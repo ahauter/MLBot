@@ -2,7 +2,7 @@ import numpy as np
 import random
 
 def sigmoid(X):
-	return 1 / (1 + np.exp(X))
+	return 1 / (1 + np.exp(-1*X))
 
 def sigmoid_prime(X):
 	return sigmoid(X) * (1 - sigmoid(X))
@@ -68,9 +68,12 @@ class Network():
 			batch_error = np.zeros(self.output_size)
 			for j in batch:
 				Y = self.last_layer(X_train[j]) 
-				batch_error = batch_error - (Y - Y_train[j])
+				batch_error = batch_error + (Y - Y_train[j])
 
-			self.last_layer.back_propagate(batch_error)
+			self.last_layer.back_propagate(batch_error, learning_rate=0.001)
+
+			if i % 1000 == 0:
+				print("Epoch number: {}\n Ave error: {}".format(i, batch_error/batch_size))
 
 
 	"""
@@ -107,11 +110,12 @@ class Layer():
 	Back propagates the aggregate error
 	since start_batch was called 
  	"""
-	def back_propagate(self, error, learning_rate=0.001):
+	def back_propagate(self, error, learning_rate=0.01):
 		self.training = False
-
+		error = error / self.num_examples
+		self.ave_output = self.ave_output / self.num_examples
 		error = error * self.activation_prime(self.ave_output)
-
+		#print(error)
 		dW = learning_rate * self.ave_output * error
 		dB = learning_rate * error 
 
@@ -129,14 +133,14 @@ class Layer():
 		if self.prev_layer:
 			X = self.prev_layer(X)
 
-		Z = self.activation(np.dot(X, self.W) + self.B)
+		Z = np.dot(X, self.W) + self.B
 
 		##Keeps track of the output of the layer for training 
 		if self.training:
-			self.num_examples += 1
 			self.ave_output = self.ave_output + Z
-			if self.num_examples > 1: 
-				self.ave_output *= (self.num_examples - 1) / self.num_examples
+			self.num_examples += 1
+
+		Z =self.activation(Z)
 
 		return Z 
 
@@ -145,8 +149,8 @@ class Layer():
 	"""
 	def start_batch(self):
 		self.training = True
-		self.num_examples = 0 
 		self.ave_output = np.zeros(len(self.B), dtype=np.float64)
+		self.num_examples = 0
 		if self.prev_layer:
 			self.prev_layer.start_batch()
 
