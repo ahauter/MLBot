@@ -1,0 +1,35 @@
+name: Low Aerial - Center Field
+skill: aerial
+description: Ball launched upward from center field. Car must jump and make aerial contact.
+
+initial_state:
+  ball:
+    location:
+      x: {min: -600.0, max: 600.0}
+      y: {min: -500.0, max: 500.0}
+      z: {fixed: 100.0}
+    velocity:
+      x: {fixed: 0.0}
+      y: {fixed: 0.0}
+      z: {min: 600.0, max: 900.0}
+  car:
+    location:
+      x: {min: -400.0, max: 400.0}
+      y: {min: -800.0, max: 800.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 50.0, max: 100.0}
+
+reward:
+  terminal:
+  - {type: aerial_hit, value: 1.0}
+  - {type: ball_grounded, value: -0.5}
+  - {type: timeout, seconds: 6.0, value: -1.0}
+  step:
+  - {type: car_near_ball, weight: 0.005}
+
+training:
+  max_episodes: 10000
+  save_every: 500
+  model_path: models/aerial.weights

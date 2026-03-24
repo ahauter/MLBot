@@ -1,0 +1,35 @@
+name: Power Shot - Center
+skill: shooter
+description: Ball near center top half, car directly behind it. Shoot into the orange goal.
+
+initial_state:
+  ball:
+    location:
+      x: {min: -500.0, max: 500.0}
+      y: {min: 3000.0, max: 4500.0}
+      z: {fixed: 100.0}
+    velocity:
+      x: {fixed: 0.0}
+      y: {fixed: 0.0}
+      z: {fixed: 0.0}
+  car:
+    location:
+      x: {min: -300.0, max: 300.0}
+      y: {min: 1500.0, max: 3000.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 33.0, max: 100.0}
+
+reward:
+  terminal:
+  - {type: goal_scored, value: 1.0}
+  - {type: ball_out_play, value: -0.5}
+  - {type: timeout, seconds: 8.0, value: -1.0}
+  step:
+  - {type: ball_toward_goal, weight: 0.01}
+
+training:
+  max_episodes: 10000
+  save_every: 500
+  model_path: models/shooter.weights
