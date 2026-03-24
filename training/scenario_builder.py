@@ -4,6 +4,9 @@ MLBot Scenario Builder
 ======================
 Interactive CLI for creating, browsing, and visualising training scenario configs.
 
+Skills are discovered dynamically from the configs/ directory — no hardcoded list.
+To add a new skill, just create a new subfolder and drop YAML files into it.
+
 Usage
 -----
     # Launch the interactive menu
@@ -42,59 +45,23 @@ from scenarios.scenario_config import (
     Vec3Config,
 )
 
-CONFIGS_DIR = Path(__file__).parent / 'scenarios' / 'configs'
+CONFIGS_DIR  = Path(__file__).parent / 'scenarios' / 'configs'
 PREVIEWS_DIR = Path(__file__).parent / 'scenarios' / 'previews'
 
-# ── skill catalogue ───────────────────────────────────────────────────────────
-
-SKILLS = {
-    '1': ('shooter',  'Score a goal'),
-    '2': ('defender', 'Prevent / clear the ball'),
-    '3': ('passer',   'Deliver ball to a teammate zone'),
-    '4': ('aerial',   'Contact an airborne ball'),
-}
-
-# Default reward blueprints per skill (humans can override in YAML later)
-DEFAULT_REWARDS: dict[str, dict] = {
-    'shooter': {
-        'terminal': [
-            {'type': 'goal_scored',   'value':  1.0},
-            {'type': 'ball_out_play', 'value': -0.5},
-            {'type': 'timeout',       'seconds': 8.0,  'value': -1.0},
-        ],
-        'step': [{'type': 'ball_toward_goal', 'weight': 0.01}],
-    },
-    'defender': {
-        'terminal': [
-            {'type': 'ball_cleared',  'value':  1.0},
-            {'type': 'goal_scored',   'value': -1.0},
-            {'type': 'timeout',       'seconds': 10.0, 'value': -0.5},
-        ],
-        'step': [{'type': 'ball_from_goal', 'weight': 0.01}],
-    },
-    'passer': {
-        'terminal': [
-            {'type': 'pass_received', 'value':  1.0},
-            {'type': 'ball_out_play', 'value': -0.5},
-            {'type': 'timeout',       'seconds': 8.0,  'value': -1.0},
-        ],
-        'step': [{'type': 'ball_toward_teammate', 'weight': 0.01}],
-    },
-    'aerial': {
-        'terminal': [
-            {'type': 'aerial_hit',    'value':  1.0},
-            {'type': 'ball_grounded', 'value': -0.5},
-            {'type': 'timeout',       'seconds': 6.0,  'value': -1.0},
-        ],
-        'step': [{'type': 'car_near_ball', 'weight': 0.005}],
-    },
-}
+# Common reward event types shown as hints in the wizard
+COMMON_TERMINAL_TYPES = [
+    'goal_scored', 'ball_out_play', 'ball_cleared',
+    'aerial_hit', 'pass_received', 'timeout',
+]
+COMMON_STEP_TYPES = [
+    'ball_toward_goal', 'ball_from_goal', 'car_near_ball',
+    'ball_toward_teammate',
+]
 
 
 # ── terminal colours ──────────────────────────────────────────────────────────
 
 def _c(text: str, code: str) -> str:
-    """Wrap text in an ANSI colour code."""
     return f'\033[{code}m{text}\033[0m'
 
 def _bold(t: str)   -> str: return _c(t, '1')
@@ -140,10 +107,6 @@ def _prompt_int(label: str, default: int) -> int:
 
 
 def _prompt_range_or_fixed(label: str, default_val: float) -> RangeOrFixed:
-    """
-    Ask the user whether this dimension is a fixed value or a random range,
-    then collect the appropriate numbers.
-    """
     print(f'\n  {_yellow(label)}')
     choice = _prompt('  Fixed or range?  (f / r)', 'f').lower()
     if choice == 'r':
@@ -154,7 +117,6 @@ def _prompt_range_or_fixed(label: str, default_val: float) -> RangeOrFixed:
 
 
 def _prompt_yaw() -> RangeOrFixed:
-    """Prompt for car yaw: random, fixed angle, or uniform range."""
     print(f'\n  {_yellow("Car yaw  (facing direction)")}')
     print(f'  {_dim("r = random   f = fixed angle   ra = angle range")}')
     choice = _prompt('  Mode', 'r').lower()
@@ -170,20 +132,91 @@ def _prompt_yaw() -> RangeOrFixed:
     return RangeOrFixed(random=True)
 
 
+# ── skill discovery ───────────────────────────────────────────────────────────
+
+def discover_skills() -> dict[str, int]:
+    """
+    Scan configs/ subdirectories and return {skill_name: scenario_count}.
+    Sorted alphabetically.
+    """
+    if not CONFIGS_DIR.exists():
+        return {}
+    skills: dict[str, int] = {}
+    for d in sorted(CONFIGS_DIR.iterdir()):
+        if d.is_dir():
+            count = len(list(d.rglob('*.yaml')))
+            if count > 0:
+                skills[d.name] = count
+    return skills
+
+
+def _pick_skill() -> str:
+    """
+    Show existing skills discovered from configs/, let user pick one or type a new name.
+    Returns the skill name string.
+    """
+    known = discover_skills()
+    print()
+    if known:
+        print(f'  {_bold("Existing skills:")}')
+        for i, (name, count) in enumerate(known.items(), 1):
+            print(f'    {_yellow(str(i))}.  {name}  {_dim(f"({count} scenario(s))")}')
+        print()
+    print(f'  Enter a number to pick an existing skill,')
+    print(f'  or type a {_bold("new skill name")} to create one.')
+    raw = _prompt('\n  Skill', '1' if known else '').strip()
+
+    # numeric selection from existing list
+    if raw.isdigit():
+        idx = int(raw) - 1
+        names = list(known.keys())
+        if 0 <= idx < len(names):
+            return names[idx]
+        print(_red(f'  ✗  No skill #{raw}. Treating as new skill name.'))
+
+    # free-text name
+    safe = raw.lower().replace(' ', '_').replace('-', '_')
+    if not safe:
+        print(_red('  ✗  Empty name; defaulting to "custom".'))
+        return 'custom'
+    return safe
+
+
+# ── reward wizard ─────────────────────────────────────────────────────────────
+
+def _build_reward_events(kind: str) -> List[RewardEvent]:
+    """
+    Interactively build a list of reward events of the given kind ('terminal' or 'step').
+    """
+    hints = COMMON_TERMINAL_TYPES if kind == 'terminal' else COMMON_STEP_TYPES
+    print(f'\n  {_dim("Common " + kind + " types:")}  {", ".join(hints)}')
+    events: List[RewardEvent] = []
+    while True:
+        etype = _prompt(f'  {kind.capitalize()} event type  (blank to finish)', '')
+        if not etype:
+            break
+        if kind == 'terminal':
+            if etype == 'timeout':
+                secs  = _prompt_float('    timeout seconds', 8.0)
+                value = _prompt_float('    reward value',   -1.0)
+                events.append(RewardEvent(type='timeout', seconds=secs, value=value))
+            else:
+                value = _prompt_float('    reward value', 1.0 if 'score' in etype or 'hit' in etype or 'received' in etype or 'cleared' in etype else -0.5)
+                events.append(RewardEvent(type=etype, value=value))
+        else:
+            weight = _prompt_float('    weight (step multiplier)', 0.01)
+            events.append(RewardEvent(type=etype, weight=weight))
+        print(_green(f'    ✓  added'))
+    return events
+
+
 # ── create ────────────────────────────────────────────────────────────────────
 
 def create_scenario() -> Optional[ScenarioConfig]:
     _section('Create New Scenario')
 
-    # Skill
-    print()
-    for key, (name, desc) in SKILLS.items():
-        print(f'  {_yellow(key)}.  {_bold(name.capitalize())} — {_dim(desc)}')
-    skill_key = _prompt('\n  Skill type', '1')
-    if skill_key not in SKILLS:
-        print(_red('  ✗  Invalid choice.'))
-        return None
-    skill, _ = SKILLS[skill_key]
+    skill = _pick_skill()
+    print(f'\n  Skill: {_bold(_cyan(skill))}')
 
     name        = _prompt('  Scenario name', f'my_{skill}_scenario')
     description = _prompt('  Short description (optional)', '')
@@ -192,7 +225,7 @@ def create_scenario() -> Optional[ScenarioConfig]:
     _section('Ball — Initial Position')
     ball_x = _prompt_range_or_fixed('Ball X  (field width: –4096 to 4096)',  0.0)
     ball_y = _prompt_range_or_fixed('Ball Y  (field length: –5120 to 5120)', 3000.0)
-    ball_z = _prompt_range_or_fixed('Ball Z  (height, min ≈ 92)',           100.0)
+    ball_z = _prompt_range_or_fixed('Ball Z  (height — ground ≈ 92, wall mid ≈ 1022)', 100.0)
 
     _section('Ball — Initial Velocity')
     set_vel = _prompt('Set initial ball velocity?  (y / n)', 'n').lower()
@@ -207,26 +240,23 @@ def create_scenario() -> Optional[ScenarioConfig]:
     _section('Car — Initial Position & State')
     car_x   = _prompt_range_or_fixed('Car X   (–4096 to 4096)',   0.0)
     car_y   = _prompt_range_or_fixed('Car Y   (–5120 to 5120)',   1500.0)
+    car_z   = _prompt_range_or_fixed('Car Z   (ground = 0)',       0.0)
     car_yaw = _prompt_yaw()
     car_boost = _prompt_range_or_fixed('Boost amount (0–100)',     33.0)
 
     # ── reward ──
-    _section('Reward & Training')
-    print(f'  Using default reward template for {_yellow(skill)}.')
-    print(_dim('  (You can edit the YAML file afterwards to customise further.)'))
-    timeout  = _prompt_float('  Episode timeout (seconds)', 8.0)
-    max_eps  = _prompt_int('  Max training episodes',     10000)
+    _section('Reward Events')
+    print(f'  Define terminal and per-step reward events for {_yellow(skill)}.')
+    print(f'  {_dim("Leave blank to finish each section.")}')
 
-    # Patch the timeout value into the default template
-    terminal_events: list[RewardEvent] = []
-    for ev_dict in DEFAULT_REWARDS[skill]['terminal']:
-        ev = dict(ev_dict)
-        if ev['type'] == 'timeout':
-            ev['seconds'] = timeout
-        terminal_events.append(RewardEvent.from_dict(ev))
-    step_events = [
-        RewardEvent.from_dict(e) for e in DEFAULT_REWARDS[skill]['step']
-    ]
+    print(f'\n  {_bold("Terminal events")} (episode ends):')
+    terminal = _build_reward_events('terminal')
+
+    print(f'\n  {_bold("Step events")} (every tick):')
+    step = _build_reward_events('step')
+
+    _section('Training')
+    max_eps = _prompt_int('  Max training episodes', 10000)
 
     # ── assemble ──
     config = ScenarioConfig(
@@ -239,16 +269,16 @@ def create_scenario() -> Optional[ScenarioConfig]:
                 velocity=Vec3Config(x=vel_x,  y=vel_y,  z=vel_z),
             ),
             car=CarConfig(
-                location=Vec3Config(x=car_x, y=car_y, z=RangeOrFixed(fixed=0.0)),
+                location=Vec3Config(x=car_x, y=car_y, z=car_z),
                 yaw=car_yaw,
                 boost=car_boost,
             ),
         ),
-        reward=RewardConfig(terminal=terminal_events, step=step_events),
+        reward=RewardConfig(terminal=terminal, step=step),
         training=TrainingConfig(
             max_episodes=max_eps,
             save_every=500,
-            model_path=f'models/{skill}.weights',
+            model_path=f'models/skill_{skill}',
         ),
     )
 
@@ -274,8 +304,7 @@ def list_scenarios() -> List[Path]:
         if folder != prev_folder:
             print(f'\n  {_dim(folder + "/")}')
             prev_folder = folder
-        rel = p.stem
-        print(f'    {_yellow(str(i + 1).rjust(2))}.  {rel}')
+        print(f'    {_yellow(str(i + 1).rjust(2))}.  {p.stem}')
     return paths
 
 
@@ -333,11 +362,14 @@ def _menu() -> None:
     print(_bold(_cyan(  '╚══════════════════════════════════╝')))
 
     while True:
+        known = discover_skills()
+        skill_summary = '  '.join(f'{n}({c})' for n, c in known.items()) if known else 'none yet'
+        print(f'\n  {_dim("skills: " + skill_summary)}')
         print(f"""
   {_yellow("1")}.  Create new scenario
   {_yellow("2")}.  View & visualise a scenario
   {_yellow("3")}.  List all saved scenarios
-  {_yellow("4")}.  Visualise all scenarios in a skill folder
+  {_yellow("4")}.  Visualise all scenarios for a skill
   {_yellow("5")}.  Visualise ALL scenarios (grid)
   {_yellow("q")}.  Quit""")
 
@@ -362,18 +394,25 @@ def _menu() -> None:
             list_scenarios()
 
         elif choice == '4':
+            known = discover_skills()
+            if not known:
+                print(_dim('  No skills found yet.'))
+                continue
             print()
-            for key, (skill, _) in SKILLS.items():
-                folder = CONFIGS_DIR / skill
-                count = len(list(folder.rglob('*.yaml'))) if folder.exists() else 0
-                print(f'  {_yellow(key)}.  {skill.capitalize()}  {_dim(f"({count} scenario(s))")}')
-            key = _prompt('\n  Skill folder', '1')
-            if key in SKILLS:
-                skill, _ = SKILLS[key]
-                save = _prompt('  Save PNG?  (y / n)', 'n').lower() == 'y'
-                _vis_folder(CONFIGS_DIR / skill, save=save)
-            else:
+            for i, (name, count) in enumerate(known.items(), 1):
+                print(f'  {_yellow(str(i))}.  {name}  {_dim(f"({count} scenario(s))")}')
+            raw = _prompt('\n  Skill number', '1')
+            names = list(known.keys())
+            try:
+                idx = int(raw) - 1
+                if not 0 <= idx < len(names):
+                    raise ValueError
+                skill = names[idx]
+            except ValueError:
                 print(_red('  ✗  Invalid choice.'))
+                continue
+            save = _prompt('  Save PNG?  (y / n)', 'n').lower() == 'y'
+            _vis_folder(CONFIGS_DIR / skill, save=save)
 
         elif choice == '5':
             save = _prompt('  Save PNG?  (y / n)', 'n').lower() == 'y'

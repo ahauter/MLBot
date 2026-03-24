@@ -1,13 +1,16 @@
 """
 Rocket League field visualiser for training scenarios.
 
-Renders a top-down 2-D view of the field showing:
-  - Ball spawn position (point) or spawn region (shaded rectangle)
-  - Ball initial velocity (arrow, if non-zero)
-  - Car spawn position or region
-  - Car facing direction / yaw (arrow, if not fully random)
-  - Reward summary text
-  - Boost pad locations (approximate)
+Each standalone figure has two panels:
+  Top   — top-down field view (X-Y plane): ball & car spawn positions / ranges,
+          velocity arrow (ball), yaw arrow (car), boost pads, goals.
+  Bottom — elevation cross-section (X-Z plane): side-wall profile showing
+           how high the ball / car spawn off the ground.  Useful for wall-ball
+           and aerial scenarios.  The elevation strip is always shown so even
+           "Z=92" ground scenarios confirm that ball is on the floor.
+
+In grid mode (when an existing Axes is passed) the elevation panel is skipped
+and a small "z=NNN" suffix is added to ball/car labels instead.
 
 Usage:
     from scenario_visualizer import visualize_scenario, visualize_all
@@ -41,6 +44,7 @@ FIELD_Y        = 5120   # half-length
 GOAL_HW        = 893    # goal half-width
 GOAL_DEPTH     = 880    # depth of goal box
 CENTER_RADIUS  = 1024   # centre-circle radius
+CEILING_Z      = 2044   # arena height (floor → ceiling)
 
 # Approximate big-boost pad positions
 BIG_BOOSTS = [
@@ -115,19 +119,31 @@ def _draw_field(ax: plt.Axes) -> None:
         ax.plot(bx, by, 'o', color='#facc15', markersize=5, alpha=0.55, zorder=2)
 
 
+def _z_label(z_cfg: RangeOrFixed) -> str:
+    """Return a z-annotation string for grid mode; empty string when near ground."""
+    z = z_cfg.center()
+    if z_cfg.is_range():
+        return f'\nz {int(z_cfg.min_val)}–{int(z_cfg.max_val)}'
+    return f'\nz={int(z)}' if z > 200 else ''
+
+
 def _draw_spawn(
-    ax:          plt.Axes,
-    x_cfg:       RangeOrFixed,
-    y_cfg:       RangeOrFixed,
-    label:       str,
-    color:       str,
-    marker:      str = 'o',
-    marker_size: int = 10,
-    z:           int = 5,
+    ax:           plt.Axes,
+    x_cfg:        RangeOrFixed,
+    y_cfg:        RangeOrFixed,
+    label:        str,
+    color:        str,
+    marker:       str = 'o',
+    marker_size:  int = 10,
+    z:            int = 5,
+    label_suffix: str = '',
 ) -> tuple[float, float]:
     """
     Draw a point or shaded range rectangle, return the centre (cx, cy)
     used as the anchor for velocity/yaw arrows.
+
+    label_suffix is appended to the annotation text — used in grid mode to
+    show Z height when there is no elevation panel.
     """
     x_rng = x_cfg.is_range()
     y_rng = y_cfg.is_range()
@@ -161,10 +177,73 @@ def _draw_spawn(
 
     ax.plot(cx, cy, marker, color=color, markersize=marker_size,
             markeredgecolor='white', markeredgewidth=0.8, zorder=z + 2)
-    ax.annotate(label, (cx, cy),
+    ax.annotate(label + label_suffix, (cx, cy),
                 textcoords='offset points', xytext=(9, 6),
                 color=color, fontsize=9, fontweight='bold', zorder=z + 3)
     return cx, cy
+
+
+def _draw_elevation(
+    ax:       plt.Axes,
+    ball_loc: 'Vec3Config',
+    ball_vel: 'Vec3Config',
+    car_loc:  'Vec3Config',
+) -> None:
+    """
+    Draw a compact X-Z cross-section ("front-on" view of the side wall).
+
+    Horizontal axis = X (−FIELD_X … +FIELD_X)
+    Vertical axis   = Z (0 … CEILING_Z)
+    """
+    ax.set_facecolor(BG_COLOR)
+
+    # ── arena outline ──
+    # Floor
+    ax.axhline(0, color=LINE_COLOR, linewidth=1.5, alpha=0.6, zorder=1)
+    # Ceiling (dashed)
+    ax.axhline(CEILING_Z, color=LINE_COLOR, linewidth=1, linestyle='--', alpha=0.4, zorder=1)
+    ax.text(FIELD_X + 100, CEILING_Z, f'ceiling\n{CEILING_Z}',
+            va='center', ha='left', color='#888', fontsize=6, zorder=2)
+    # Side walls
+    ax.axvline(-FIELD_X, color=LINE_COLOR, linewidth=1.5, alpha=0.5, zorder=1)
+    ax.axvline( FIELD_X, color=LINE_COLOR, linewidth=1.5, alpha=0.5, zorder=1)
+    # Light fill for the arena interior
+    ax.add_patch(patches.Rectangle(
+        (-FIELD_X, 0), 2 * FIELD_X, CEILING_Z,
+        facecolor=FIELD_COLOR, alpha=0.25, edgecolor='none', zorder=0,
+    ))
+
+    # ── ball ──
+    bx, bz = _draw_spawn(
+        ax, ball_loc.x, ball_loc.z,
+        'ball', BALL_COLOR, marker='o', marker_size=9, z=5,
+    )
+    # Z-velocity arrow (vertical component)
+    vz = ball_vel.z.center()
+    if abs(vz) > 1:
+        scale = 0.4
+        ax.annotate(
+            '', xy=(bx, bz + vz * scale), xytext=(bx, bz),
+            arrowprops=dict(arrowstyle='->', color=BALL_COLOR, lw=1.8),
+            zorder=6,
+        )
+
+    # ── car ──
+    _draw_spawn(
+        ax, car_loc.x, car_loc.z,
+        'car', CAR_COLOR, marker='^', marker_size=9, z=5,
+    )
+
+    # ── axis style ──
+    ax.set_xlim(-FIELD_X - 700, FIELD_X + 700)
+    ax.set_ylim(-80, CEILING_Z + 300)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X', color='#666', fontsize=7)
+    ax.set_ylabel('Z  (height)', color='#666', fontsize=7)
+    ax.tick_params(colors='#555', labelsize=6)
+    ax.set_title('elevation  (X-Z)', color='#888', fontsize=8, pad=3)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#333')
 
 
 def _draw_velocity_arrow(
@@ -235,9 +314,13 @@ def visualize_scenario(
     """
     standalone = ax is None
     if standalone:
-        fig, ax = plt.subplots(figsize=(6, 9))
+        fig, (ax, ax_elev) = plt.subplots(
+            2, 1, figsize=(6, 10.5),
+            gridspec_kw={'height_ratios': [5, 1.5]},
+        )
         fig.patch.set_facecolor(BG_COLOR)
     else:
+        ax_elev = None
         fig = ax.get_figure()
 
     ax.set_facecolor(BG_COLOR)
@@ -246,11 +329,16 @@ def visualize_scenario(
     skill_color = SKILL_COLORS.get(config.skill, '#ffffff')
     state = config.initial_state
 
+    # In grid mode (no elevation panel) append z height to the label
+    ball_z_sfx = '' if standalone else _z_label(state.ball.location.z)
+    car_z_sfx  = '' if standalone else _z_label(state.car.location.z)
+
     # ── ball ──
     ball_cx, ball_cy = _draw_spawn(
         ax,
         state.ball.location.x, state.ball.location.y,
         'ball', BALL_COLOR, marker='o', marker_size=11, z=5,
+        label_suffix=ball_z_sfx,
     )
     _draw_velocity_arrow(
         ax, ball_cx, ball_cy,
@@ -264,6 +352,7 @@ def visualize_scenario(
         ax,
         state.car.location.x, state.car.location.y,
         'car', CAR_COLOR, marker='^', marker_size=11, z=5,
+        label_suffix=car_z_sfx,
     )
     _draw_yaw_arrow(ax, car_cx, car_cy, state.car.yaw, CAR_COLOR)
 
@@ -311,6 +400,10 @@ def visualize_scenario(
     for spine in ax.spines.values():
         spine.set_edgecolor('#333')
     ax.tick_params(colors='#555', labelsize=6)
+
+    # ── elevation strip (standalone only) ──
+    if ax_elev is not None:
+        _draw_elevation(ax_elev, state.ball.location, state.ball.velocity, state.car.location)
 
     if save_path:
         fig.savefig(save_path, dpi=130, bbox_inches='tight', facecolor=BG_COLOR)
