@@ -647,15 +647,22 @@ def train(
             if trial is not None and episode > 0 and episode % 200 == 0:
                 trial.report(smoothed_reward, step=episode)
                 if trial.should_prune():
-                    raise _TrialPruned()
+                    import optuna
+                    raise optuna.exceptions.TrialPruned()
 
             # ── checkpoint ────────────────────────────────────────────────────
             if episode > 0 and episode % config.save_every == 0:
                 _save_all(encoder, policy_head, model_path)
                 print(f'[ep {episode:05d}] Checkpointed.')
 
-    except _TrialPruned:
-        pass
+    except Exception as exc:
+        # Re-raise unless it's an Optuna pruning signal
+        try:
+            import optuna
+            if not isinstance(exc, optuna.exceptions.TrialPruned):
+                raise
+        except ImportError:
+            raise
     finally:
         env.close()
         logger.finish()
@@ -664,10 +671,6 @@ def train(
     _save_all(encoder, policy_head, model_path)
 
     return smoothed_reward
-
-
-class _TrialPruned(Exception):
-    """Internal signal to cleanly exit the training loop on Optuna pruning."""
 
 
 def _save_all(

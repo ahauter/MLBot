@@ -109,7 +109,7 @@ def objective(trial, episodes_per_trial: int, use_wandb: bool) -> float:
 def main() -> None:
     try:
         import optuna
-        from optuna.pruners import ASHAPruner
+        from optuna.pruners import SuccessiveHalvingPruner
         from optuna.samplers import TPESampler
     except ImportError:
         print('Optuna is not installed. Run:  pip install optuna', file=sys.stderr)
@@ -134,7 +134,7 @@ def main() -> None:
 
     study = optuna.create_study(
         direction='maximize',
-        pruner=ASHAPruner(
+        pruner=SuccessiveHalvingPruner(
             min_resource=PRUNE_MIN_RESOURCE,
             reduction_factor=PRUNE_REDUCTION_FACTOR,
         ),
@@ -169,7 +169,6 @@ def main() -> None:
             use_wandb=not args.no_wandb,
         ),
         n_trials=args.n_trials,
-        n_jobs=1,           # RL envs are not thread-safe; run sequentially
         show_progress_bar=True,
     )
 
