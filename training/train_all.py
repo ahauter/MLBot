@@ -136,6 +136,8 @@ def compute_awac_loss(
     if not trajectory:
         return zero, zero, zero
 
+    device = next(encoder.parameters()).device
+
     tokens_batch = torch.tensor(
         np.concatenate([t[0] for t in trajectory], axis=0),
         dtype=torch.float32, device=device,
@@ -146,7 +148,7 @@ def compute_awac_loss(
     )   # (T_ep, ACTION_DIM)
     returns = torch.tensor(
         compute_returns([t[2] for t in trajectory], config.gamma),
-        dtype=torch.float32,
+        dtype=torch.float32, device=device,
     )   # (T_ep,)
 
     embeddings = encoder(tokens_batch, entity_type_ids,
@@ -628,16 +630,16 @@ def train(
                           file=sys.stderr)
 
                 if batches:
-                    buf_windows = torch.cat([b[0] for b in batches])
-                    buf_actions = torch.cat([b[1] for b in batches])
-                    buf_returns = torch.cat([b[2] for b in batches])
+                    buf_windows = torch.cat([b[0] for b in batches]).to(device)
+                    buf_actions = torch.cat([b[1] for b in batches]).to(device)
+                    buf_returns = torch.cat([b[2] for b in batches]).to(device)
 
                     encoder.train()
                     policy_head.train()
                     buf_total, _, _ = _awac_loss_from_batch(
                         encoder, policy_head, entity_type_ids,
                         buf_windows, buf_actions, buf_returns, config,
-                        entity_perm=torch.randperm(N),
+                        entity_perm=torch.randperm(N, device=device),
                     )
                     optimizer.zero_grad()
                     buf_total.backward()
