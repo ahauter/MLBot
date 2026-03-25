@@ -11,8 +11,12 @@ matplotlib
 # has with RLBot's dependency pins.
 torch
 
-# Fast CPU-based RL simulation (no live game required for training)
-rlgym-sim
+# Fast CPU-based RL simulation (no live game required for training).
+# rocketsim provides the C++ physics engine with Windows/Linux/macOS wheels on PyPI.
+# rlgym-sim is not on PyPI — install from GitHub (rocketsim is pulled in automatically,
+# but listed explicitly here so pip can cache the wheel on repeated installs).
+rocketsim
+rlgym-sim @ git+https://github.com/AechPro/rocket-league-gym-sim@main
 
 # This will cause pip to auto-upgrade and stop scaring people with warning messages
 pip
