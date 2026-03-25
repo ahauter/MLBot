@@ -1,0 +1,17 @@
+# Evaluation config — vs Psyonix Allstar
+[match]
+game_mode = "Soccer"
+game_map = "Mannfield"
+instant_start = true
+enable_rendering = false
+enable_state_setting = true
+
+[[cars]]
+team = 0
+type = "RLBot"
+config = "src/bot.toml"
+
+[[cars]]
+team = 1
+type = "Psyonix"
+skill = "Allstar"

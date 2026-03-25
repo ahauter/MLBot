@@ -1,38 +1,30 @@
 #!/usr/bin/env python3
 """
-Hyperparameter Tuning with Optuna + ASHA Pruning
-=================================================
-Searches over AWAC training hyperparameters using Optuna with the
-Asynchronous Successive Halving (ASHA) pruner for early stopping of
-underperforming trials.
+Hyperparameter Tuning with Optuna (d3rlpy)
+==========================================
+Searches over training hyperparameters using Optuna with ASHA pruning.
+Each trial runs a shortened d3rlpy training session and reports mean
+episode reward. Best params can be loaded by train.py --params-from.
 
-Each trial runs a shortened training session and reports its smoothed
-episode reward. Trials showing no improvement are pruned at regular
-checkpoints (every 200 episodes).
-
-The Optuna study is stored in a local SQLite database so it survives
-process crashes — just re-run this script to resume from where you left off.
-
-Each trial also logs to W&B (if configured) under the same project,
-grouped so the W&B parallel coordinates plot shows the full search.
+The study is stored in SQLite for crash-resistant resumability.
 
 Usage
 -----
-    # Run 50 Optuna trials (resumable):
+    # Run 50 trials:
     python training/tune.py
 
-    # Override number of trials or episodes per trial:
-    python training/tune.py --n-trials 20 --episodes-per-trial 1000
+    # Override trials or step budget:
+    python training/tune.py --n-trials 20 --steps-per-trial 200000
 
-    # Disable W&B (stdout only):
-    python training/tune.py --no-wandb
-
-    # Show best trial from a completed study:
+    # Show best trial:
     python training/tune.py --show-best
+
+    # Resume from existing study:
+    python training/tune.py --storage sqlite:///optuna_baseline.db
 
 Requirements
 ------------
-    pip install optuna wandb
+    pip install optuna d3rlpy gymnasium
 """
 from __future__ import annotations
 
@@ -40,103 +32,139 @@ import argparse
 import sys
 from pathlib import Path
 
-# ── path setup ────────────────────────────────────────────────────────────────
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-from train_config import TrainConfig
-from train_all import RLGymEnv, discover_all_configs, train
-from logger import ExperimentLogger
+
+# ── study settings ───────────────────────────────────────────────────────────
+
+STUDY_NAME = 'baseline-hparam-search'
+STORAGE_PATH = 'sqlite:///optuna_baseline.db'
 
 
-# ── Optuna study settings ─────────────────────────────────────────────────────
+# ── objective ────────────────────────────────────────────────────────────────
 
-STUDY_NAME    = 'awac-hparam-search'
-STORAGE_PATH  = 'sqlite:///optuna_mlbot.db'
-PRUNE_INTERVAL = 200    # report intermediate reward every N episodes
-PRUNE_MIN_RESOURCE = 200    # minimum episodes before pruning is allowed
-PRUNE_REDUCTION_FACTOR = 3  # ASHA halving factor
-
-
-# ── objective function ────────────────────────────────────────────────────────
-
-def objective(trial, episodes_per_trial: int, use_wandb: bool) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
     """
-    Single Optuna trial: sample hyperparameters, run training, return reward.
-
-    The smoothed 100-episode mean reward is used as the objective.
-    Trials are pruned at PRUNE_INTERVAL-episode checkpoints if they are
-    significantly below the current best.
+    Single Optuna trial: sample hyperparams, run shortened training,
+    return mean episode reward.
     """
-    import optuna
+    import numpy as np
+    import d3rlpy
+    from d3rlpy.algos.qlearning.explorers import NormalNoise
+    from d3rlpy.logging import FileAdapterFactory, WanDBAdapterFactory
 
-    config = TrainConfig(
-        lr=trial.suggest_float('lr', 1e-5, 1e-3, log=True),
-        awac_beta=trial.suggest_float('awac_beta', 0.1, 5.0),
-        awac_max_weight=trial.suggest_float('awac_max_weight', 5.0, 100.0, log=True),
-        gamma=trial.suggest_float('gamma', 0.95, 0.999),
-        explore_std=trial.suggest_float('explore_std', 0.01, 0.3),
-        expert_replay_ratio=trial.suggest_float('expert_replay_ratio', 0.0, 1.0),
-        buffer_batch_size=trial.suggest_int('buffer_batch_size', 64, 512, log=True),
-        max_episodes=episodes_per_trial,
-        save_every=episodes_per_trial + 1,   # skip mid-trial checkpoints
-        model_dir=f'models/trial_{trial.number}/',
-        wandb_project='mlbot',
-        wandb_run_name=f'trial-{trial.number:03d}',
-        wandb_group='optuna-study',
-    )
+    from baseline_encoder_factory import TransformerEncoderFactory
+    from gym_env import BaselineGymEnv
 
-    configs = discover_all_configs()
-    if not configs:
-        raise RuntimeError('No scenario configs found — cannot run trial.')
+    # ── sample hyperparameters ───────────────────────────────────────────
+    actor_lr = trial.suggest_float('actor_lr', 1e-5, 1e-3, log=True)
+    critic_lr = trial.suggest_float('critic_lr', 1e-5, 1e-3, log=True)
+    awac_lambda = trial.suggest_float('awac_lambda', 0.1, 5.0)
+    tau = trial.suggest_float('tau', 0.001, 0.05, log=True)
+    batch_size = trial.suggest_int('batch_size', 64, 512, log=True)
+    gamma = trial.suggest_float('gamma', 0.95, 0.999)
+    explore_noise = trial.suggest_float('explore_noise', 0.01, 0.3)
 
-    env   = RLGymEnv()
-    logger = ExperimentLogger(config, enabled=use_wandb, group='optuna-study')
+    t_window = 8
+    encoder_factory = TransformerEncoderFactory(t_window=t_window)
 
-    smoothed_reward = train(
-        all_configs=configs,
-        env=env,
-        config=config,
-        logger=logger,
-        trial=trial,
-    )
-    return smoothed_reward
+    algo = d3rlpy.algos.AWACConfig(
+        batch_size=batch_size,
+        gamma=gamma,
+        actor_learning_rate=actor_lr,
+        critic_learning_rate=critic_lr,
+        actor_encoder_factory=encoder_factory,
+        critic_encoder_factory=encoder_factory,
+        tau=tau,
+        lam=awac_lambda,
+    ).create(device='cpu')
+
+    env = BaselineGymEnv(t_window=t_window)
+    buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000, env=env)
+    explorer = NormalNoise(std=explore_noise)
+
+    if use_wandb:
+        logger_adapter = WanDBAdapterFactory(project='rlbot-baseline-tuning')
+    else:
+        logger_adapter = FileAdapterFactory(
+            root_dir=f'models/tune/trial_{trial.number}'
+        )
+
+    # Track rewards for pruning
+    episode_rewards = []
+    pruning_interval = 50_000  # check every 50k steps
+
+    def callback(algo_obj, epoch, total_step):
+        import optuna
+        # Report at pruning intervals
+        if total_step > 0 and total_step % pruning_interval < 1000:
+            if episode_rewards:
+                mean_reward = float(np.mean(episode_rewards[-100:]))
+                trial.report(mean_reward, step=total_step)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+
+    try:
+        algo.fit_online(
+            env=env,
+            buffer=buffer,
+            explorer=explorer,
+            n_steps=steps_per_trial,
+            n_steps_per_epoch=10_000,
+            random_steps=5_000,
+            experiment_name=f'tune_trial_{trial.number}',
+            logger_adapter=logger_adapter,
+            show_progress=False,
+            callback=callback,
+        )
+    except Exception as e:
+        # Check if it's an Optuna pruning signal
+        try:
+            import optuna
+            if isinstance(e, optuna.exceptions.TrialPruned):
+                raise
+        except ImportError:
+            pass
+        print(f'Trial {trial.number} failed: {e}', file=sys.stderr)
+        return float('-inf')
+    finally:
+        env.close()
+
+    # Return mean reward from last 100 episodes
+    if episode_rewards:
+        return float(np.mean(episode_rewards[-100:]))
+    return 0.0
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main():
     try:
         import optuna
         from optuna.pruners import SuccessiveHalvingPruner
         from optuna.samplers import TPESampler
     except ImportError:
-        print('Optuna is not installed. Run:  pip install optuna', file=sys.stderr)
+        print('Optuna required: pip install optuna', file=sys.stderr)
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description='AWAC hyperparameter tuning via Optuna.')
-    parser.add_argument('--n-trials',          default=50,   type=int,
-                        help='Number of Optuna trials to run (default: 50)')
-    parser.add_argument('--episodes-per-trial', default=2000, type=int,
-                        help='Training episodes per trial (default: 2000)')
-    parser.add_argument('--no-wandb',          action='store_true',
-                        help='Disable W&B logging')
-    parser.add_argument('--show-best',         action='store_true',
-                        help='Print best trial from existing study and exit')
-    parser.add_argument('--study-name',        default=STUDY_NAME)
-    parser.add_argument('--storage',           default=STORAGE_PATH,
-                        help='Optuna storage URL (default: sqlite:///optuna_mlbot.db)')
+    parser = argparse.ArgumentParser(description='Baseline hyperparameter tuning.')
+    parser.add_argument('--n-trials', type=int, default=50)
+    parser.add_argument('--steps-per-trial', type=int, default=500_000)
+    parser.add_argument('--no-wandb', action='store_true')
+    parser.add_argument('--show-best', action='store_true')
+    parser.add_argument('--study-name', default=STUDY_NAME)
+    parser.add_argument('--storage', default=STORAGE_PATH)
     args = parser.parse_args()
 
-    # Suppress Optuna's verbose per-trial logs (W&B covers it)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     study = optuna.create_study(
         direction='maximize',
         pruner=SuccessiveHalvingPruner(
-            min_resource=PRUNE_MIN_RESOURCE,
-            reduction_factor=PRUNE_REDUCTION_FACTOR,
+            min_resource=50_000,
+            reduction_factor=3,
         ),
         sampler=TPESampler(seed=42),
         storage=args.storage,
@@ -150,24 +178,19 @@ def main() -> None:
         else:
             best = study.best_trial
             print(f'\nBest trial #{best.number}')
-            print(f'  Smoothed reward: {best.value:.4f}')
+            print(f'  Reward: {best.value:.4f}')
             print('  Hyperparameters:')
             for k, v in best.params.items():
                 print(f'    {k}: {v}')
+            print(f'\nUse with: python training/train.py --params-from {args.storage.replace("sqlite:///", "")}')
         return
 
-    n_existing = len([t for t in study.trials
-                      if t.state.is_finished()])
-    print(f'Study "{args.study_name}" — {n_existing} completed trials so far.')
-    print(f'Running {args.n_trials} more trials ({args.episodes_per_trial} ep each)...')
-    print(f'Storage: {args.storage}')
+    n_existing = len([t for t in study.trials if t.state.is_finished()])
+    print(f'Study "{args.study_name}" — {n_existing} completed trials.')
+    print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
 
     study.optimize(
-        lambda trial: objective(
-            trial,
-            episodes_per_trial=args.episodes_per_trial,
-            use_wandb=not args.no_wandb,
-        ),
+        lambda trial: objective(trial, args.steps_per_trial, not args.no_wandb),
         n_trials=args.n_trials,
         show_progress_bar=True,
     )
@@ -177,8 +200,6 @@ def main() -> None:
     print(f'Best trial #{best.number}  reward={best.value:.4f}')
     for k, v in best.params.items():
         print(f'  {k}: {v}')
-    print(f'\nTo resume: python training/tune.py --storage {args.storage}')
-    print('To view:   python training/tune.py --show-best')
 
 
 if __name__ == '__main__':
