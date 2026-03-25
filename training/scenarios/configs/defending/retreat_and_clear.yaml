@@ -1,0 +1,52 @@
+name: Retreat and Clear
+description: Defender retreats to clear a ball rolling toward the blue goal; attacker pursues.
+
+initial_state:
+  ball:
+    location:
+      x: {min: -1500.0, max: 1500.0}
+      y: {min: -4500.0, max: -2500.0}
+      z: {fixed: 100.0}
+    velocity:
+      x: {fixed: 0.0}
+      y: {min: -800.0, max: -200.0}
+      z: {fixed: 0.0}
+  blue:
+    skill: defending
+    location:
+      x: {min: -1000.0, max: 1000.0}
+      y: {min: -3000.0, max: -1500.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 0.0, max: 50.0}
+  orange:
+    skill: attacking
+    location:
+      x: {min: -1000.0, max: 1000.0}
+      y: {min: -2000.0, max: -500.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 33.0, max: 100.0}
+
+reward:
+  blue:
+    terminal:
+    - {type: ball_cleared, value: 1.0}
+    - {type: goal_scored, value: -1.0}
+    - {type: timeout, seconds: 10.0, value: -0.5}
+    step:
+    - {type: ball_from_goal, weight: 0.01}
+  orange:
+    terminal:
+    - {type: goal_scored, value: 1.0}
+    - {type: ball_cleared, value: -0.5}
+    - {type: timeout, seconds: 10.0, value: -0.5}
+    step:
+    - {type: ball_toward_goal, weight: 0.01}
+
+training:
+  max_episodes: 10000
+  save_every: 500
+  model_path: models/

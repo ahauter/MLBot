@@ -1,0 +1,52 @@
+name: Corner Shot - Right Wing
+description: Shooter curls a shot from the right corner; goalkeeper defends.
+
+initial_state:
+  ball:
+    location:
+      x: {min: 2500.0, max: 3800.0}
+      y: {min: 2500.0, max: 4200.0}
+      z: {fixed: 100.0}
+    velocity:
+      x: {fixed: 0.0}
+      y: {fixed: 0.0}
+      z: {fixed: 0.0}
+  blue:
+    skill: shooting
+    location:
+      x: {min: 1500.0, max: 3000.0}
+      y: {min: 1500.0, max: 3500.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 20.0, max: 80.0}
+  orange:
+    skill: saving
+    location:
+      x: {min: -500.0, max: 500.0}
+      y: {min: 4200.0, max: 4800.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {fixed: -1.5708}
+    boost: {min: 0.0, max: 33.0}
+
+reward:
+  blue:
+    terminal:
+    - {type: goal_scored, value: 1.0}
+    - {type: ball_out_play, value: -0.5}
+    - {type: timeout, seconds: 8.0, value: -1.0}
+    step:
+    - {type: ball_toward_goal, weight: 0.01}
+  orange:
+    terminal:
+    - {type: save_made, value: 1.0}
+    - {type: goal_scored, value: -1.0}
+    - {type: timeout, seconds: 8.0, value: 0.5}
+    step:
+    - {type: ball_from_goal, weight: 0.01}
+
+training:
+  max_episodes: 10000
+  save_every: 500
+  model_path: models/
