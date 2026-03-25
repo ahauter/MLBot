@@ -421,6 +421,48 @@ def _grad_norm(params) -> float:
     return total ** 0.5
 
 
+# ── off-policy AWAC loss (batched buffer samples) ─────────────────────────────
+
+def _awac_loss_from_batch(
+    encoder:         SharedTransformerEncoder,
+    policy_head:     PolicyHead,
+    entity_type_ids: Union[torch.Tensor, List[int]],
+    windows:         torch.Tensor,   # (B, T_WINDOW, N, TOKEN_FEATURES)
+    actions:         torch.Tensor,   # (B, ACTION_DIM)
+    returns:         torch.Tensor,   # (B,)  — MC returns from buffer
+    config:          TrainConfig,
+    entity_perm:     Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    AWAC loss over a pre-sampled batch from the replay buffer.
+
+    Unlike compute_awac_loss(), this accepts tensors directly (no trajectory
+    list, no return computation) so it works with SequenceReplayBuffer.sample().
+
+    Returns (total_loss, policy_loss, value_loss).
+    """
+    embeddings = encoder(windows, entity_type_ids, entity_perm=entity_perm)
+    policy, values = policy_head(embeddings)
+    values = values.squeeze(-1)   # (B,)
+
+    advantages = (returns - values.detach())
+
+    action_dim = float(policy.shape[1])
+    log_probs = (
+        -0.5 * ((actions - policy) / math.exp(_LOG_STD)).pow(2).sum(dim=-1)
+        - action_dim * (_LOG_STD + 0.5 * math.log(_TWO_PI))
+    )
+
+    weights = torch.clamp(
+        torch.exp(advantages / config.awac_beta), max=config.awac_max_weight
+    ).detach()
+
+    policy_loss = -(log_probs * weights).mean()
+    value_loss  = (returns - values).pow(2).mean()
+
+    return policy_loss + 0.5 * value_loss, policy_loss, value_loss
+
+
 # ── main training function ────────────────────────────────────────────────────
 
 def train(
@@ -473,20 +515,26 @@ def train(
     all_params = list(encoder.parameters()) + list(policy_head.parameters())
     optimizer  = optim.Adam(all_params, lr=config.lr)
 
-    # ── 4. Off-policy replay buffer ───────────────────────────────────────────
-    replay_buf = SequenceReplayBuffer(
+    # ── 4. Replay buffers (expert and sim kept separate for ratio control) ───
+    _buf_kwargs = dict(
         capacity=config.buffer_capacity,
         t_window=T_WINDOW,
         action_dim=PolicyHead.ACTION_DIM,
         token_features=TOKEN_FEATURES,
     )
+    expert_buffer = SequenceReplayBuffer(**_buf_kwargs)
+    sim_buffer    = SequenceReplayBuffer(**_buf_kwargs)
 
-    # ── 4b. Pre-fill buffer with human replay episodes ────────────────────────
+    # ── 4b. Pre-fill expert buffer with human replay episodes ─────────────────
     replay_data_dir = Path(__file__).parent / 'replay_data' / 'parsed'
     if replay_data_dir.exists():
-        load_replays_into_buffer(replay_data_dir, replay_buf)
+        load_replays_into_buffer(replay_data_dir, expert_buffer)
 
-    print(f'Configs: {len(all_configs)}   Episodes: {config.max_episodes}   Buffer: {len(replay_buf)} steps')
+    print(
+        f'Configs: {len(all_configs)}   Episodes: {config.max_episodes}   '
+        f'Expert buffer: {len(expert_buffer)} steps   '
+        f'Expert ratio: {config.expert_replay_ratio:.2f}'
+    )
 
     # Rolling window for smoothed reward (used for Optuna objective)
     episode_rewards: deque = deque(maxlen=100)
@@ -502,12 +550,12 @@ def train(
                 entity_type_ids, config=config, explore=True,
             )
 
-            # Store trajectories in replay buffer
-            replay_buf.add_episode(
+            # Store sim trajectories in the sim buffer
+            sim_buffer.add_episode(
                 [(w[0], a, r, i == len(blue_traj) - 1)
                  for i, (w, a, r) in enumerate(blue_traj)]
             )
-            replay_buf.add_episode(
+            sim_buffer.add_episode(
                 [(w[0], a, r, i == len(orange_traj) - 1)
                  for i, (w, a, r) in enumerate(orange_traj)]
             )
@@ -537,6 +585,41 @@ def train(
             grad_norm = _grad_norm(all_params)
             optimizer.step()
 
+            # ── off-policy buffer update (expert + sim) ───────────────────────
+            buf_loss_val = 0.0
+            batch_size = config.buffer_batch_size
+            has_expert  = len(expert_buffer) >= T_WINDOW
+            has_sim     = len(sim_buffer)    >= T_WINDOW
+
+            if batch_size > 0 and (has_expert or has_sim):
+                n_expert = int(batch_size * config.expert_replay_ratio) if has_expert else 0
+                n_sim    = batch_size - n_expert if has_sim else 0
+                # redistribute if one source is unavailable
+                if not has_expert: n_expert, n_sim = 0, batch_size
+                if not has_sim:    n_expert, n_sim = batch_size, 0
+
+                batches = []
+                if n_expert > 0:
+                    batches.append(expert_buffer.sample(n_expert, config.gamma))
+                if n_sim > 0:
+                    batches.append(sim_buffer.sample(n_sim, config.gamma))
+
+                buf_windows = torch.cat([b[0] for b in batches])
+                buf_actions = torch.cat([b[1] for b in batches])
+                buf_returns = torch.cat([b[2] for b in batches])
+
+                encoder.train()
+                policy_head.train()
+                buf_total, _, _ = _awac_loss_from_batch(
+                    encoder, policy_head, entity_type_ids,
+                    buf_windows, buf_actions, buf_returns, config,
+                    entity_perm=torch.randperm(N),
+                )
+                optimizer.zero_grad()
+                buf_total.backward()
+                optimizer.step()
+                buf_loss_val = float(buf_total)
+
             # ── metrics ───────────────────────────────────────────────────────
             blue_ep_reward   = sum(r for _, _, r in blue_traj)
             orange_ep_reward = sum(r for _, _, r in orange_traj)
@@ -547,13 +630,15 @@ def train(
             logger.log(
                 episode,
                 **{
-                    'train/total_loss':          float(total_loss),
-                    'train/policy_loss':         float(policy_loss),
-                    'train/value_loss':          float(value_loss),
-                    'train/episode_reward':      ep_reward,
-                    'train/episode_length':      len(blue_traj),
-                    'train/grad_norm':           grad_norm,
-                    'train/replay_buffer_size':  len(replay_buf),
+                    'train/total_loss':            float(total_loss),
+                    'train/policy_loss':           float(policy_loss),
+                    'train/value_loss':            float(value_loss),
+                    'train/buffer_loss':           buf_loss_val,
+                    'train/episode_reward':        ep_reward,
+                    'train/episode_length':        len(blue_traj),
+                    'train/grad_norm':             grad_norm,
+                    'train/expert_buffer_size':    len(expert_buffer),
+                    'train/sim_buffer_size':       len(sim_buffer),
                     'train/smoothed_reward_100ep': smoothed_reward,
                 },
             )
@@ -610,7 +695,11 @@ def main() -> None:
     parser.add_argument('--awac-beta',   default=1.0,    type=float)
     parser.add_argument('--awac-max-weight', default=20.0, type=float)
     parser.add_argument('--gamma',       default=0.99,   type=float)
-    parser.add_argument('--explore-std', default=0.1,    type=float)
+    parser.add_argument('--explore-std',       default=0.1,   type=float)
+    parser.add_argument('--expert-ratio',      default=0.5,   type=float,
+                        help='Fraction of off-policy batch from expert replays (0.0–1.0)')
+    parser.add_argument('--buffer-batch-size', default=256,   type=int,
+                        help='Off-policy batch size per episode update (0 to disable)')
     # W&B
     parser.add_argument('--no-wandb',    action='store_true',
                         help='Disable W&B logging (stdout only)')
@@ -624,6 +713,8 @@ def main() -> None:
         awac_max_weight=args.awac_max_weight,
         gamma=args.gamma,
         explore_std=args.explore_std,
+        expert_replay_ratio=args.expert_ratio,
+        buffer_batch_size=args.buffer_batch_size,
         max_episodes=args.episodes,
         save_every=args.save_every,
         model_dir=args.model_dir,

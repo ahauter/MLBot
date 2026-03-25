@@ -77,6 +77,8 @@ def objective(trial, episodes_per_trial: int, use_wandb: bool) -> float:
         awac_max_weight=trial.suggest_float('awac_max_weight', 5.0, 100.0, log=True),
         gamma=trial.suggest_float('gamma', 0.95, 0.999),
         explore_std=trial.suggest_float('explore_std', 0.01, 0.3),
+        expert_replay_ratio=trial.suggest_float('expert_replay_ratio', 0.0, 1.0),
+        buffer_batch_size=trial.suggest_int('buffer_batch_size', 64, 512, log=True),
         max_episodes=episodes_per_trial,
         save_every=episodes_per_trial + 1,   # skip mid-trial checkpoints
         model_dir=f'models/trial_{trial.number}/',

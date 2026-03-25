@@ -25,6 +25,9 @@ class TrainConfig:
 
     # ── Replay buffer ─────────────────────────────────────────────────────────
     buffer_capacity: int = 500_000
+    buffer_batch_size: int = 256        # off-policy batch size per episode update
+    expert_replay_ratio: float = 0.5    # fraction of off-policy batch from expert buffer
+                                        # (0.0 = sim only, 1.0 = expert only)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     max_episodes: int = 10_000
