@@ -1,14 +1,23 @@
 """
 Dataclasses representing a training scenario configuration.
 
-Each scenario is stored as a YAML file and describes:
-  - which skill is being trained (shooter, defender, passer, aerial)
-  - the initial game state (ball + car positions, optionally randomised)
-  - the reward structure (terminal events and per-step signals)
-  - training hyper-parameters
+Each scenario is adversarial: it defines TWO cars (blue + orange), each
+training a different skill simultaneously.  E.g. a "shooting" scenario always
+has an opposing "saving" car, so neither side is ever practised in isolation.
 
-All position/velocity/boost fields accept either a fixed value or a uniform
-random range, expressed with the helpers below.
+Schema overview
+───────────────
+  name / description          — human-readable labels
+  initial_state
+    ball                      — BallConfig  (location + velocity, each RangeOrFixed)
+    blue                      — CarConfig   (skill + location + yaw + boost)
+    orange                    — CarConfig   (adversary skill + location + yaw + boost)
+  reward
+    blue                      — RewardConfig  (terminal events + step signals)
+    orange                    — RewardConfig
+  training                    — TrainingConfig  (episodes, save cadence, model dir)
+
+All position/velocity/boost fields accept either { fixed: N } or { min: A, max: B }.
 """
 
 from __future__ import annotations
@@ -24,22 +33,15 @@ import yaml
 
 @dataclass
 class RangeOrFixed:
-    """
-    Represents a scalar that is either a fixed value or drawn uniformly from
-    [min_val, max_val] each episode.  Set random=True for a full [-π, π] yaw.
-    """
     fixed:   Optional[float] = None
     min_val: Optional[float] = None
     max_val: Optional[float] = None
     random:  bool = False          # convenience flag for "any yaw"
 
-    # ── queries ──
-
     def is_range(self) -> bool:
         return self.min_val is not None and self.max_val is not None
 
     def center(self) -> float:
-        """Return the representative (mid-point) value, used for visualisation."""
         if self.fixed is not None:
             return self.fixed
         if self.is_range():
@@ -47,17 +49,13 @@ class RangeOrFixed:
         return 0.0
 
     def sample(self, rng=None) -> float:
-        """Draw a concrete value for one episode."""
-        import random as _rnd
-        import math
+        import random as _rnd, math
         if self.random:
             return _rnd.uniform(-math.pi, math.pi)
         if self.fixed is not None:
             return self.fixed
         lo, hi = self.min_val, self.max_val
         return rng.uniform(lo, hi) if rng is not None else _rnd.uniform(lo, hi)
-
-    # ── serialisation ──
 
     def to_dict(self) -> dict:
         if self.random:
@@ -98,7 +96,7 @@ class Vec3Config:
         )
 
 
-# ── ball & car ────────────────────────────────────────────────────────────────
+# ── ball ──────────────────────────────────────────────────────────────────────
 
 @dataclass
 class BallConfig:
@@ -106,10 +104,7 @@ class BallConfig:
     velocity: Vec3Config
 
     def to_dict(self) -> dict:
-        return {
-            'location': self.location.to_dict(),
-            'velocity': self.velocity.to_dict(),
-        }
+        return {'location': self.location.to_dict(), 'velocity': self.velocity.to_dict()}
 
     @classmethod
     def from_dict(cls, d: dict) -> BallConfig:
@@ -119,42 +114,58 @@ class BallConfig:
         )
 
 
+# ── car (used for both blue and orange) ───────────────────────────────────────
+
 @dataclass
 class CarConfig:
+    skill:    str           # which skill this car is training
     location: Vec3Config
-    yaw:   RangeOrFixed      # radians; random=True means any direction
-    boost: RangeOrFixed      # 0–100
+    yaw:      RangeOrFixed  # radians; random=True → any direction
+    boost:    RangeOrFixed  # 0–100
 
     def to_dict(self) -> dict:
-        return {
-            'location': self.location.to_dict(),
-            'rotation': {'yaw': self.yaw.to_dict()},
-            'boost':    self.boost.to_dict(),
-        }
+        d: dict = {}
+        if self.skill:
+            d['skill'] = self.skill
+        d['location'] = self.location.to_dict()
+        d['rotation']  = {'yaw': self.yaw.to_dict()}
+        d['boost']     = self.boost.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> CarConfig:
         rotation = d.get('rotation', {})
         return cls(
+            skill=d.get('skill', ''),
             location=Vec3Config.from_dict(d.get('location', {})),
             yaw=RangeOrFixed.from_dict(rotation.get('yaw', {'fixed': 0})),
             boost=RangeOrFixed.from_dict(d.get('boost', {'fixed': 33})),
         )
 
 
+# ── initial state (ball + two cars) ───────────────────────────────────────────
+
 @dataclass
 class InitialStateConfig:
-    ball: BallConfig
-    car:  CarConfig
+    ball:   BallConfig
+    blue:   CarConfig    # primary car (attacker / main skill)
+    orange: CarConfig    # adversary car
 
     def to_dict(self) -> dict:
-        return {'ball': self.ball.to_dict(), 'car': self.car.to_dict()}
+        return {
+            'ball':   self.ball.to_dict(),
+            'blue':   self.blue.to_dict(),
+            'orange': self.orange.to_dict(),
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> InitialStateConfig:
+        # backward compat: accept old 'car' key as blue car
+        blue_dict = d.get('blue') or d.get('car', {})
         return cls(
             ball=BallConfig.from_dict(d.get('ball', {})),
-            car=CarConfig.from_dict(d.get('car', {})),
+            blue=CarConfig.from_dict(blue_dict),
+            orange=CarConfig.from_dict(d.get('orange', {})),
         )
 
 
@@ -162,11 +173,10 @@ class InitialStateConfig:
 
 @dataclass
 class RewardEvent:
-    """A single terminal or per-step reward signal."""
     type:    str
-    value:   float = 0.0   # used for terminal events
-    weight:  float = 1.0   # scaling for step rewards
-    seconds: float = 0.0   # only for type == 'timeout'
+    value:   float = 0.0
+    weight:  float = 1.0
+    seconds: float = 0.0   # only used for type == 'timeout'
 
     def to_dict(self) -> dict:
         d: dict = {'type': self.type}
@@ -208,13 +218,33 @@ class RewardConfig:
         )
 
 
+@dataclass
+class AdversarialRewardConfig:
+    """Holds independent reward configs for each side of the adversarial scenario."""
+    blue:   RewardConfig
+    orange: RewardConfig
+
+    def to_dict(self) -> dict:
+        return {'blue': self.blue.to_dict(), 'orange': self.orange.to_dict()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> AdversarialRewardConfig:
+        # backward compat: old flat format has 'terminal' / 'step' at top level
+        if 'terminal' in d or 'step' in d:
+            return cls(blue=RewardConfig.from_dict(d), orange=RewardConfig())
+        return cls(
+            blue=RewardConfig.from_dict(d.get('blue', {})),
+            orange=RewardConfig.from_dict(d.get('orange', {})),
+        )
+
+
 # ── training hyper-params ─────────────────────────────────────────────────────
 
 @dataclass
 class TrainingConfig:
-    max_episodes: int  = 10000
-    save_every:   int  = 500
-    model_path:   str  = ''
+    max_episodes: int = 10000
+    save_every:   int = 500
+    model_path:   str = 'models/'
 
     def to_dict(self) -> dict:
         return {
@@ -228,7 +258,7 @@ class TrainingConfig:
         return cls(
             max_episodes=d.get('max_episodes', 10000),
             save_every=d.get('save_every', 500),
-            model_path=d.get('model_path', ''),
+            model_path=d.get('model_path', 'models/'),
         )
 
 
@@ -237,16 +267,19 @@ class TrainingConfig:
 @dataclass
 class ScenarioConfig:
     name:          str
-    skill:         str
     description:   str
     initial_state: InitialStateConfig
-    reward:        RewardConfig
+    reward:        AdversarialRewardConfig
     training:      TrainingConfig
+
+    @property
+    def skill(self) -> str:
+        """Primary (blue) skill name — used for display and folder organisation."""
+        return self.initial_state.blue.skill
 
     def to_dict(self) -> dict:
         return {
             'name':          self.name,
-            'skill':         self.skill,
             'description':   self.description,
             'initial_state': self.initial_state.to_dict(),
             'reward':        self.reward.to_dict(),
@@ -257,22 +290,33 @@ class ScenarioConfig:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as fh:
-            yaml.dump(
-                self.to_dict(), fh,
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-            )
+            yaml.dump(self.to_dict(), fh,
+                      default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> ScenarioConfig:
         with open(path) as fh:
             d = yaml.safe_load(fh)
+
+        initial_state = InitialStateConfig.from_dict(d.get('initial_state', {}))
+
+        # backward compat: old top-level 'skill' key → assign to blue car
+        if 'skill' in d and not initial_state.blue.skill:
+            initial_state = InitialStateConfig(
+                ball=initial_state.ball,
+                blue=CarConfig(
+                    skill=d['skill'],
+                    location=initial_state.blue.location,
+                    yaw=initial_state.blue.yaw,
+                    boost=initial_state.blue.boost,
+                ),
+                orange=initial_state.orange,
+            )
+
         return cls(
             name=d['name'],
-            skill=d['skill'],
             description=d.get('description', ''),
-            initial_state=InitialStateConfig.from_dict(d.get('initial_state', {})),
-            reward=RewardConfig.from_dict(d.get('reward', {})),
+            initial_state=initial_state,
+            reward=AdversarialRewardConfig.from_dict(d.get('reward', {})),
             training=TrainingConfig.from_dict(d.get('training', {})),
         )

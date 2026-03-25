@@ -54,17 +54,23 @@ BIG_BOOSTS = [
 ]
 
 # ── colour palette ────────────────────────────────────────────────────────────
-BG_COLOR    = '#12121f'
-FIELD_COLOR = '#2d5a27'
-LINE_COLOR  = 'white'
-BALL_COLOR  = '#38bdf8'
-CAR_COLOR   = '#fb923c'
+BG_COLOR         = '#12121f'
+FIELD_COLOR      = '#2d5a27'
+LINE_COLOR       = 'white'
+BALL_COLOR       = '#38bdf8'
+BLUE_CAR_COLOR   = '#60a5fa'   # RL blue team
+ORANGE_CAR_COLOR = '#fb923c'   # RL orange team
 
 SKILL_COLORS = {
-    'shooter':  '#ef4444',
-    'defender': '#60a5fa',
-    'passer':   '#4ade80',
-    'aerial':   '#c084fc',
+    'shooting':     '#ef4444',
+    'saving':       '#60a5fa',
+    'defending':    '#3b82f6',
+    'attacking':    '#f97316',
+    'passing':      '#4ade80',
+    'intercepting': '#fb923c',
+    'aerial':       '#c084fc',
+    'dribbling':    '#fbbf24',
+    'challenging':  '#f97316',
 }
 
 
@@ -184,10 +190,11 @@ def _draw_spawn(
 
 
 def _draw_elevation(
-    ax:       plt.Axes,
-    ball_loc: 'Vec3Config',
-    ball_vel: 'Vec3Config',
-    car_loc:  'Vec3Config',
+    ax:         plt.Axes,
+    ball_loc:   'Vec3Config',
+    ball_vel:   'Vec3Config',
+    blue_loc:   'Vec3Config',
+    orange_loc: 'Vec3Config',
 ) -> None:
     """
     Draw a compact X-Z cross-section ("front-on" view of the side wall).
@@ -228,11 +235,10 @@ def _draw_elevation(
             zorder=6,
         )
 
-    # ── car ──
-    _draw_spawn(
-        ax, car_loc.x, car_loc.z,
-        'car', CAR_COLOR, marker='^', marker_size=9, z=5,
-    )
+    # ── blue car ──
+    _draw_spawn(ax, blue_loc.x,   blue_loc.z,   'blue',   BLUE_CAR_COLOR,   marker='v', marker_size=9, z=5)
+    # ── orange car ──
+    _draw_spawn(ax, orange_loc.x, orange_loc.z, 'orange', ORANGE_CAR_COLOR, marker='^', marker_size=9, z=5)
 
     # ── axis style ──
     ax.set_xlim(-FIELD_X - 700, FIELD_X + 700)
@@ -283,15 +289,23 @@ def _draw_yaw_arrow(
 
 
 def _reward_summary(config: ScenarioConfig) -> str:
-    lines = ['Reward']
-    for ev in config.reward.terminal:
-        if ev.type == 'timeout':
-            lines.append(f'  ✓ timeout {ev.seconds}s → {ev.value:+.1f}')
-        else:
-            lines.append(f'  ✓ {ev.type}: {ev.value:+.1f}')
-    for ev in config.reward.step:
-        lines.append(f'  ~ {ev.type} ×{ev.weight}')
+    def _fmt(side: str, rc) -> list:
+        out = [f'{side}:']
+        for ev in rc.terminal:
+            if ev.type == 'timeout':
+                out.append(f'  ✓ timeout {ev.seconds}s→{ev.value:+.1f}')
+            else:
+                out.append(f'  ✓ {ev.type}: {ev.value:+.1f}')
+        for ev in rc.step:
+            out.append(f'  ~ {ev.type} ×{ev.weight}')
+        return out
+
+    lines = _fmt('blue', config.reward.blue) + [''] + _fmt('orange', config.reward.orange)
     return '\n'.join(lines)
+
+
+def _boost_str(b) -> str:
+    return f'{int(b.min_val)}–{int(b.max_val)}' if b.is_range() else str(int(b.fixed))
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -326,12 +340,14 @@ def visualize_scenario(
     ax.set_facecolor(BG_COLOR)
     _draw_field(ax)
 
-    skill_color = SKILL_COLORS.get(config.skill, '#ffffff')
     state = config.initial_state
+    blue_skill_color   = SKILL_COLORS.get(state.blue.skill,   BLUE_CAR_COLOR)
+    orange_skill_color = SKILL_COLORS.get(state.orange.skill, ORANGE_CAR_COLOR)
 
-    # In grid mode (no elevation panel) append z height to the label
-    ball_z_sfx = '' if standalone else _z_label(state.ball.location.z)
-    car_z_sfx  = '' if standalone else _z_label(state.car.location.z)
+    # In grid mode append z height to labels (no elevation panel available)
+    ball_z_sfx   = '' if standalone else _z_label(state.ball.location.z)
+    blue_z_sfx   = '' if standalone else _z_label(state.blue.location.z)
+    orange_z_sfx = '' if standalone else _z_label(state.orange.location.z)
 
     # ── ball ──
     ball_cx, ball_cy = _draw_spawn(
@@ -347,14 +363,23 @@ def visualize_scenario(
         BALL_COLOR,
     )
 
-    # ── car ──
-    car_cx, car_cy = _draw_spawn(
+    # ── blue car ──
+    blue_cx, blue_cy = _draw_spawn(
         ax,
-        state.car.location.x, state.car.location.y,
-        'car', CAR_COLOR, marker='^', marker_size=11, z=5,
-        label_suffix=car_z_sfx,
+        state.blue.location.x, state.blue.location.y,
+        'blue', BLUE_CAR_COLOR, marker='v', marker_size=11, z=5,
+        label_suffix=blue_z_sfx,
     )
-    _draw_yaw_arrow(ax, car_cx, car_cy, state.car.yaw, CAR_COLOR)
+    _draw_yaw_arrow(ax, blue_cx, blue_cy, state.blue.yaw, BLUE_CAR_COLOR)
+
+    # ── orange car ──
+    orange_cx, orange_cy = _draw_spawn(
+        ax,
+        state.orange.location.x, state.orange.location.y,
+        'orange', ORANGE_CAR_COLOR, marker='^', marker_size=11, z=5,
+        label_suffix=orange_z_sfx,
+    )
+    _draw_yaw_arrow(ax, orange_cx, orange_cy, state.orange.yaw, ORANGE_CAR_COLOR)
 
     # ── axis limits ──
     ax.set_xlim(-FIELD_X - 700, FIELD_X + 700)
@@ -363,29 +388,32 @@ def visualize_scenario(
 
     # ── title ──
     ax.set_title(config.name, color='white', fontsize=11, fontweight='bold', pad=6)
-    ax.text(
-        0.5, 1.005, f'skill: {config.skill.upper()}',
-        transform=ax.transAxes, ha='center', va='bottom',
-        color=skill_color, fontsize=8,
-    )
+    # Two coloured skill labels side-by-side
+    ax.text(0.38, 1.005, f'blue: {state.blue.skill}',
+            transform=ax.transAxes, ha='right', va='bottom',
+            color=blue_skill_color, fontsize=8)
+    ax.text(0.50, 1.005, '↔',
+            transform=ax.transAxes, ha='center', va='bottom',
+            color='#666', fontsize=8)
+    ax.text(0.62, 1.005, f'orange: {state.orange.skill}',
+            transform=ax.transAxes, ha='left', va='bottom',
+            color=orange_skill_color, fontsize=8)
 
     # ── reward legend (bottom-left) ──
     ax.text(
         0.02, 0.02, _reward_summary(config),
         transform=ax.transAxes, va='bottom', ha='left',
-        color='white', fontsize=6.5, alpha=0.85, family='monospace',
+        color='white', fontsize=5.5, alpha=0.85, family='monospace',
         bbox=dict(boxstyle='round,pad=0.35', facecolor='#00000077', edgecolor='none'),
         zorder=10,
     )
 
-    # ── boost label (bottom-right) ──
-    boost = state.car.boost
-    boost_str = (f'boost {int(boost.min_val)}–{int(boost.max_val)}'
-                 if boost.is_range() else f'boost {int(boost.fixed)}')
+    # ── boost labels (bottom-right) ──
     ax.text(
-        0.98, 0.02, boost_str,
+        0.98, 0.02,
+        f'boost  blue {_boost_str(state.blue.boost)}  orange {_boost_str(state.orange.boost)}',
         transform=ax.transAxes, va='bottom', ha='right',
-        color=CAR_COLOR, fontsize=7, alpha=0.9,
+        color='#aaa', fontsize=6.5, alpha=0.9,
     )
 
     # ── description (top, under title) ──
@@ -403,7 +431,8 @@ def visualize_scenario(
 
     # ── elevation strip (standalone only) ──
     if ax_elev is not None:
-        _draw_elevation(ax_elev, state.ball.location, state.ball.velocity, state.car.location)
+        _draw_elevation(ax_elev, state.ball.location, state.ball.velocity,
+                        state.blue.location, state.orange.location)
 
     if save_path:
         fig.savefig(save_path, dpi=130, bbox_inches='tight', facecolor=BG_COLOR)

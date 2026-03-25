@@ -1,6 +1,5 @@
 name: Midfield Pass
-skill: passer
-description: Ball near midfield. Car must pass the ball forward into the attacking half.
+description: Passer delivers ball from midfield into the attack half; interceptor tries to cut it off.
 
 initial_state:
   ball:
@@ -12,7 +11,8 @@ initial_state:
       x: {fixed: 0.0}
       y: {fixed: 0.0}
       z: {fixed: 0.0}
-  car:
+  blue:
+    skill: passing
     location:
       x: {min: -800.0, max: 800.0}
       y: {min: -1500.0, max: -500.0}
@@ -20,16 +20,33 @@ initial_state:
     rotation:
       yaw: {random: true}
     boost: {min: 20.0, max: 60.0}
+  orange:
+    skill: intercepting
+    location:
+      x: {min: -800.0, max: 800.0}
+      y: {min: 500.0, max: 1500.0}
+      z: {fixed: 0.0}
+    rotation:
+      yaw: {random: true}
+    boost: {min: 20.0, max: 60.0}
 
 reward:
-  terminal:
-  - {type: pass_received, value: 1.0}
-  - {type: ball_out_play, value: -0.5}
-  - {type: timeout, seconds: 8.0, value: -1.0}
-  step:
-  - {type: ball_toward_teammate, weight: 0.01}
+  blue:
+    terminal:
+    - {type: pass_received, value: 1.0}
+    - {type: ball_out_play, value: -0.5}
+    - {type: timeout, seconds: 8.0, value: -1.0}
+    step:
+    - {type: ball_toward_teammate, weight: 0.01}
+  orange:
+    terminal:
+    - {type: interception, value: 1.0}
+    - {type: pass_received, value: -1.0}
+    - {type: timeout, seconds: 8.0, value: 0.5}
+    step:
+    - {type: car_near_ball, weight: 0.01}
 
 training:
   max_episodes: 10000
   save_every: 500
-  model_path: models/passer.weights
+  model_path: models/
