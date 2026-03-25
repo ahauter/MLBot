@@ -23,7 +23,8 @@ rlgym-sim PhysicsObject conventions used here
   obj.position          np.array([x, y, z])
   obj.linear_velocity   np.array([vx, vy, vz])
   obj.angular_velocity  np.array([avx, avy, avz])
-  obj.euler_angles()    np.array([roll, pitch, yaw])   ← rlgym convention
+  obj.euler_angles()    np.array([pitch, yaw, roll])   ← rlgym convention
+                        (use .yaw() / .pitch() / .roll() helpers to avoid index ambiguity)
 
 PlayerData fields
 -----------------
@@ -137,7 +138,6 @@ class TokenObsBuilder(ObsBuilder):
 
         # ── token 1: own car ──────────────────────────────────────────────────
         own       = player.car_data
-        own_rot   = own.euler_angles()   # [roll, pitch, yaw]
         own_boost = player.boost_amount  # 0..1 — multiply by 100 for 0-100 scale
 
         own_tok = np.array([
@@ -147,16 +147,15 @@ class TokenObsBuilder(ObsBuilder):
             own.linear_velocity[0] / MAX_VEL,
             own.linear_velocity[1] / MAX_VEL,
             own.linear_velocity[2] / MAX_VEL,
-            own_rot[2]             / math.pi,   # yaw
-            own_rot[1]             / math.pi,   # pitch
-            own_rot[0]             / math.pi,   # roll
+            own.yaw()              / math.pi,
+            own.pitch()            / math.pi,
+            own.roll()             / math.pi,
             (own_boost * 100.0)    / MAX_BOOST,
         ], dtype=np.float32)
 
         # ── token 2: opponent — boost hidden ──────────────────────────────────
         if opponent is not None:
             opp     = opponent.car_data
-            opp_rot = opp.euler_angles()
             opp_tok = np.array([
                 opp.position[0]        / FIELD_X,
                 opp.position[1]        / FIELD_Y,
@@ -164,9 +163,9 @@ class TokenObsBuilder(ObsBuilder):
                 opp.linear_velocity[0] / MAX_VEL,
                 opp.linear_velocity[1] / MAX_VEL,
                 opp.linear_velocity[2] / MAX_VEL,
-                opp_rot[2]             / math.pi,   # yaw
-                opp_rot[1]             / math.pi,   # pitch
-                opp_rot[0]             / math.pi,   # roll
+                opp.yaw()              / math.pi,
+                opp.pitch()            / math.pi,
+                opp.roll()             / math.pi,
                 0.0,   # <-- opponent boost intentionally hidden
             ], dtype=np.float32)
         else:
@@ -232,7 +231,7 @@ class ScenarioStateSetter(StateSetter):
                 cfg.blue.location.y.sample(),
                 cfg.blue.location.z.sample(),
             ]
-            blue.euler_angles = [0.0, cfg.blue.yaw.sample(), 0.0]
+            blue.set_rot(pitch=0.0, yaw=cfg.blue.yaw.sample(), roll=0.0)
             blue.linear_velocity  = [0.0, 0.0, 0.0]
             blue.angular_velocity = [0.0, 0.0, 0.0]
             blue.boost = cfg.blue.boost.sample() / 100.0   # StateWrapper uses 0..1
@@ -245,7 +244,7 @@ class ScenarioStateSetter(StateSetter):
                 cfg.orange.location.y.sample(),
                 cfg.orange.location.z.sample(),
             ]
-            orange.euler_angles = [0.0, cfg.orange.yaw.sample(), 0.0]
+            orange.set_rot(pitch=0.0, yaw=cfg.orange.yaw.sample(), roll=0.0)
             orange.linear_velocity  = [0.0, 0.0, 0.0]
             orange.angular_velocity = [0.0, 0.0, 0.0]
             orange.boost = cfg.orange.boost.sample() / 100.0
