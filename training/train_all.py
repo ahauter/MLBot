@@ -218,18 +218,25 @@ class RLGymEnv(GameEnv):
     rlgym_obs_to_tokens() in encoder.py reshapes it back to (1, N_TOKENS, TOKEN_FEATURES).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mesh_path: Optional[str] = None) -> None:
         self._env  = None
         self._scenario: Optional[ScenarioConfig] = None
 
         try:
             import rlgym_sim
+            import RocketSim as rsim
             self._rlgym_sim = rlgym_sim
         except ImportError as exc:
             raise ImportError(
                 'rlgym-sim is required for --env rlgym.  '
-                'Install it with:  pip install rlgym-sim'
+                'Install it with:  pip install rocketsim && '
+                'pip install git+https://github.com/AechPro/rocket-league-gym-sim@main'
             ) from exc
+
+        # Initialise the C++ physics engine with the collision mesh files.
+        # These must be extracted from your Rocket League installation first.
+        path = mesh_path or str(_REPO / 'meshes')
+        rsim.init(path)
 
     def _build_env(self, scenario: ScenarioConfig):
         from rlgym_env import (
@@ -523,6 +530,11 @@ def main() -> None:
     parser.add_argument('--episodes',   default=10000,  type=int)
     parser.add_argument('--save-every', default=500,    type=int)
     parser.add_argument('--model-dir',  default='models/')
+    parser.add_argument(
+        '--meshes', default=None,
+        help='Path to folder containing .cmf collision mesh files '
+             '(default: <repo>/meshes/)',
+    )
     args = parser.parse_args()
 
     configs = discover_all_configs()
@@ -531,7 +543,7 @@ def main() -> None:
         return
 
     if args.env == 'rlgym':
-        env: GameEnv = RLGymEnv()
+        env: GameEnv = RLGymEnv(mesh_path=args.meshes)
     else:
         raise NotImplementedError(
             '--env rlbot requires a configured game_runner.  '
