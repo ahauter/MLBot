@@ -133,17 +133,19 @@ def compute_awac_loss(
     if not trajectory:
         return torch.tensor(0.0)
 
+    device = next(encoder.parameters()).device
+
     tokens_batch = torch.tensor(
         np.concatenate([t[0] for t in trajectory], axis=0),
-        dtype=torch.float32,
+        dtype=torch.float32, device=device,
     )   # (T_ep, T_WINDOW, N, TOKEN_FEATURES)
     actions_taken = torch.tensor(
         np.stack([t[1] for t in trajectory], axis=0),
-        dtype=torch.float32,
+        dtype=torch.float32, device=device,
     )   # (T_ep, ACTION_DIM)
     returns = torch.tensor(
         compute_returns([t[2] for t in trajectory]),
-        dtype=torch.float32,
+        dtype=torch.float32, device=device,
     )   # (T_ep,)
 
     embeddings = encoder(tokens_batch, entity_type_ids, entity_perm=entity_perm)
@@ -376,15 +378,16 @@ def collect_episode(
         blue_window   = np.stack(blue_buf)[np.newaxis]    # (1, T, N, F)
         orange_window = np.stack(orange_buf)[np.newaxis]  # (1, T, N, F)
 
+        device = next(encoder.parameters()).device
         with torch.no_grad():
             blue_emb = encoder(
-                torch.tensor(blue_window,   dtype=torch.float32),
+                torch.tensor(blue_window,   dtype=torch.float32, device=device),
                 entity_type_ids,
-            ).numpy()   # (1, D_MODEL)
+            ).cpu().numpy()   # (1, D_MODEL)
             orange_emb = encoder(
-                torch.tensor(orange_window, dtype=torch.float32),
+                torch.tensor(orange_window, dtype=torch.float32, device=device),
                 entity_type_ids,
-            ).numpy()
+            ).cpu().numpy()
 
         blue_action,   _ = policy_head.act(blue_emb)
         orange_action, _ = policy_head.act(orange_emb)
@@ -421,7 +424,10 @@ def train(
     model_path = Path(model_dir)
     model_path.mkdir(parents=True, exist_ok=True)
 
-    entity_type_ids = torch.tensor(entity_type_ids, dtype=torch.long)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+
+    entity_type_ids = torch.tensor(entity_type_ids, dtype=torch.long, device=device)
 
     # ── 1. Build shared encoder + single policy head ──────────────────────────
     encoder     = SharedTransformerEncoder()
@@ -437,6 +443,9 @@ def train(
     if head_ckpt.exists():
         policy_head.load(str(head_ckpt))
         print(f'Loaded policy head from {head_ckpt}')
+
+    encoder.to(device)
+    policy_head.to(device)
 
     # ── 3. Single optimizer over ALL parameters ───────────────────────────────
     all_params = list(encoder.parameters()) + list(policy_head.parameters())
@@ -483,7 +492,7 @@ def train(
 
             # Random entity permutation for AWAC data augmentation
             N = blue_traj[0][0].shape[2]   # entity count from window shape (1,T,N,F)
-            entity_perm = torch.randperm(N)
+            entity_perm = torch.randperm(N, device=device)
 
             blue_loss = compute_awac_loss(
                 encoder, policy_head, blue_traj,
