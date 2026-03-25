@@ -7,6 +7,10 @@ rlbottraining
 pyyaml
 matplotlib
 
+# ML framework — PyTorch avoids the protobuf/numpy conflicts that TensorFlow
+# has with RLBot's dependency pins.
+torch
+
 # Fast CPU-based RL simulation (no live game required for training)
 rlgym-sim
 

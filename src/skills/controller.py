@@ -25,7 +25,7 @@ import types
 from typing import List, Optional
 
 import numpy as np
-import tensorflow as tf
+import torch
 
 
 # ── dummy packet builder (no RLBot dependency) ────────────────────────────────
@@ -44,11 +44,15 @@ def _make_dummy_packet(config, rng=None):
         v.x, v.y, v.z = float(x), float(y), float(z)
         return v
 
-    def _physics(loc, vel, yaw):
+    def _rotation(yaw, pitch=0.0, roll=0.0):
+        return types.SimpleNamespace(yaw=float(yaw), pitch=float(pitch), roll=float(roll))
+
+    def _physics(loc, vel, yaw, ang_vel=None):
         p = types.SimpleNamespace()
-        p.location = loc
-        p.velocity = vel
-        p.rotation = types.SimpleNamespace(yaw=float(yaw))
+        p.location         = loc
+        p.velocity         = vel
+        p.angular_velocity = ang_vel or _vec(0.0, 0.0, 0.0)
+        p.rotation         = _rotation(yaw)
         return p
 
     # Ball
@@ -82,6 +86,9 @@ def _make_dummy_packet(config, rng=None):
         types.SimpleNamespace(physics=blue_phys,   boost=init.blue.boost.sample(rng)),
         types.SimpleNamespace(physics=orange_phys, boost=init.orange.boost.sample(rng)),
     ]
+    # Provide stub teams and game_info so state_to_tokens() can read game state
+    packet.teams     = [types.SimpleNamespace(score=0), types.SimpleNamespace(score=0)]
+    packet.game_info = types.SimpleNamespace(game_time_remaining=300.0, is_overtime=False)
     return packet
 
 
@@ -136,10 +143,12 @@ class KNNController:
                 sample_embs = []
                 for _ in range(n_samples):
                     packet = _make_dummy_packet(cfg)
-                    tokens = state_to_tokens(packet, car_idx)          # (1, N_TOKENS, 8)
-                    emb    = self.encoder(
-                        tf.constant(tokens, dtype=tf.float32)
-                    ).numpy()                                           # (1, 64)
+                    tokens = state_to_tokens(packet, car_idx)          # (1, N_TOKENS, TOKEN_FEATURES)
+                    self.encoder.eval()
+                    with torch.no_grad():
+                        emb = self.encoder(
+                            torch.tensor(tokens, dtype=torch.float32)
+                        ).detach().numpy()                             # (1, D_MODEL)
                     sample_embs.append(emb[0])                         # (64,)
 
                 mean_emb = np.mean(sample_embs, axis=0)                # (64,)
