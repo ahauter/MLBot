@@ -64,6 +64,7 @@ from encoder import (
     MAX_VEL, MAX_ANG_VEL, MAX_BOOST,
     MAX_SCORE, MAX_TIME,
     N_TOKENS, TOKEN_FEATURES,
+    ENTITY_TYPE_IDS_1V1,
 )
 
 # ── big boost pad metadata ────────────────────────────────────────────────────

@@ -1,61 +1,109 @@
 """
-Shared Transformer Encoder
-==========================
-Converts a game-state packet into a 64-dimensional embedding.
+Shared Spatiotemporal Transformer Encoder
+==========================================
+Converts a sliding window of T game-state snapshots into a 64-dim embedding.
 
-State representation — one token per entity:
-  token 0    ball          [x, y, z, vx, vy, vz, av_x, av_y, av_z, 0       ]
-  token 1    own car       [x, y, z, vx, vy, vz, yaw,  pitch, roll, boost   ]
-  token 2    opponent car  [x, y, z, vx, vy, vz, yaw,  pitch, roll, 0       ]
-                           └─ opponent boost is intentionally hidden (not
-                              observable in real Rocket League matches)
-  tokens 3-8 big boost pad [x, y, z, active, 0, 0, 0, 0, 0, 0               ]
-  token 9    game state    [score_diff, time_rem, overtime, 0, 0, 0, 0, 0, 0, 0]
+Each snapshot contains N entity tokens (N varies by game mode):
+  Standard 1v1 (N=10):
+    token 0    ball          [x, y, z, vx, vy, vz, av_x, av_y, av_z, 0       ]
+    token 1    own car       [x, y, z, vx, vy, vz, yaw,  pitch, roll, boost   ]
+    token 2    opponent car  [x, y, z, vx, vy, vz, yaw,  pitch, roll, 0       ]
+                             └─ opponent boost intentionally hidden
+    tokens 3-8 big boost pad [x, y, z, active, 0, 0, 0, 0, 0, 0               ]
+    token 9    game state    [score_diff, time_rem, overtime, 0, …             ]
 
-TOKEN_FEATURES = 10.  All values are individually normalised to [-1, 1].
+TOKEN_FEATURES = 10.  All values individually normalised to [-1, 1].
 
-Adding more entities (teammates, small pads) just means adding more tokens —
-the transformer architecture requires no other code changes.
+Entity type IDs (shared contract across all game modes):
+    0 = ball
+    1 = own car
+    2 = opponent car
+    3 = boost pad
+    4 = game state
 
-RLGym integration
------------------
-`rlgym_obs_to_tokens(obs, player_idx)` maps a flat RLGym observation vector
-(produced by our custom TokenObsBuilder) to (1, N_TOKENS, TOKEN_FEATURES).
-The encoder and all downstream code stay unchanged across both paths.
+ENTITY_TYPE_IDS_1V1 maps the standard 10 slots to these IDs:
+    [0, 1, 2, 3, 3, 3, 3, 3, 3, 4]
+
+Temporal window
+---------------
+forward() accepts either:
+  (batch, N, F)        — single-step legacy path (auto-unsqueezed to T=1)
+  (batch, T, N, F)     — sliding window of T steps
+
+entity_type_ids (N,) must be supplied by the caller; it varies per game mode.
+
+During AWAC training, pass entity_perm=(N,) int64 permutation to shuffle the
+entity axis as data augmentation.  The same permutation is applied across all
+T timesteps.  Never use entity_perm at inference.
+
+Adding more entities (teammates, small pads) just means more tokens per step —
+no other code changes required.
 """
 
 from __future__ import annotations
 
+import functools
 import math
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-# ── normalization constants ───────────────────────────────────────────────────
+# ── normalisation constants ───────────────────────────────────────────────────
 
 FIELD_X      = 4096.0
 FIELD_Y      = 5120.0
 CEILING_Z    = 2044.0
 MAX_VEL      = 2300.0
-MAX_ANG_VEL  = 5.5      # rad/s (approximate max in Rocket League)
+MAX_ANG_VEL  = 5.5
 MAX_BOOST    = 100.0
-MAX_SCORE    = 10.0     # normalise score diff; clipped to [-1, 1] after division
-MAX_TIME     = 300.0    # regulation length in seconds
+MAX_SCORE    = 10.0
+MAX_TIME     = 300.0
 
 # ── token dimensions ──────────────────────────────────────────────────────────
 
 TOKEN_FEATURES = 10
+D_MODEL        = 64
 
-# 1 ball + 1 own car + 1 opponent + 6 big boost pads + 1 game-state
+# N_TOKENS=10 kept for backward compatibility with 1v1 tokenisers.
+# New code should read N from the token array shape, not this constant.
 N_TOKENS = 10
 
-# Encoder output dimension
-D_MODEL = 64
+# ── temporal window ───────────────────────────────────────────────────────────
 
-# Number of big boost pads expected — must match N_TOKENS - 3
+T_WINDOW = 4   # default sliding window size (4 steps × ~66 ms ≈ 266 ms)
+T_MAX    = 8   # maximum window size the model supports
+
+# ── entity type IDs ───────────────────────────────────────────────────────────
+
+N_ENTITY_TYPES = 5   # ball=0, own_car=1, opp_car=2, boost_pad=3, game_state=4
+
+# Standard 1v1 mapping: 10 token slots → type IDs
+ENTITY_TYPE_IDS_1V1: List[int] = [0, 1, 2, 3, 3, 3, 3, 3, 3, 4]
+
 _N_BIG_PADS = 6
+
+
+# ── causal mask ───────────────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=16)
+def _causal_mask(T: int, N: int, device_str: str) -> torch.Tensor:
+    """
+    Block-lower-triangular additive attention mask of shape (T*N, T*N).
+
+    Entry [i, j] = -inf  if token j belongs to a later timestep than token i,
+                 = 0.0   otherwise (token can attend).
+
+    Cached by (T, N, device_str) so it is only computed once per unique combo.
+    The returned tensor must not be modified in-place.
+    """
+    size = T * N
+    # which timestep does each position belong to?
+    step = torch.arange(size, device=device_str) // N   # (size,)
+    mask = torch.zeros(size, size, device=device_str)
+    mask[step.unsqueeze(1) < step.unsqueeze(0)] = float('-inf')
+    return mask
 
 
 # ── state extraction ──────────────────────────────────────────────────────────
@@ -72,20 +120,9 @@ def state_to_tokens(
     Parameters
     ----------
     packet   : RLBot GameTickPacket
-    car_idx  : index of "own" car (0 = blue, 1 = orange); opponent = car_idx ^ 1
+    car_idx  : index of "own" car (0 = blue, 1 = orange)
     big_pads : list of BoostPad objects from BoostPadTracker.get_full_boosts()
-               (must have a `.location` Vec3 and `.is_active` bool).
-               Pass None to leave pad tokens zeroed (e.g. first tick before
-               BoostPadTracker is initialised).
-
-    Token layout
-    ------------
-    idx  entity        features
-    0    ball           x y z  vx vy vz  av_x av_y av_z  0
-    1    own car        x y z  vx vy vz  yaw pitch roll   boost
-    2    opponent car   x y z  vx vy vz  yaw pitch roll   0  ← boost hidden
-    3-8  big boost pad  x y z  active    0 0 0 0 0 0
-    9    game state     score_diff time_rem overtime  0…
+               Pass None to leave pad tokens zeroed.
     """
     opp_idx = car_idx ^ 1
 
@@ -95,7 +132,6 @@ def state_to_tokens(
 
     own_boost = float(packet.game_cars[car_idx].boost)
 
-    # ── token 0: ball ─────────────────────────────────────────────────────────
     ball_token = np.array([
         ball.location.x         / FIELD_X,
         ball.location.y         / FIELD_Y,
@@ -109,7 +145,6 @@ def state_to_tokens(
         0.0,
     ], dtype=np.float32)
 
-    # ── token 1: own car ──────────────────────────────────────────────────────
     own_token = np.array([
         own.location.x  / FIELD_X,
         own.location.y  / FIELD_Y,
@@ -123,7 +158,6 @@ def state_to_tokens(
         own_boost / MAX_BOOST,
     ], dtype=np.float32)
 
-    # ── token 2: opponent car — boost intentionally hidden ────────────────────
     opp_token = np.array([
         opp.location.x  / FIELD_X,
         opp.location.y  / FIELD_Y,
@@ -134,10 +168,9 @@ def state_to_tokens(
         float(opp.rotation.yaw)   / math.pi,
         float(opp.rotation.pitch) / math.pi,
         float(opp.rotation.roll)  / math.pi,
-        0.0,   # <-- opponent boost is NOT given to the encoder
+        0.0,
     ], dtype=np.float32)
 
-    # ── tokens 3-8: big boost pads ────────────────────────────────────────────
     pad_tokens = []
     if big_pads is not None:
         for pad in big_pads[:_N_BIG_PADS]:
@@ -151,7 +184,6 @@ def state_to_tokens(
     while len(pad_tokens) < _N_BIG_PADS:
         pad_tokens.append(np.zeros(TOKEN_FEATURES, dtype=np.float32))
 
-    # ── token 9: game state ───────────────────────────────────────────────────
     blue_score   = float(packet.teams[0].score)
     orange_score = float(packet.teams[1].score)
     score_diff   = (blue_score - orange_score) if car_idx == 0 else (orange_score - blue_score)
@@ -176,21 +208,18 @@ def state_to_tokens(
 
 def rlgym_obs_to_tokens(obs: np.ndarray, player_idx: int) -> np.ndarray:
     """
-    Map a flat RLGym observation vector to (1, N_TOKENS, TOKEN_FEATURES).
+    Map a flat RLGym observation vector to (1, N, TOKEN_FEATURES).
 
-    Assumes the observation was produced by TokenObsBuilder (training/rlgym_env.py),
-    which serialises the token matrix row-by-row into a flat array of length
-    N_TOKENS * TOKEN_FEATURES.  player_idx is accepted for API symmetry but is
-    not used here — the obs builder already encodes the observation from the
-    requesting player's perspective.
+    N is inferred from obs length: N = len(obs) // TOKEN_FEATURES.
+    Assumes the observation was produced by TokenObsBuilder.
     """
-    expected = N_TOKENS * TOKEN_FEATURES
-    if obs.shape[0] != expected:
+    if obs.shape[0] % TOKEN_FEATURES != 0:
         raise ValueError(
-            f'Expected obs length {expected} (N_TOKENS={N_TOKENS} × '
-            f'TOKEN_FEATURES={TOKEN_FEATURES}), got {obs.shape[0]}'
+            f'obs length {obs.shape[0]} is not divisible by '
+            f'TOKEN_FEATURES={TOKEN_FEATURES}'
         )
-    return obs.reshape(1, N_TOKENS, TOKEN_FEATURES).astype(np.float32)
+    N = obs.shape[0] // TOKEN_FEATURES
+    return obs.reshape(1, N, TOKEN_FEATURES).astype(np.float32)
 
 
 # ── transformer building blocks ───────────────────────────────────────────────
@@ -213,10 +242,13 @@ class _TransformerEncoderLayer(nn.Module):
         self.drop1 = nn.Dropout(0.1)
         self.drop2 = nn.Dropout(0.1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Training/eval mode is inherited from the parent module via model.train()/eval()
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x_norm   = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
         x        = x + self.drop1(attn_out)
         x        = x + self.drop2(self.ffn(self.norm2(x)))
         return x
@@ -226,10 +258,19 @@ class _TransformerEncoderLayer(nn.Module):
 
 class SharedTransformerEncoder(nn.Module):
     """
-    Shared encoder used by both cars and both skill heads in every episode.
+    Spatiotemporal encoder: sliding T-step window → (batch, D_MODEL) embedding.
 
-    Input:  (batch, N_TOKENS, TOKEN_FEATURES)  — normalised token matrix
-    Output: (batch, D_MODEL)                   — embedding via mean-pool over tokens
+    Input:  (batch, T, N, TOKEN_FEATURES)  — window of T steps, N entities each
+        or  (batch, N, TOKEN_FEATURES)     — single-step (auto-unsqueezed to T=1)
+    Output: (batch, D_MODEL)               — via mean-pool over last-step tokens
+
+    entity_type_ids: (N,) int64 tensor mapping each slot to its type ID.
+                     Must be supplied by the caller; varies per game mode.
+                     Use ENTITY_TYPE_IDS_1V1 for standard 1v1.
+
+    entity_perm: optional (N,) int64 permutation for AWAC data augmentation.
+                 Shuffles the entity axis identically across all T timesteps.
+                 Never use at inference.
     """
 
     N_HEADS  = 4
@@ -242,10 +283,12 @@ class SharedTransformerEncoder(nn.Module):
 
         self.input_projection = nn.Linear(TOKEN_FEATURES, d_model)
 
-        # Learned per-entity-position embeddings (1, N_TOKENS, d_model).
-        # Each entity (ball, own car, opponent, each boost pad, game-state) gets
-        # its own learned offset so the transformer can distinguish entity types.
-        self.pos_embedding = nn.Parameter(torch.randn(1, N_TOKENS, d_model) * 0.02)
+        # Entity type embedding — replaces the old slot-indexed pos_embedding.
+        # Keyed by entity type ID (0-4), shared across all game modes.
+        self.entity_type_embedding = nn.Embedding(N_ENTITY_TYPES, d_model)
+
+        # Time embedding — one learnable vector per timestep index (0 = oldest).
+        self.time_embedding = nn.Embedding(T_MAX, d_model)
 
         self.transformer_layers = nn.ModuleList([
             _TransformerEncoderLayer(
@@ -254,16 +297,56 @@ class SharedTransformerEncoder(nn.Module):
             for _ in range(self.N_LAYERS)
         ])
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        entity_type_ids: Union[torch.Tensor, List[int]],
+        entity_perm: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        tokens: (batch, N_TOKENS, TOKEN_FEATURES)
-        returns: (batch, D_MODEL)
+        tokens:          (batch, T, N, F)  or  (batch, N, F)
+        entity_type_ids: (N,) — type ID per entity slot; varies by game mode
+        entity_perm:     (N,) optional permutation for AWAC shuffling (training only)
+        returns:         (batch, D_MODEL)
         """
-        x = self.input_projection(tokens)   # (batch, N_TOKENS, D_MODEL)
-        x = x + self.pos_embedding          # broadcast add entity-type embeddings
+        if tokens.dim() == 3:
+            tokens = tokens.unsqueeze(1)          # (batch, 1, N, F)
+        batch, T, N, F = tokens.shape
+
+        # Convert entity_type_ids to a tensor on the right device
+        if not isinstance(entity_type_ids, torch.Tensor):
+            entity_type_ids = torch.tensor(
+                entity_type_ids, dtype=torch.long, device=tokens.device)
+        else:
+            entity_type_ids = entity_type_ids.to(tokens.device)
+
+        # Apply entity permutation (AWAC data augmentation — training only)
+        if entity_perm is not None:
+            tokens          = tokens[:, :, entity_perm, :]
+            entity_type_ids = entity_type_ids[entity_perm]
+
+        x = tokens.reshape(batch, T * N, F)
+        x = self.input_projection(x)                          # (batch, T*N, D)
+
+        # Entity type embeddings — tiled across T timesteps
+        etype = entity_type_ids.unsqueeze(0).expand(T, N).reshape(1, T * N)
+        x = x + self.entity_type_embedding(etype)             # (batch, T*N, D)
+
+        # Time embeddings — index 0=oldest, T-1=most recent
+        t_ids = (
+            torch.arange(T, device=x.device)
+            .unsqueeze(1).expand(T, N).reshape(1, T * N)
+        )
+        x = x + self.time_embedding(t_ids)                    # (batch, T*N, D)
+
+        # Causal mask: entities at step t cannot attend to step t+1 .. T-1
+        mask = _causal_mask(T, N, str(x.device))
         for layer in self.transformer_layers:
-            x = layer(x)                   # (batch, N_TOKENS, D_MODEL)
-        return x.mean(dim=1)               # mean-pool → (batch, D_MODEL)
+            x = layer(x, attn_mask=mask)                      # (batch, T*N, D)
+
+        # Pool over the most-recent timestep's tokens only.
+        # History is already encoded into these positions via cross-time attention.
+        return x[:, (T - 1) * N:, :].mean(dim=1)             # (batch, D)
 
     def save(self, path: str) -> None:
         torch.save(self.state_dict(), path)
@@ -275,5 +358,8 @@ class SharedTransformerEncoder(nn.Module):
     def load_from(cls, path: str) -> 'SharedTransformerEncoder':
         """Load a saved encoder from a .pt checkpoint."""
         model = cls()
-        model.load_state_dict(torch.load(path, map_location='cpu'))
+        state = torch.load(path, map_location='cpu')
+        # Migration: old checkpoints have pos_embedding — drop it silently.
+        state.pop('pos_embedding', None)
+        model.load_state_dict(state, strict=False)
         return model
