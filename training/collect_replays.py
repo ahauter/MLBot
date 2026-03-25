@@ -108,6 +108,12 @@ def main() -> None:
         action='store_false',
         help='Re-download all replays even if already in manifest.json',
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=2,
+        help='Parallel download workers (default: 2, max ~3 recommended)',
+    )
 
     args = parser.parse_args()
 
@@ -125,6 +131,7 @@ def main() -> None:
         playlist   = args.playlist,
         keep_raw   = args.keep_raw,
         resume     = args.resume,
+        workers    = args.workers,
     )
 
 
