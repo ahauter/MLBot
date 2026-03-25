@@ -37,7 +37,8 @@ import numpy as np
 import requests
 
 try:
-    from rlgym_tools.replays import ReplayConverter
+    from rlgym_tools.rocket_league.replays.parsed_replay import ParsedReplay
+    from rlgym_tools.rocket_league.replays.convert import replay_to_rlgym
 except ImportError as _err:
     raise ImportError(
         'rlgym-tools is required for replay parsing.\n'
@@ -95,11 +96,11 @@ def gamestate_to_tokens(state, player_idx: int) -> np.ndarray:
     """
     own_player: Optional[object] = None
     opp_player: Optional[object] = None
-    for p in state.players:
-        if p.team_num == player_idx and own_player is None:
-            own_player = p
-        elif p.team_num != player_idx and opp_player is None:
-            opp_player = p
+    for car in state.cars.values():
+        if car.team_num == player_idx and own_player is None:
+            own_player = car
+        elif car.team_num != player_idx and opp_player is None:
+            opp_player = car
 
     ball = state.ball
 
@@ -119,8 +120,8 @@ def gamestate_to_tokens(state, player_idx: int) -> np.ndarray:
 
     # ── token 1: own car ──────────────────────────────────────────────────────
     if own_player is not None:
-        own = own_player.car_data
-        own_boost = own_player.boost_amount   # 0..1; multiply by 100 for 0-100 scale
+        own = own_player.physics
+        own_boost = own_player.boost_amount   # rlgym Car: 0..100 scale
         own_tok = np.array([
             own.position[0]        / FIELD_X,
             own.position[1]        / FIELD_Y,
@@ -128,17 +129,17 @@ def gamestate_to_tokens(state, player_idx: int) -> np.ndarray:
             own.linear_velocity[0] / MAX_VEL,
             own.linear_velocity[1] / MAX_VEL,
             own.linear_velocity[2] / MAX_VEL,
-            own.yaw()              / math.pi,
-            own.pitch()            / math.pi,
-            own.roll()             / math.pi,
-            (own_boost * 100.0)    / MAX_BOOST,
+            own.yaw               / math.pi,
+            own.pitch             / math.pi,
+            own.roll              / math.pi,
+            own_boost             / MAX_BOOST,
         ], dtype=np.float32)
     else:
         own_tok = np.zeros(TOKEN_FEATURES, dtype=np.float32)
 
     # ── token 2: opponent — boost intentionally hidden ────────────────────────
     if opp_player is not None:
-        opp = opp_player.car_data
+        opp = opp_player.physics
         opp_tok = np.array([
             opp.position[0]        / FIELD_X,
             opp.position[1]        / FIELD_Y,
@@ -146,9 +147,9 @@ def gamestate_to_tokens(state, player_idx: int) -> np.ndarray:
             opp.linear_velocity[0] / MAX_VEL,
             opp.linear_velocity[1] / MAX_VEL,
             opp.linear_velocity[2] / MAX_VEL,
-            opp.yaw()              / math.pi,
-            opp.pitch()            / math.pi,
-            opp.roll()             / math.pi,
+            opp.yaw               / math.pi,
+            opp.pitch             / math.pi,
+            opp.roll              / math.pi,
             0.0,   # opponent boost not observable in real matches
         ], dtype=np.float32)
     else:
@@ -157,7 +158,7 @@ def gamestate_to_tokens(state, player_idx: int) -> np.ndarray:
     # ── tokens 3-8: big boost pads ────────────────────────────────────────────
     pad_toks = []
     for i, idx in enumerate(_BIG_PAD_INDICES):
-        active = float(state.boost_pads[idx]) if idx < len(state.boost_pads) else 0.0
+        active = float(state.boost_pad_timers[idx] == 0) if idx < len(state.boost_pad_timers) else 0.0
         pos = _BIG_PAD_POSITIONS[i]
         pad_toks.append(np.array([
             pos[0] / FIELD_X,
@@ -189,15 +190,15 @@ def parse_replay(replay_path: Path) -> np.ndarray:
       T   : number of frames
       2   : player perspectives — index 0 = blue, index 1 = orange
     """
-    converter = ReplayConverter()
-    # ReplayConverter.convert() returns an iterable of GameState objects
-    states = list(converter.convert(str(replay_path)))
+    replay = ParsedReplay.load(str(replay_path))
+    replay_frames = list(replay_to_rlgym(replay))
 
-    if not states:
+    if not replay_frames:
         raise ValueError(f'No frames parsed from {replay_path}')
 
     frames = []
-    for state in states:
+    for replay_frame in replay_frames:
+        state = replay_frame.state
         blue_tok   = gamestate_to_tokens(state, player_idx=0)
         orange_tok = gamestate_to_tokens(state, player_idx=1)
         frames.append(np.stack([blue_tok, orange_tok], axis=0))   # (2, N_TOKENS, F)

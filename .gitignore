@@ -6,6 +6,8 @@ __pycache__/
 # Collision meshes from the game
 collision_meshes/
 models/
+replay_data/
+.env
 
 # C extensions
 *.so
