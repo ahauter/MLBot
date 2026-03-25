@@ -81,17 +81,20 @@ class ExperimentLogger:
         except ImportError:
             return None
 
-        # Check that credentials exist (login file or env var)
+        # Check credentials via wandb's own mechanism — handles env vars,
+        # ~/.netrc, ~/_netrc (Windows), and wandb settings files correctly.
         api_key = os.environ.get('WANDB_API_KEY', '')
-        netrc   = os.path.expanduser('~/.netrc')
-        has_creds = bool(api_key) or (
-            os.path.exists(netrc) and 'api.wandb.ai' in open(netrc).read()
-        )
-        if not has_creds:
-            print('[logger] WANDB_API_KEY not set and no saved login found — '
-                  'falling back to stdout. Run `wandb login` to enable W&B.',
-                  file=sys.stderr)
-            return None
+        if not api_key:
+            try:
+                # Returns True if already authenticated (no prompts, no network)
+                logged_in = wandb.login(anonymous='never', relogin=False)
+            except Exception:
+                logged_in = False
+            if not logged_in:
+                print('[logger] No W&B credentials found — '
+                      'falling back to stdout. Run `wandb login` to enable W&B.',
+                      file=sys.stderr)
+                return None
 
         try:
             cfg_dict = dataclasses.asdict(config)

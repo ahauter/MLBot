@@ -7,6 +7,9 @@ __pycache__/
 collision_meshes/
 models/
 replay_data/
+wandb/
+*.db
+.claude/
 .env
 
 # C extensions

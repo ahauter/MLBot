@@ -550,13 +550,14 @@ def train(
                 entity_type_ids, config=config, explore=True,
             )
 
-            # Store sim trajectories in the sim buffer
+            # Store sim trajectories in the sim buffer.
+            # w has shape (1, T_WINDOW, N, F); w[0, -1] is the current (N, F) obs.
             sim_buffer.add_episode(
-                [(w[0], a, r, i == len(blue_traj) - 1)
+                [(w[0, -1], a, r, i == len(blue_traj) - 1)
                  for i, (w, a, r) in enumerate(blue_traj)]
             )
             sim_buffer.add_episode(
-                [(w[0], a, r, i == len(orange_traj) - 1)
+                [(w[0, -1], a, r, i == len(orange_traj) - 1)
                  for i, (w, a, r) in enumerate(orange_traj)]
             )
 
@@ -588,8 +589,8 @@ def train(
             # ── off-policy buffer update (expert + sim) ───────────────────────
             buf_loss_val = 0.0
             batch_size = config.buffer_batch_size
-            has_expert  = len(expert_buffer) >= T_WINDOW
-            has_sim     = len(sim_buffer)    >= T_WINDOW
+            has_expert  = len(expert_buffer._valid_endpoints()) > 0
+            has_sim     = len(sim_buffer._valid_endpoints())    > 0
 
             if batch_size > 0 and (has_expert or has_sim):
                 n_expert = int(batch_size * config.expert_replay_ratio) if has_expert else 0
@@ -599,26 +600,31 @@ def train(
                 if not has_sim:    n_expert, n_sim = batch_size, 0
 
                 batches = []
-                if n_expert > 0:
-                    batches.append(expert_buffer.sample(n_expert, config.gamma))
-                if n_sim > 0:
-                    batches.append(sim_buffer.sample(n_sim, config.gamma))
+                try:
+                    if n_expert > 0:
+                        batches.append(expert_buffer.sample(n_expert, config.gamma))
+                    if n_sim > 0:
+                        batches.append(sim_buffer.sample(n_sim, config.gamma))
+                except RuntimeError as _sample_err:
+                    print(f'[warn] Skipping off-policy update: {_sample_err}',
+                          file=sys.stderr)
 
-                buf_windows = torch.cat([b[0] for b in batches])
-                buf_actions = torch.cat([b[1] for b in batches])
-                buf_returns = torch.cat([b[2] for b in batches])
+                if batches:
+                    buf_windows = torch.cat([b[0] for b in batches])
+                    buf_actions = torch.cat([b[1] for b in batches])
+                    buf_returns = torch.cat([b[2] for b in batches])
 
-                encoder.train()
-                policy_head.train()
-                buf_total, _, _ = _awac_loss_from_batch(
-                    encoder, policy_head, entity_type_ids,
-                    buf_windows, buf_actions, buf_returns, config,
-                    entity_perm=torch.randperm(N),
-                )
-                optimizer.zero_grad()
-                buf_total.backward()
-                optimizer.step()
-                buf_loss_val = float(buf_total)
+                    encoder.train()
+                    policy_head.train()
+                    buf_total, _, _ = _awac_loss_from_batch(
+                        encoder, policy_head, entity_type_ids,
+                        buf_windows, buf_actions, buf_returns, config,
+                        entity_perm=torch.randperm(N),
+                    )
+                    optimizer.zero_grad()
+                    buf_total.backward()
+                    optimizer.step()
+                    buf_loss_val = float(buf_total)
 
             # ── metrics ───────────────────────────────────────────────────────
             blue_ep_reward   = sum(r for _, _, r in blue_traj)
