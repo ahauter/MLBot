@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import tensorflow as tf
+import torch
 
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.structures.game_data_struct import GameTickPacket
@@ -51,13 +51,12 @@ class MyBot(BaseAgent):
 
     def initialize_agent(self) -> None:
         """Load encoder, KNN index, and all available skill heads from models/."""
-        enc_path = MODEL_DIR / 'encoder.weights.h5'
+        enc_path = MODEL_DIR / 'encoder.pt'
         if enc_path.exists():
             self.encoder = SharedTransformerEncoder.load_from(str(enc_path))
         else:
             # No trained model yet — use untrained encoder (random behaviour)
             self.encoder = SharedTransformerEncoder()
-            self.encoder(tf.zeros((1, 3, 8)))
 
         self.controller = KNNController(self.encoder, k=3)
         knn_path = MODEL_DIR / 'knn_index.npz'
@@ -70,18 +69,19 @@ class MyBot(BaseAgent):
         # Load whichever skill heads are present in models/
         for skill_name in self.controller.known_skills():
             head = SkillHead(skill_name)
-            head(tf.zeros((1, 64)))   # build variables before loading weights
-            head_path = MODEL_DIR / f'skill_{skill_name}.weights.h5'
+            head_path = MODEL_DIR / f'skill_{skill_name}.pt'
             if head_path.exists():
-                head.load_weights(str(head_path))
+                head.load_state_dict(torch.load(str(head_path), map_location='cpu'))
             self.skill_heads[skill_name] = head
 
     def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
         # 1. Encode current game state for this car's perspective
-        tokens    = state_to_tokens(packet, self.index)            # (1, 3, 8)
-        embedding = self.encoder(
-            tf.constant(tokens, dtype=tf.float32)
-        ).numpy()                                                   # (1, 64)
+        tokens = state_to_tokens(packet, self.index)   # (1, N_TOKENS, TOKEN_FEATURES)
+        self.encoder.eval()
+        with torch.no_grad():
+            embedding = self.encoder(
+                torch.tensor(tokens, dtype=torch.float32)
+            ).numpy()                                   # (1, D_MODEL)
 
         # 2. Select skill via KNN lookup
         if self.skill_heads:

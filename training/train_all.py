@@ -5,8 +5,8 @@ Joint Multi-Task Training Loop
 Trains all skills simultaneously using adversarial scenario configs.
 
 Both cars in each episode share the SAME encoder and the SAME skill_heads dict.
-Gradients from blue's loss and orange's loss are summed in a single GradientTape
-so the shared encoder learns features useful for all skills at once.
+Gradients from blue's loss and orange's loss are summed in a single backward()
+pass so the shared encoder learns features useful for all skills at once.
 
 Usage
 -----
@@ -24,14 +24,10 @@ Usage
 
 Architecture notes
 ------------------
-- Actor-Critic with Monte Carlo returns (A2C).  Upgrade path to PPO is
-  scaffolded in the TODOs below.
+- Actor-Critic with Monte Carlo returns (A2C).
 - Policy: Gaussian distribution with fixed log_std = log(0.5).  The mean is
   the tanh output of the skill head.  Exploration comes from per-step additive
   Gaussian noise on the analog controls during trajectory collection.
-- The GradientTape context wraps compute_ac_loss() which replays the episode
-  as a batch — the encoder is called INSIDE the tape for training, separate
-  from the inference calls during tick collection.
 
 Environment abstraction
 -----------------------
@@ -61,7 +57,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.optim as optim
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _REPO = Path(__file__).parent.parent
@@ -117,15 +114,15 @@ def compute_returns(rewards: List[float]) -> np.ndarray:
 
 # ── Actor-Critic loss ─────────────────────────────────────────────────────────
 
-_LOG_STD = tf.constant(math.log(0.5), dtype=tf.float32)
-_TWO_PI  = tf.constant(2.0 * math.pi, dtype=tf.float32)
+_LOG_STD = math.log(0.5)
+_TWO_PI  = 2.0 * math.pi
 
 
 def compute_ac_loss(
     encoder:    SharedTransformerEncoder,
     skill_head: SkillHead,
     trajectory: List[Tuple[np.ndarray, np.ndarray, float]],
-) -> tf.Tensor:
+) -> torch.Tensor:
     """
     Compute Actor-Critic loss from one episode's trajectory.
 
@@ -134,45 +131,38 @@ def compute_ac_loss(
       action  (ACTION_DIM,)  — action actually taken (including exploration noise)
       reward  scalar
 
-    Must be called INSIDE a tf.GradientTape so encoder gradients are captured.
-    Returns tf.constant(0.0) for empty trajectories.
+    Returns torch.tensor(0.0) for empty trajectories.
     """
     if not trajectory:
-        return tf.constant(0.0)
+        return torch.tensor(0.0)
 
-    tokens_batch  = tf.constant(
+    tokens_batch  = torch.tensor(
         np.concatenate([t[0] for t in trajectory], axis=0),
-        dtype=tf.float32,
+        dtype=torch.float32,
     )   # (T, N_TOKENS, TOKEN_FEATURES)
-    actions_taken = tf.constant(
+    actions_taken = torch.tensor(
         np.stack([t[1] for t in trajectory], axis=0),
-        dtype=tf.float32,
+        dtype=torch.float32,
     )   # (T, ACTION_DIM)
-    returns = tf.constant(
+    returns = torch.tensor(
         compute_returns([t[2] for t in trajectory]),
-        dtype=tf.float32,
+        dtype=torch.float32,
     )   # (T,)
 
-    embeddings     = encoder(tokens_batch, training=True)       # (T, D_MODEL)
-    policy, values = skill_head(embeddings, training=True)      # (T, ACTION_DIM), (T, 1)
-    values         = tf.squeeze(values, axis=-1)                # (T,)
+    embeddings     = encoder(tokens_batch)              # (T, D_MODEL)
+    policy, values = skill_head(embeddings)             # (T, ACTION_DIM), (T, 1)
+    values         = values.squeeze(-1)                 # (T,)
 
-    advantages = returns - tf.stop_gradient(values)
+    advantages = returns - values.detach()              # (T,)
 
-    action_dim = tf.cast(tf.shape(policy)[1], tf.float32)
+    action_dim = float(policy.shape[1])
     log_probs  = (
-        -0.5 * tf.reduce_sum(
-            tf.square((actions_taken - policy) / tf.exp(_LOG_STD)), axis=-1
-        )
-        - action_dim * (_LOG_STD + 0.5 * tf.math.log(_TWO_PI))
+        -0.5 * ((actions_taken - policy) / math.exp(_LOG_STD)).pow(2).sum(dim=-1)
+        - action_dim * (_LOG_STD + 0.5 * math.log(_TWO_PI))
     )
-    policy_loss = -tf.reduce_mean(log_probs * tf.stop_gradient(advantages))
-    value_loss  =  tf.reduce_mean(tf.square(returns - values))
-
-    # Differential entropy of Gaussian — encourages exploration
-    entropy_bonus = 0.01 * 0.5 * action_dim * (
-        1.0 + tf.math.log(_TWO_PI * tf.exp(2.0 * _LOG_STD))
-    )
+    policy_loss   = -(log_probs * advantages.detach()).mean()
+    value_loss    = (returns - values).pow(2).mean()
+    entropy_bonus = 0.01 * 0.5 * action_dim * (1.0 + math.log(_TWO_PI * math.exp(2.0 * _LOG_STD)))
 
     return policy_loss + 0.5 * value_loss - entropy_bonus
 
@@ -223,20 +213,14 @@ class RLGymEnv(GameEnv):
     """
     Wraps rlgym-sim for fast CPU rollouts — no live Rocket League needed.
 
-    The observation builder (TokenObsBuilder) serialises the token matrix row-by-row
-    into a flat array of length N_TOKENS * TOKEN_FEATURES.  rlgym_obs_to_tokens()
-    in encoder.py reshapes it back into (1, N_TOKENS, TOKEN_FEATURES).
-
-    rlgym-sim uses a 2-player environment where action arrays are stacked:
-        actions = np.stack([blue_action, orange_action], axis=0)  # (2, ACTION_DIM)
+    The observation builder (TokenObsBuilder in training/rlgym_env.py) serialises
+    the token matrix row-by-row into a flat array of length N_TOKENS * TOKEN_FEATURES.
+    rlgym_obs_to_tokens() in encoder.py reshapes it back to (1, N_TOKENS, TOKEN_FEATURES).
     """
 
     def __init__(self) -> None:
         self._env  = None
         self._scenario: Optional[ScenarioConfig] = None
-        self._grader:   Optional[ScenarioGrader] = None
-        self._episode_start: float = 0.0
-        self._last_obs: Optional[Tuple] = None
 
         try:
             import rlgym_sim
@@ -247,62 +231,46 @@ class RLGymEnv(GameEnv):
                 'Install it with:  pip install rlgym-sim'
             ) from exc
 
-    # ------------------------------------------------------------------
     def _build_env(self, scenario: ScenarioConfig):
-        """Construct a fresh rlgym-sim env from the given ScenarioConfig."""
-        from rlgym_env import (   # local helper in training/
+        from rlgym_env import (
             TokenObsBuilder,
             ScenarioStateSetter,
             ScenarioRewardFn,
             ScenarioTerminalCondition,
         )
-        obs_builder  = TokenObsBuilder()
-        state_setter = ScenarioStateSetter(scenario)
-        reward_fn    = ScenarioRewardFn(scenario)
-        terminal     = ScenarioTerminalCondition(scenario)
-
         return self._rlgym_sim.make(
-            obs_builder           = obs_builder,
-            action_parser         = self._rlgym_sim.utils.action_parsers.ContinuousAction(),
-            state_setter          = state_setter,
-            reward_fn             = reward_fn,
-            terminal_conditions   = [terminal],
-            team_size             = 1,
-            tick_skip             = 8,
+            obs_builder         = TokenObsBuilder(),
+            action_parser       = self._rlgym_sim.utils.action_parsers.ContinuousAction(),
+            state_setter        = ScenarioStateSetter(scenario),
+            reward_fn           = ScenarioRewardFn(scenario),
+            terminal_conditions = [ScenarioTerminalCondition(scenario)],
+            team_size           = 1,
+            tick_skip           = 8,
         )
 
-    # ------------------------------------------------------------------
     def reset(self, scenario: ScenarioConfig) -> _OBS_PAIR:
-        self._scenario     = scenario
-        self._grader       = ScenarioGrader(scenario)
-        self._episode_start = time.monotonic()
-
+        self._scenario = scenario
         if self._env is not None:
             self._env.close()
         self._env = self._build_env(scenario)
+        obs_list, _info = self._env.reset()
+        return (
+            rlgym_obs_to_tokens(obs_list[0], player_idx=0),
+            rlgym_obs_to_tokens(obs_list[1], player_idx=1),
+        )
 
-        obs_list, _info = self._env.reset()   # list of flat obs per player
-        blue_tokens   = rlgym_obs_to_tokens(obs_list[0], player_idx=0)
-        orange_tokens = rlgym_obs_to_tokens(obs_list[1], player_idx=1)
-        self._last_obs = (blue_tokens, orange_tokens)
-        return blue_tokens, orange_tokens
-
-    # ------------------------------------------------------------------
-    def step(
-        self,
-        blue_action:   np.ndarray,
-        orange_action: np.ndarray,
-    ) -> _STEP_OUT:
-        actions = np.stack([blue_action, orange_action], axis=0)  # (2, ACTION_DIM)
+    def step(self, blue_action, orange_action) -> _STEP_OUT:
+        actions = np.stack([blue_action, orange_action], axis=0)
         obs_list, rewards, terminated, truncated, _info = self._env.step(actions)
-
-        blue_tokens   = rlgym_obs_to_tokens(obs_list[0], player_idx=0)
-        orange_tokens = rlgym_obs_to_tokens(obs_list[1], player_idx=1)
-
         done = bool(terminated or truncated)
-        return blue_tokens, orange_tokens, float(rewards[0]), float(rewards[1]), done
+        return (
+            rlgym_obs_to_tokens(obs_list[0], player_idx=0),
+            rlgym_obs_to_tokens(obs_list[1], player_idx=1),
+            float(rewards[0]),
+            float(rewards[1]),
+            done,
+        )
 
-    # ------------------------------------------------------------------
     def close(self) -> None:
         if self._env is not None:
             self._env.close()
@@ -315,77 +283,62 @@ class RLBotEnv(GameEnv):
     """
     Wraps a live RLBot game runner for human play and expert-data collection.
 
-    This env requires an external game runner that provides:
+    Requires a configured game_runner with:
         game_runner.reset(scenario) -> None
         game_runner.get_packet()    -> GameTickPacket
         game_runner.apply_actions(blue_controls, orange_controls) -> None
 
-    Pass a configured game_runner instance to the constructor.
-    The boost_pad_tracker must have been initialised with the field info
-    before the first call to reset().
+    Pass a configured BoostPadTracker instance (already initialised with field
+    info) so that boost pad tokens are populated correctly.
     """
 
     def __init__(self, game_runner, boost_pad_tracker=None) -> None:
-        self._runner = game_runner
+        self._runner            = game_runner
         self._boost_pad_tracker = boost_pad_tracker
         self._scenario: Optional[ScenarioConfig] = None
         self._grader:   Optional[ScenarioGrader] = None
         self._episode_start: float = 0.0
 
-    # ------------------------------------------------------------------
-    def _get_big_pads(self):
-        if self._boost_pad_tracker is None:
-            return None
-        return self._boost_pad_tracker.get_full_boosts()
+    def _big_pads(self):
+        return self._boost_pad_tracker.get_full_boosts() if self._boost_pad_tracker else None
 
-    # ------------------------------------------------------------------
     def reset(self, scenario: ScenarioConfig) -> _OBS_PAIR:
         self._scenario      = scenario
         self._grader        = ScenarioGrader(scenario)
         self._episode_start = time.monotonic()
-
         self._runner.reset(scenario)
         packet = self._runner.get_packet()
-
-        if self._boost_pad_tracker is not None:
+        if self._boost_pad_tracker:
             self._boost_pad_tracker.update_boost_status(packet)
+        pads = self._big_pads()
+        return (
+            state_to_tokens(packet, car_idx=0, big_pads=pads),
+            state_to_tokens(packet, car_idx=1, big_pads=pads),
+        )
 
-        big_pads      = self._get_big_pads()
-        blue_tokens   = state_to_tokens(packet, car_idx=0, big_pads=big_pads)
-        orange_tokens = state_to_tokens(packet, car_idx=1, big_pads=big_pads)
-        return blue_tokens, orange_tokens
-
-    # ------------------------------------------------------------------
-    def step(
-        self,
-        blue_action:   np.ndarray,
-        orange_action: np.ndarray,
-    ) -> _STEP_OUT:
+    def step(self, blue_action, orange_action) -> _STEP_OUT:
         self._runner.apply_actions(blue_action, orange_action)
         packet = self._runner.get_packet()
-
-        if self._boost_pad_tracker is not None:
+        if self._boost_pad_tracker:
             self._boost_pad_tracker.update_boost_status(packet)
-
-        big_pads      = self._get_big_pads()
-        blue_tokens   = state_to_tokens(packet, car_idx=0, big_pads=big_pads)
-        orange_tokens = state_to_tokens(packet, car_idx=1, big_pads=big_pads)
-
+        pads    = self._big_pads()
         elapsed = time.monotonic() - self._episode_start
         event   = self._grader.check(packet, elapsed)
-
-        blue_r   = step_reward(packet, self._scenario.reward.blue,   0)
+        blue_r  = step_reward(packet, self._scenario.reward.blue,   0)
         orange_r = step_reward(packet, self._scenario.reward.orange, 1)
         if event:
             blue_r   += reward_for_event(self._scenario.reward.blue,   event)
             orange_r += reward_for_event(self._scenario.reward.orange, event)
+        return (
+            state_to_tokens(packet, car_idx=0, big_pads=pads),
+            state_to_tokens(packet, car_idx=1, big_pads=pads),
+            blue_r,
+            orange_r,
+            event is not None,
+        )
 
-        done = event is not None
-        return blue_tokens, orange_tokens, blue_r, orange_r, done
-
-    # ------------------------------------------------------------------
     def close(self) -> None:
-        pass   # game runner lifetime is managed by the caller
+        pass
 
 
 # ── per-episode trajectory collection ────────────────────────────────────────
@@ -397,11 +350,7 @@ def collect_episode(
     skill_heads: Dict[str, SkillHead],
     explore:     bool = True,
 ) -> Tuple[List[Tuple], List[Tuple]]:
-    """
-    Run one episode and return (blue_trajectory, orange_trajectory).
-
-    Each trajectory is a list of (tokens, action, reward) tuples.
-    """
+    """Run one episode and return (blue_trajectory, orange_trajectory)."""
     blue_skill   = scenario.initial_state.blue.skill
     orange_skill = scenario.initial_state.orange.skill
 
@@ -410,23 +359,25 @@ def collect_episode(
     blue_traj:   List[Tuple] = []
     orange_traj: List[Tuple] = []
 
+    encoder.eval()
+    for head in skill_heads.values():
+        head.eval()
+
     done = False
     while not done:
-        # ── inference (outside GradientTape) ──────────────────────────────────
-        blue_emb   = encoder(tf.constant(blue_obs)).numpy()    # (1, D_MODEL)
-        orange_emb = encoder(tf.constant(orange_obs)).numpy()
+        with torch.no_grad():
+            blue_emb   = encoder(torch.tensor(blue_obs,   dtype=torch.float32)).numpy()
+            orange_emb = encoder(torch.tensor(orange_obs, dtype=torch.float32)).numpy()
 
         blue_action,   _ = skill_heads[blue_skill].act(blue_emb)
         orange_action, _ = skill_heads[orange_skill].act(orange_emb)
 
-        # ── exploration noise on analog dims (throttle, steer, pitch, yaw, roll)
         if explore:
             blue_action[:5]   += np.random.normal(0, 0.1, 5)
             orange_action[:5] += np.random.normal(0, 0.1, 5)
             np.clip(blue_action[:5],   -1.0, 1.0, out=blue_action[:5])
             np.clip(orange_action[:5], -1.0, 1.0, out=orange_action[:5])
 
-        # ── environment step ──────────────────────────────────────────────────
         blue_obs, orange_obs, blue_r, orange_r, done = env.step(blue_action, orange_action)
 
         blue_traj.append((blue_obs,   blue_action,   blue_r))
@@ -451,7 +402,6 @@ def train(
     # ── 1. Build shared encoder ───────────────────────────────────────────────
     encoder = SharedTransformerEncoder()
 
-    # Collect all unique skill names across every config (both sides)
     all_skill_names: set = set()
     for cfg in all_configs:
         all_skill_names.add(cfg.initial_state.blue.skill)
@@ -463,24 +413,22 @@ def train(
         name: SkillHead(name) for name in sorted(all_skill_names)
     }
 
-    # Build all models with dummy inputs so weights are created
-    _dummy = tf.zeros((1, N_TOKENS, TOKEN_FEATURES))
-    encoder(_dummy)
-    for head in skill_heads.values():
-        head(tf.zeros((1, encoder.d_model)))
-
-    # Try loading existing checkpoints
-    enc_ckpt = model_path / 'encoder.weights.h5'
+    # ── 3. Try loading existing checkpoints ───────────────────────────────────
+    enc_ckpt = model_path / 'encoder.pt'
     if enc_ckpt.exists():
-        encoder.load_weights(str(enc_ckpt))
+        encoder.load_state_dict(torch.load(str(enc_ckpt), map_location='cpu'))
         print(f'Loaded encoder from {enc_ckpt}')
     for name, head in skill_heads.items():
-        head_ckpt = model_path / f'skill_{name}.weights.h5'
+        head_ckpt = model_path / f'skill_{name}.pt'
         if head_ckpt.exists():
-            head.load_weights(str(head_ckpt))
+            head.load_state_dict(torch.load(str(head_ckpt), map_location='cpu'))
             print(f'Loaded skill head: {name}')
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
+    # ── 4. Single optimizer over ALL parameters ───────────────────────────────
+    all_params = list(encoder.parameters())
+    for head in skill_heads.values():
+        all_params += list(head.parameters())
+    optimizer = optim.Adam(all_params, lr=3e-4)
 
     # Filter to a single skill if requested
     active_configs = all_configs
@@ -497,35 +445,32 @@ def train(
     print(f'Skills: {sorted(all_skill_names)}')
     print(f'Configs: {len(active_configs)}   Episodes: {max_episodes}')
 
-    # ── 3. Episode loop ───────────────────────────────────────────────────────
+    # ── 5. Episode loop ───────────────────────────────────────────────────────
     try:
         for episode in range(max_episodes):
             scenario     = random.choice(active_configs)
             blue_skill   = scenario.initial_state.blue.skill
             orange_skill = scenario.initial_state.orange.skill
 
-            # Collect trajectory from the live environment
+            # Collect trajectory (encoder in eval mode, no_grad)
             blue_traj, orange_traj = collect_episode(
                 env, scenario, encoder, skill_heads, explore=True,
             )
 
-            # ── 4. Joint gradient update ──────────────────────────────────────
-            with tf.GradientTape() as tape:
-                blue_loss   = compute_ac_loss(encoder, skill_heads[blue_skill],   blue_traj)
-                orange_loss = compute_ac_loss(encoder, skill_heads[orange_skill], orange_traj)
-                total_loss  = blue_loss + orange_loss
+            # ── gradient update ───────────────────────────────────────────────
+            encoder.train()
+            skill_heads[blue_skill].train()
+            skill_heads[orange_skill].train()
 
-            # Collect variables; avoid duplicate entries when both sides share a skill
-            vars_ep = (
-                encoder.trainable_variables
-                + skill_heads[blue_skill].trainable_variables
-                + (skill_heads[orange_skill].trainable_variables
-                   if orange_skill != blue_skill else [])
-            )
-            grads = tape.gradient(total_loss, vars_ep)
-            optimizer.apply_gradients(zip(grads, vars_ep))
+            blue_loss   = compute_ac_loss(encoder, skill_heads[blue_skill],   blue_traj)
+            orange_loss = compute_ac_loss(encoder, skill_heads[orange_skill], orange_traj)
+            total_loss  = blue_loss + orange_loss
 
-            # ── 5. Logging ────────────────────────────────────────────────────
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            # ── logging ───────────────────────────────────────────────────────
             if episode % 100 == 0:
                 print(
                     f'[ep {episode:05d}] loss={float(total_loss):.4f}  '
@@ -533,25 +478,21 @@ def train(
                     f'ticks={len(blue_traj)}'
                 )
 
-            # ── 6. Checkpoint ─────────────────────────────────────────────────
+            # ── checkpoint ────────────────────────────────────────────────────
             if episode > 0 and episode % save_every == 0:
                 _save_all(encoder, skill_heads, model_path)
                 print(f'[ep {episode:05d}] Checkpointed.')
 
-            # TODO: PPO upgrade — replace A2C trajectory collection with a
-            #   rollout buffer and clipped surrogate objective.
-            #
-            # TODO: Expert data mixing (p=0.1) — with probability 0.1 replace
-            #   one side's trajectory with a sampled expert trajectory from
-            #   training/expert_data/<skill>/*.npz using BC loss instead of PG.
+            # TODO: PPO upgrade — replace A2C with rollout buffer + clipped surrogate
+            # TODO: Expert data mixing (p=0.1) — BC loss from expert_data/<skill>/*.npz
 
     finally:
         env.close()
 
-    # ── 7. Final save ─────────────────────────────────────────────────────────
+    # ── 6. Final save ─────────────────────────────────────────────────────────
     _save_all(encoder, skill_heads, model_path)
 
-    # ── 8. Build KNN index ────────────────────────────────────────────────────
+    # ── 7. Build KNN index ────────────────────────────────────────────────────
     print('Building KNN index...')
     controller = KNNController(encoder, k=3)
     controller.build_index(all_configs, n_samples=20)
@@ -565,9 +506,9 @@ def _save_all(
     skill_heads: Dict[str, SkillHead],
     model_path:  Path,
 ) -> None:
-    encoder.save_weights(str(model_path / 'encoder.weights.h5'))
+    torch.save(encoder.state_dict(),    str(model_path / 'encoder.pt'))
     for name, head in skill_heads.items():
-        head.save_weights(str(model_path / f'skill_{name}.weights.h5'))
+        torch.save(head.state_dict(), str(model_path / f'skill_{name}.pt'))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -578,9 +519,9 @@ def main() -> None:
         '--env', default='rlgym', choices=['rlgym', 'rlbot'],
         help='Game environment: rlgym (fast sim, default) or rlbot (live game)',
     )
-    parser.add_argument('--skill',      default=None,    help='Fine-tune a single skill')
-    parser.add_argument('--episodes',   default=10000,   type=int)
-    parser.add_argument('--save-every', default=500,     type=int)
+    parser.add_argument('--skill',      default=None,   help='Fine-tune a single skill')
+    parser.add_argument('--episodes',   default=10000,  type=int)
+    parser.add_argument('--save-every', default=500,    type=int)
     parser.add_argument('--model-dir',  default='models/')
     args = parser.parse_args()
 

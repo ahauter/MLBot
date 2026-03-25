@@ -30,8 +30,8 @@ import math
 from typing import List, Optional
 
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
+import torch
+import torch.nn as nn
 
 # ── normalization constants ───────────────────────────────────────────────────
 
@@ -97,12 +97,12 @@ def state_to_tokens(
 
     # ── token 0: ball ─────────────────────────────────────────────────────────
     ball_token = np.array([
-        ball.location.x        / FIELD_X,
-        ball.location.y        / FIELD_Y,
-        ball.location.z        / CEILING_Z,
-        ball.velocity.x        / MAX_VEL,
-        ball.velocity.y        / MAX_VEL,
-        ball.velocity.z        / MAX_VEL,
+        ball.location.x         / FIELD_X,
+        ball.location.y         / FIELD_Y,
+        ball.location.z         / CEILING_Z,
+        ball.velocity.x         / MAX_VEL,
+        ball.velocity.y         / MAX_VEL,
+        ball.velocity.z         / MAX_VEL,
         ball.angular_velocity.x / MAX_ANG_VEL,
         ball.angular_velocity.y / MAX_ANG_VEL,
         ball.angular_velocity.z / MAX_ANG_VEL,
@@ -148,7 +148,6 @@ def state_to_tokens(
                 float(pad.is_active),
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             ], dtype=np.float32))
-    # Pad with zeros if fewer than _N_BIG_PADS pads were supplied
     while len(pad_tokens) < _N_BIG_PADS:
         pad_tokens.append(np.zeros(TOKEN_FEATURES, dtype=np.float32))
 
@@ -169,7 +168,7 @@ def state_to_tokens(
     tokens = np.stack(
         [ball_token, own_token, opp_token] + pad_tokens + [gs_token],
         axis=0,
-    )                           # (N_TOKENS, TOKEN_FEATURES)
+    )                            # (N_TOKENS, TOKEN_FEATURES)
     return tokens[np.newaxis, ...]   # (1, N_TOKENS, TOKEN_FEATURES)
 
 
@@ -179,13 +178,11 @@ def rlgym_obs_to_tokens(obs: np.ndarray, player_idx: int) -> np.ndarray:
     """
     Map a flat RLGym observation vector to (1, N_TOKENS, TOKEN_FEATURES).
 
-    This adapter assumes the observation was produced by TokenObsBuilder
-    (defined in training/rlgym_env.py), which serialises the token matrix
-    row-by-row into a flat array of length N_TOKENS * TOKEN_FEATURES.
-
-    player_idx is accepted for API symmetry but is not used here — the
-    obs builder already encodes the observation from the perspective of
-    the requesting player.
+    Assumes the observation was produced by TokenObsBuilder (training/rlgym_env.py),
+    which serialises the token matrix row-by-row into a flat array of length
+    N_TOKENS * TOKEN_FEATURES.  player_idx is accepted for API symmetry but is
+    not used here — the obs builder already encodes the observation from the
+    requesting player's perspective.
     """
     expected = N_TOKENS * TOKEN_FEATURES
     if obs.shape[0] != expected:
@@ -198,38 +195,36 @@ def rlgym_obs_to_tokens(obs: np.ndarray, player_idx: int) -> np.ndarray:
 
 # ── transformer building blocks ───────────────────────────────────────────────
 
-class _TransformerEncoderLayer(keras.layers.Layer):
+class _TransformerEncoderLayer(nn.Module):
     """Pre-norm transformer encoder block (LayerNorm before each sublayer)."""
 
-    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, **kwargs):
-        super().__init__(**kwargs)
-        self.attn = keras.layers.MultiHeadAttention(
-            num_heads=n_heads, key_dim=d_model // n_heads, dropout=0.0,
+    def __init__(self, d_model: int, n_heads: int, ffn_dim: int):
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads, dropout=0.0, batch_first=True,
         )
-        self.ffn = keras.Sequential([
-            keras.layers.Dense(ffn_dim, activation='relu'),
-            keras.layers.Dense(d_model),
-        ])
-        self.norm1 = keras.layers.LayerNormalization()
-        self.norm2 = keras.layers.LayerNormalization()
-        self.drop1 = keras.layers.Dropout(0.1)
-        self.drop2 = keras.layers.Dropout(0.1)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.ReLU(),
+            nn.Linear(ffn_dim, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop1 = nn.Dropout(0.1)
+        self.drop2 = nn.Dropout(0.1)
 
-    def call(self, x, training=False):
-        # Self-attention sublayer
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Training/eval mode is inherited from the parent module via model.train()/eval()
         x_norm   = self.norm1(x)
-        attn_out = self.attn(x_norm, x_norm, training=training)
-        x        = x + self.drop1(attn_out, training=training)
-        # FFN sublayer
-        x_norm  = self.norm2(x)
-        ffn_out = self.ffn(x_norm)
-        x       = x + self.drop2(ffn_out, training=training)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x        = x + self.drop1(attn_out)
+        x        = x + self.drop2(self.ffn(self.norm2(x)))
         return x
 
 
 # ── main encoder model ────────────────────────────────────────────────────────
 
-class SharedTransformerEncoder(keras.Model):
+class SharedTransformerEncoder(nn.Module):
     """
     Shared encoder used by both cars and both skill heads in every episode.
 
@@ -241,31 +236,25 @@ class SharedTransformerEncoder(keras.Model):
     N_LAYERS = 2
     FFN_DIM  = 128
 
-    def __init__(self, d_model: int = D_MODEL, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, d_model: int = D_MODEL):
+        super().__init__()
         self.d_model = d_model
 
-        self.input_projection = keras.layers.Dense(d_model, name='input_proj')
+        self.input_projection = nn.Linear(TOKEN_FEATURES, d_model)
 
         # Learned per-entity-position embeddings (1, N_TOKENS, d_model).
-        # Ball, own car, opponent, each boost pad, and game-state each get
-        # their own learned offset so the transformer can distinguish entity types.
-        self.pos_embedding = self.add_weight(
-            name='pos_embedding',
-            shape=(1, N_TOKENS, d_model),
-            initializer='random_normal',
-            trainable=True,
-        )
+        # Each entity (ball, own car, opponent, each boost pad, game-state) gets
+        # its own learned offset so the transformer can distinguish entity types.
+        self.pos_embedding = nn.Parameter(torch.randn(1, N_TOKENS, d_model) * 0.02)
 
-        self.transformer_layers = [
+        self.transformer_layers = nn.ModuleList([
             _TransformerEncoderLayer(
                 d_model=d_model, n_heads=self.N_HEADS, ffn_dim=self.FFN_DIM,
-                name=f'transformer_{i}',
             )
-            for i in range(self.N_LAYERS)
-        ]
+            for _ in range(self.N_LAYERS)
+        ])
 
-    def call(self, tokens, training=False):
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         tokens: (batch, N_TOKENS, TOKEN_FEATURES)
         returns: (batch, D_MODEL)
@@ -273,20 +262,18 @@ class SharedTransformerEncoder(keras.Model):
         x = self.input_projection(tokens)   # (batch, N_TOKENS, D_MODEL)
         x = x + self.pos_embedding          # broadcast add entity-type embeddings
         for layer in self.transformer_layers:
-            x = layer(x, training=training) # (batch, N_TOKENS, D_MODEL)
-        x = tf.reduce_mean(x, axis=1)       # mean-pool → (batch, D_MODEL)
-        return x
+            x = layer(x)                   # (batch, N_TOKENS, D_MODEL)
+        return x.mean(dim=1)               # mean-pool → (batch, D_MODEL)
 
     def save(self, path: str) -> None:
-        self.save_weights(path)
+        torch.save(self.state_dict(), path)
 
     def load(self, path: str) -> None:
-        self.load_weights(path)
+        self.load_state_dict(torch.load(path, map_location='cpu'))
 
     @classmethod
     def load_from(cls, path: str) -> 'SharedTransformerEncoder':
-        """Load a saved encoder.  Builds with dummy input first."""
+        """Load a saved encoder from a .pt checkpoint."""
         model = cls()
-        model(tf.zeros((1, N_TOKENS, TOKEN_FEATURES)))   # build variables
-        model.load_weights(path)
+        model.load_state_dict(torch.load(path, map_location='cpu'))
         return model
