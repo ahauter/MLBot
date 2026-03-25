@@ -70,13 +70,14 @@ class PolicyHead(nn.Module):
           value_est:  scalar float
         """
         self.eval()
+        device = next(self.parameters()).device
         with torch.no_grad():
-            emb    = torch.tensor(embedding, dtype=torch.float32)
+            emb    = torch.tensor(embedding, dtype=torch.float32, device=device)
             policy, value = self(emb)
-        action = policy.numpy()[0]                      # (8,)
+        action = policy.cpu().numpy()[0]                # (8,)
         action[:5] = np.clip(action[:5], -1.0, 1.0)
         action[5:] = (action[5:] >= 0.5).astype(np.float32)
-        return action, float(value.numpy()[0, 0])
+        return action, float(value.cpu().numpy()[0, 0])
 
     def save(self, path: str) -> None:
         torch.save(self.state_dict(), path)

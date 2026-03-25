@@ -131,7 +131,7 @@ def compute_awac_loss(
     Returns torch.tensor(0.0) for empty trajectories.
     """
     if not trajectory:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=next(encoder.parameters()).device)
 
     device = next(encoder.parameters()).device
 

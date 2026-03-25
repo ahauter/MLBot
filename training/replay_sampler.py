@@ -332,6 +332,17 @@ def _save_manifest(manifest_path: Path, manifest: dict[str, dict]) -> None:
         json.dump(list(manifest.values()), f, indent=2)
 
 
+def _is_complete(npz_path: Path) -> bool:
+    """Return True if npz_path exists and contains all required keys."""
+    if not npz_path.exists():
+        return False
+    try:
+        with np.load(npz_path) as data:
+            return {'tokens', 'actions', 'rewards', 'dones'}.issubset(data.files)
+    except Exception:
+        return False
+
+
 # ── main pipeline ─────────────────────────────────────────────────────────────
 
 def collect(
@@ -368,8 +379,10 @@ def collect(
         rid = meta['id']
 
         if resume and rid in manifest:
-            skipped += 1
-            continue
+            if _is_complete(parsed_dir / f'{rid}.npz'):
+                skipped += 1
+                continue
+            # incomplete file — fall through to re-download
 
         raw_path = raw_dir / f'{rid}.replay'
         parsed_path = parsed_dir / f'{rid}.npz'
