@@ -48,6 +48,7 @@ from policy_head import PolicyHead
 from scenarios.graders import ScenarioGrader, reward_for_event, step_reward
 from scenarios.scenario_config import ScenarioConfig
 from replay_buffer import SequenceReplayBuffer
+from replay_dataset import load_replays_into_buffer
 
 import abc
 import argparse
@@ -449,7 +450,12 @@ def train(
         token_features=TOKEN_FEATURES,
     )
 
-    print(f'Configs: {len(all_configs)}   Episodes: {max_episodes}')
+    # ── 4b. Pre-fill buffer with human replay episodes ────────────────────────
+    replay_data_dir = Path(__file__).parent / 'replay_data' / 'parsed'
+    if replay_data_dir.exists():
+        load_replays_into_buffer(replay_data_dir, replay_buf)
+
+    print(f'Configs: {len(all_configs)}   Episodes: {max_episodes}   Buffer: {len(replay_buf)} steps')
 
     # ── 5. Episode loop ───────────────────────────────────────────────────────
     try:
