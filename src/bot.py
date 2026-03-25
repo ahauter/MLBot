@@ -1,24 +1,18 @@
 """
 MLBot — RLBot Agent
 ===================
-Loads the shared encoder, KNN skill controller, and per-skill heads at startup,
+Loads the shared spatiotemporal encoder and single policy head at startup,
 then on every tick:
-  1. Encode current game state → 64-dim embedding
-  2. KNN lookup → select which SkillHead to activate
-  3. SkillHead.act() → 8-float action
+  1. Append current token snapshot to the sliding observation window
+  2. Encode window → 64-dim embedding
+  3. PolicyHead.act() → 8-float action
   4. Translate to SimpleControllerState
-
-Notes
------
-- Skill discovery is dynamic: skills are read from the KNN index (which is
-  built from the YAML configs after training), so no skill names are hardcoded.
-- Works for either car index (blue or orange) because state_to_tokens(packet,
-  self.index) encodes the bot's own car as token 1 and the opponent as token 2.
 """
 
 from __future__ import annotations
 
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -27,15 +21,18 @@ import torch
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 
-# Add src/ and training/ to path so encoder/skills are importable
 _SRC  = Path(__file__).parent
 _REPO = _SRC.parent
 sys.path.insert(0, str(_SRC))
 sys.path.insert(0, str(_REPO / 'training'))
 
-from encoder import SharedTransformerEncoder, state_to_tokens
-from skills.skill_head import SkillHead
-from skills.controller import KNNController
+from encoder import (
+    SharedTransformerEncoder,
+    state_to_tokens,
+    ENTITY_TYPE_IDS_1V1,
+    T_WINDOW,
+)
+from policy_head import PolicyHead
 
 MODEL_DIR = _REPO / 'models'
 
@@ -46,51 +43,52 @@ class MyBot(BaseAgent):
         super().__init__(name, team, index)
         self.index:       int                      = index
         self.encoder:     SharedTransformerEncoder = None
-        self.controller:  KNNController            = None
-        self.skill_heads: dict[str, SkillHead]     = {}
+        self.policy_head: PolicyHead               = None
+        self._obs_buffer: deque                    = None
+        self._entity_type_ids: torch.Tensor        = torch.tensor(
+            ENTITY_TYPE_IDS_1V1, dtype=torch.long)
 
     def initialize_agent(self) -> None:
-        """Load encoder, KNN index, and all available skill heads from models/."""
+        """Load encoder and policy head from models/."""
         enc_path = MODEL_DIR / 'encoder.pt'
         if enc_path.exists():
             self.encoder = SharedTransformerEncoder.load_from(str(enc_path))
         else:
-            # No trained model yet — use untrained encoder (random behaviour)
             self.encoder = SharedTransformerEncoder()
 
-        self.controller = KNNController(self.encoder, k=3)
-        knn_path = MODEL_DIR / 'knn_index.npz'
-        if knn_path.exists():
-            self.controller.load_index(str(knn_path))
-        else:
-            # Index not built yet; controller will have no entries
-            pass
+        self.policy_head = PolicyHead()
+        head_path = MODEL_DIR / 'policy.pt'
+        if head_path.exists():
+            self.policy_head.load(str(head_path))
 
-        # Load whichever skill heads are present in models/
-        for skill_name in self.controller.known_skills():
-            head = SkillHead(skill_name)
-            head_path = MODEL_DIR / f'skill_{skill_name}.pt'
-            if head_path.exists():
-                head.load_state_dict(torch.load(str(head_path), map_location='cpu'))
-            self.skill_heads[skill_name] = head
+        self.encoder.eval()
+        self.policy_head.eval()
+
+        # Observation window — filled on first get_output() call
+        self._obs_buffer = None
 
     def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
-        # 1. Encode current game state for this car's perspective
-        tokens = state_to_tokens(packet, self.index)   # (1, N_TOKENS, TOKEN_FEATURES)
-        self.encoder.eval()
+        tokens = state_to_tokens(packet, self.index)   # (1, N, TOKEN_FEATURES)
+        frame  = tokens[0]                              # (N, TOKEN_FEATURES)
+
+        # Initialise window by replicating the first frame T times
+        if self._obs_buffer is None:
+            self._obs_buffer = deque(
+                [frame.copy() for _ in range(T_WINDOW)], maxlen=T_WINDOW)
+        else:
+            self._obs_buffer.append(frame)
+
+        window = np.stack(self._obs_buffer)[np.newaxis]  # (1, T_WINDOW, N, F)
+
         with torch.no_grad():
             embedding = self.encoder(
-                torch.tensor(tokens, dtype=torch.float32)
-            ).numpy()                                   # (1, D_MODEL)
+                torch.tensor(window, dtype=torch.float32),
+                self._entity_type_ids,
+            ).numpy()   # (1, D_MODEL)
 
-        # 2. Select skill via KNN lookup
-        if self.skill_heads:
-            skill = self.controller.select_skill(embedding[0])     # (64,) → str
-            if skill not in self.skill_heads:
-                skill = next(iter(self.skill_heads))
-            action, _ = self.skill_heads[skill].act(embedding)     # (8,)
+        if self.policy_head is not None:
+            action, _ = self.policy_head.act(embedding)
         else:
-            # No trained skill heads available — output neutral controls
             action = np.zeros(8, dtype=np.float32)
 
         return self.translate_controls(action)
@@ -98,16 +96,8 @@ class MyBot(BaseAgent):
     def translate_controls(self, action: np.ndarray) -> SimpleControllerState:
         """
         Map an 8-float action array to a SimpleControllerState.
-
-        Layout matches human_play.py _controls_to_action exactly:
-          [0] throttle    [-1,  1]
-          [1] steer       [-1,  1]
-          [2] pitch       [-1,  1]
-          [3] yaw         [-1,  1]
-          [4] roll        [-1,  1]
-          [5] jump        {0, 1}
-          [6] boost       {0, 1}
-          [7] handbrake   {0, 1}
+          [0] throttle  [1] steer  [2] pitch  [3] yaw  [4] roll
+          [5] jump  [6] boost  [7] handbrake
         """
         ctrl           = SimpleControllerState()
         ctrl.throttle  = float(np.clip(action[0], -1.0, 1.0))
