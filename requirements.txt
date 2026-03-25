@@ -24,5 +24,9 @@ rlgym-tools
 pandas
 pyarrow
 
+# Experiment tracking and hyperparameter tuning
+wandb
+optuna
+
 # This will cause pip to auto-upgrade and stop scaring people with warning messages
 pip

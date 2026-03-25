@@ -37,6 +37,9 @@ from encoder import (
 import json
 import math
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -316,6 +319,94 @@ class BallchasingClient:
         return dest_path
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+class _RateLimiter:
+    """Thread-safe token bucket: at most `rate` calls per second."""
+
+    def __init__(self, rate: float = 1.5) -> None:
+        self._interval = 1.0 / rate
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            wait = self._interval - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+
+
+def _extract_player_ranks(meta: dict) -> list[dict]:
+    """Return one entry per player with name, team, rank_id, and rank_tier."""
+    players = []
+    for team in ('blue', 'orange'):
+        for p in meta.get(team, {}).get('players', []):
+            rank = p.get('rank') or {}
+            players.append({
+                'name':      p.get('name'),
+                'team':      team,
+                'rank_id':   rank.get('id'),    # e.g. "gold-2"
+                'rank_tier': rank.get('tier'),  # integer 0-19
+            })
+    return players
+
+
+def _process_one(
+    client: 'BallchasingClient',
+    meta: dict,
+    raw_dir: Path,
+    parsed_dir: Path,
+    output_dir: Path,
+    keep_raw: bool,
+    min_rank: str,
+    playlist: str,
+    limiter: _RateLimiter,
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Download + parse one replay. Returns (rid, manifest_entry, error_msg)."""
+    rid = meta['id']
+    raw_path = raw_dir / f'{rid}.replay'
+    parsed_path = parsed_dir / f'{rid}.npz'
+    try:
+        for attempt in range(5):
+            limiter.acquire()
+            try:
+                client.download_replay(rid, raw_path)
+                break
+            except requests.HTTPError as exc:
+                if exc.response.status_code == 429 and attempt < 4:
+                    time.sleep(2 ** attempt)   # 1, 2, 4, 8 s
+                    continue
+                raise
+        tokens, actions, rewards, dones = parse_replay(raw_path)
+        np.savez_compressed(parsed_path, tokens=tokens, actions=actions,
+                            rewards=rewards, dones=dones)
+    except Exception as exc:
+        if raw_path.exists():
+            raw_path.unlink()
+        return rid, None, str(exc)
+
+    if not keep_raw:
+        raw_path.unlink()
+
+    n_goals = int(dones[:, 0].sum())
+    player_ranks = _extract_player_ranks(meta)
+    tiers = [p['rank_tier']
+             for p in player_ranks if p['rank_tier'] is not None]
+    entry = {
+        'replay_id':     rid,
+        'rank':          meta.get('min_rank', {}).get('name', min_rank),
+        'playlist':      meta.get('playlist_id', playlist),
+        'frame_count':   int(tokens.shape[0]),
+        'goal_count':    n_goals,
+        'players':       player_ranks,
+        'avg_rank_tier': sum(tiers) / len(tiers) if tiers else None,
+        'parsed_path':   str(parsed_path.relative_to(output_dir)),
+        'downloaded_at': datetime.now(timezone.utc).isoformat(),
+    }
+    return rid, entry, None
+
+
 # ── manifest helpers ──────────────────────────────────────────────────────────
 
 def _load_manifest(manifest_path: Path) -> dict[str, dict]:
@@ -354,6 +445,7 @@ def collect(
     playlist: str = 'ranked-standard',
     keep_raw: bool = False,
     resume: bool = True,
+    workers: int = 2,
 ) -> None:
     output_dir = Path(output_dir)
     raw_dir = output_dir / 'raw'
@@ -364,6 +456,8 @@ def collect(
     parsed_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = _load_manifest(manifest_path) if resume else {}
+    manifest_lock = threading.Lock()
+    limiter = _RateLimiter(rate=1.5)
     client = BallchasingClient(api_key)
 
     print(f'Searching ballchasing.com for {count} replays '
@@ -371,57 +465,41 @@ def collect(
     replay_list = client.search_replays(count, min_rank, max_rank, playlist)
     print(f'Found {len(replay_list)} replays from API.')
 
+    to_download = [m for m in replay_list if not (
+        resume and m['id'] in manifest)]
+    skipped = len(replay_list) - len(to_download)
+    total = len(to_download)
+    print(
+        f'Downloading {total} replays ({skipped} already cached) with {workers} worker(s) ...')
+
     saved = 0
-    skipped = 0
     failed = 0
 
-    for meta in replay_list:
-        rid = meta['id']
-
-        if resume and rid in manifest:
-            if _is_complete(parsed_dir / f'{rid}.npz'):
-                skipped += 1
-                continue
-            # incomplete file — fall through to re-download
-
-        raw_path = raw_dir / f'{rid}.replay'
-        parsed_path = parsed_dir / f'{rid}.npz'
-
-        print(
-            f'  [{saved + skipped + 1}/{len(replay_list)}] {rid} ...', end=' ', flush=True)
-
-        try:
-            client.download_replay(rid, raw_path)
-            tokens, actions, rewards, dones = parse_replay(raw_path)
-            np.savez_compressed(parsed_path,
-                                tokens=tokens,
-                                actions=actions,
-                                rewards=rewards,
-                                dones=dones)
-        except Exception as exc:
-            print(f'FAILED ({exc})')
-            if raw_path.exists():
-                raw_path.unlink()
-            failed += 1
-            continue
-
-        if not keep_raw:
-            raw_path.unlink()
-
-        n_goals = int(dones[:, 0].sum())
-        manifest[rid] = {
-            'replay_id':     rid,
-            'rank':          meta.get('min_rank', {}).get('name', min_rank),
-            'playlist':      meta.get('playlist_id', playlist),
-            'frame_count':   int(tokens.shape[0]),
-            'goal_count':    n_goals,
-            'parsed_path':   str(parsed_path.relative_to(output_dir)),
-            'downloaded_at': datetime.now(timezone.utc).isoformat(),
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            executor.submit(_process_one, client, meta, raw_dir, parsed_dir,
+                            output_dir, keep_raw, min_rank, playlist, limiter): meta['id']
+            for meta in to_download
         }
-        _save_manifest(manifest_path, manifest)
-
-        print(f'OK  ({tokens.shape[0]} frames, {n_goals} goals)')
-        saved += 1
+        for i, future in enumerate(as_completed(futures), 1):
+            rid, entry, err = future.result()
+            if err:
+                print(f'  [{i}/{total}] {rid} FAILED ({err})')
+                failed += 1
+            else:
+                tier = entry['avg_rank_tier']
+                tier_str = f'{tier:.1f}' if tier is not None else 'n/a'
+                print(f'  [{i}/{total}] {rid} OK  '
+                      f'({entry["frame_count"]} frames, {entry["goal_count"]} goals, tier={tier_str})')
+                with manifest_lock:
+                    manifest[rid] = entry
+                    _save_manifest(manifest_path, manifest)
+                saved += 1
+    except KeyboardInterrupt:
+        print('\nInterrupted — cancelling pending downloads ...')
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     print(f'\nDone. Saved {saved} | Skipped {skipped} | Failed {failed}')
     print(f'Total in manifest: {len(manifest)}')

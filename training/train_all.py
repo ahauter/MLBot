@@ -16,8 +16,11 @@ Usage
     # Train via RLBot (live game):
     python training/train_all.py --env rlbot
 
-    # Override number of episodes:
-    python training/train_all.py --env rlgym --episodes 5000
+    # Override hyperparameters:
+    python training/train_all.py --env rlgym --episodes 5000 --lr 1e-4 --awac-beta 2.0
+
+    # Disable W&B (stdout only):
+    python training/train_all.py --env rlgym --no-wandb
 
 Architecture
 ------------
@@ -49,6 +52,8 @@ from scenarios.graders import ScenarioGrader, reward_for_event, step_reward
 from scenarios.scenario_config import ScenarioConfig
 from replay_buffer import SequenceReplayBuffer
 from replay_dataset import load_replays_into_buffer
+from train_config import TrainConfig
+from logger import ExperimentLogger
 
 import abc
 import argparse
@@ -88,15 +93,12 @@ def discover_all_configs() -> List[ScenarioConfig]:
 
 # ── discounted returns ────────────────────────────────────────────────────────
 
-GAMMA = 0.99
-
-
-def compute_returns(rewards: List[float]) -> np.ndarray:
+def compute_returns(rewards: List[float], gamma: float) -> np.ndarray:
     """Compute normalised discounted Monte Carlo returns."""
     returns = np.zeros(len(rewards), dtype=np.float32)
     G = 0.0
     for t in reversed(range(len(rewards))):
-        G = rewards[t] + GAMMA * G
+        G = rewards[t] + gamma * G
         returns[t] = G
     if len(returns) > 1:
         std = returns.std()
@@ -108,9 +110,7 @@ def compute_returns(rewards: List[float]) -> np.ndarray:
 # ── AWAC loss ─────────────────────────────────────────────────────────────────
 
 _LOG_STD = math.log(0.5)
-_TWO_PI  = 2.0 * math.pi
-AWAC_BETA = 1.0      # temperature: higher → closer to pure BC
-AWAC_MAX_WEIGHT = 20.0   # clip exp(A/β) to prevent gradient explosion
+_TWO_PI = 2.0 * math.pi
 
 
 def compute_awac_loss(
@@ -118,8 +118,9 @@ def compute_awac_loss(
     policy_head:     PolicyHead,
     trajectory:      List[Tuple[np.ndarray, np.ndarray, float]],
     entity_type_ids: Union[torch.Tensor, List[int]],
+    config:          TrainConfig,
     entity_perm:     Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute AWAC loss from one episode's trajectory.
 
@@ -128,12 +129,12 @@ def compute_awac_loss(
       action         (ACTION_DIM,)
       reward         scalar
 
-    Returns torch.tensor(0.0) for empty trajectories.
+    Returns (total_loss, policy_loss, value_loss).
+    Returns zeros for empty trajectories.
     """
+    zero = torch.tensor(0.0)
     if not trajectory:
-        return torch.tensor(0.0, device=next(encoder.parameters()).device)
-
-    device = next(encoder.parameters()).device
+        return zero, zero, zero
 
     tokens_batch = torch.tensor(
         np.concatenate([t[0] for t in trajectory], axis=0),
@@ -144,11 +145,12 @@ def compute_awac_loss(
         dtype=torch.float32, device=device,
     )   # (T_ep, ACTION_DIM)
     returns = torch.tensor(
-        compute_returns([t[2] for t in trajectory]),
-        dtype=torch.float32, device=device,
+        compute_returns([t[2] for t in trajectory], config.gamma),
+        dtype=torch.float32,
     )   # (T_ep,)
 
-    embeddings = encoder(tokens_batch, entity_type_ids, entity_perm=entity_perm)
+    embeddings = encoder(tokens_batch, entity_type_ids,
+                         entity_perm=entity_perm)
     policy, values = policy_head(embeddings)
     values = values.squeeze(-1)                         # (T_ep,)
 
@@ -163,13 +165,13 @@ def compute_awac_loss(
 
     # AWAC weighting: exp(A / β), clipped to prevent explosion
     weights = torch.clamp(
-        torch.exp(advantages / AWAC_BETA), max=AWAC_MAX_WEIGHT
+        torch.exp(advantages / config.awac_beta), max=config.awac_max_weight
     ).detach()
 
     policy_loss = -(log_probs * weights).mean()
-    value_loss  = (returns - values).pow(2).mean()
+    value_loss = (returns - values).pow(2).mean()
 
-    return policy_loss + 0.5 * value_loss
+    return policy_loss + 0.5 * value_loss, policy_loss, value_loss
 
 
 # ── environment abstraction ───────────────────────────────────────────────────
@@ -320,10 +322,10 @@ class RLBotEnv(GameEnv):
         pads = self._big_pads()
         elapsed = time.monotonic() - self._episode_start
         event = self._grader.check(packet, elapsed)
-        blue_r   = step_reward(packet, self._scenario.reward.blue,   0)
+        blue_r = step_reward(packet, self._scenario.reward.blue,   0)
         orange_r = step_reward(packet, self._scenario.reward.orange, 1)
         if event:
-            blue_r   += reward_for_event(self._scenario.reward.blue,   event)
+            blue_r += reward_for_event(self._scenario.reward.blue,   event)
             orange_r += reward_for_event(self._scenario.reward.orange, event)
         return (
             state_to_tokens(packet, car_idx=0, big_pads=pads),
@@ -345,7 +347,8 @@ def collect_episode(
     encoder:         SharedTransformerEncoder,
     policy_head:     PolicyHead,
     entity_type_ids: Union[torch.Tensor, List[int]],
-    t_window:        int  = T_WINDOW,
+    config:          TrainConfig,
+    t_window:        int = T_WINDOW,
     explore:         bool = True,
 ) -> Tuple[List[Tuple], List[Tuple]]:
     """
@@ -360,12 +363,14 @@ def collect_episode(
     def _strip(obs: np.ndarray) -> np.ndarray:
         return obs[0]   # (N, F)
 
-    init_blue   = _strip(blue_obs)
+    init_blue = _strip(blue_obs)
     init_orange = _strip(orange_obs)
 
     # Sliding window buffers — warm up by replicating the initial frame
-    blue_buf   = deque([init_blue.copy()   for _ in range(t_window)], maxlen=t_window)
-    orange_buf = deque([init_orange.copy() for _ in range(t_window)], maxlen=t_window)
+    blue_buf = deque([init_blue.copy()
+                     for _ in range(t_window)], maxlen=t_window)
+    orange_buf = deque([init_orange.copy()
+                       for _ in range(t_window)], maxlen=t_window)
 
     encoder.eval()
     policy_head.eval()
@@ -375,17 +380,19 @@ def collect_episode(
 
     done = False
     while not done:
-        blue_window   = np.stack(blue_buf)[np.newaxis]    # (1, T, N, F)
+        blue_window = np.stack(blue_buf)[np.newaxis]    # (1, T, N, F)
         orange_window = np.stack(orange_buf)[np.newaxis]  # (1, T, N, F)
 
         device = next(encoder.parameters()).device
         with torch.no_grad():
             blue_emb = encoder(
-                torch.tensor(blue_window,   dtype=torch.float32, device=device),
+                torch.tensor(blue_window,   dtype=torch.float32,
+                             device=device),
                 entity_type_ids,
             ).cpu().numpy()   # (1, D_MODEL)
             orange_emb = encoder(
-                torch.tensor(orange_window, dtype=torch.float32, device=device),
+                torch.tensor(orange_window, dtype=torch.float32,
+                             device=device),
                 entity_type_ids,
             ).cpu().numpy()
 
@@ -393,8 +400,8 @@ def collect_episode(
         orange_action, _ = policy_head.act(orange_emb)
 
         if explore:
-            blue_action[:5]   += np.random.normal(0, 0.1, 5)
-            orange_action[:5] += np.random.normal(0, 0.1, 5)
+            blue_action[:5] += np.random.normal(0, config.explore_std, 5)
+            orange_action[:5] += np.random.normal(0, config.explore_std, 5)
             np.clip(blue_action[:5],   -1.0, 1.0, out=blue_action[:5])
             np.clip(orange_action[:5], -1.0, 1.0, out=orange_action[:5])
 
@@ -410,27 +417,97 @@ def collect_episode(
     return blue_traj, orange_traj
 
 
+# ── gradient norm helper ──────────────────────────────────────────────────────
+
+def _grad_norm(params) -> float:
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            total += p.grad.detach().norm().item() ** 2
+    return total ** 0.5
+
+
+# ── off-policy AWAC loss (batched buffer samples) ─────────────────────────────
+
+def _awac_loss_from_batch(
+    encoder:         SharedTransformerEncoder,
+    policy_head:     PolicyHead,
+    entity_type_ids: Union[torch.Tensor, List[int]],
+    windows:         torch.Tensor,   # (B, T_WINDOW, N, TOKEN_FEATURES)
+    actions:         torch.Tensor,   # (B, ACTION_DIM)
+    returns:         torch.Tensor,   # (B,)  — MC returns from buffer
+    config:          TrainConfig,
+    entity_perm:     Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    AWAC loss over a pre-sampled batch from the replay buffer.
+
+    Unlike compute_awac_loss(), this accepts tensors directly (no trajectory
+    list, no return computation) so it works with SequenceReplayBuffer.sample().
+
+    Returns (total_loss, policy_loss, value_loss).
+    """
+    embeddings = encoder(windows, entity_type_ids, entity_perm=entity_perm)
+    policy, values = policy_head(embeddings)
+    values = values.squeeze(-1)   # (B,)
+
+    advantages = (returns - values.detach())
+
+    action_dim = float(policy.shape[1])
+    log_probs = (
+        -0.5 * ((actions - policy) / math.exp(_LOG_STD)).pow(2).sum(dim=-1)
+        - action_dim * (_LOG_STD + 0.5 * math.log(_TWO_PI))
+    )
+
+    weights = torch.clamp(
+        torch.exp(advantages / config.awac_beta), max=config.awac_max_weight
+    ).detach()
+
+    policy_loss = -(log_probs * weights).mean()
+    value_loss = (returns - values).pow(2).mean()
+
+    return policy_loss + 0.5 * value_loss, policy_loss, value_loss
+
+
 # ── main training function ────────────────────────────────────────────────────
 
 def train(
     all_configs:     List[ScenarioConfig],
     env:             GameEnv,
+    config:          Optional[TrainConfig] = None,
+    logger:          Optional[ExperimentLogger] = None,
     entity_type_ids: Union[torch.Tensor, List[int]] = ENTITY_TYPE_IDS_1V1,
-    max_episodes:    int = 10000,
-    save_every:      int = 500,
-    model_dir:       str = 'models/',
-    buffer_capacity: int = 500_000,
-) -> None:
-    model_path = Path(model_dir)
+    # Optuna integration — pass trial for pruning support
+    trial=None,
+) -> float:
+    """
+    Train the AWAC agent and return the final smoothed episode reward.
+
+    Parameters
+    ----------
+    all_configs : list of ScenarioConfig
+    env : GameEnv
+    config : TrainConfig  (uses defaults if None)
+    logger : ExperimentLogger  (stdout-only if None)
+    entity_type_ids : entity type index tensor
+    trial : optuna.Trial or None  — if provided, enables ASHA pruning
+    """
+    if config is None:
+        config = TrainConfig()
+    if logger is None:
+        logger = ExperimentLogger(config, enabled=False)
+
+    model_path = Path(config.model_dir)
     model_path.mkdir(parents=True, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    entity_type_ids = torch.tensor(entity_type_ids, dtype=torch.long, device=device)
+    entity_type_ids = torch.tensor(
+        entity_type_ids, dtype=torch.long, device=device)
 
     # ── 1. Build shared encoder + single policy head ──────────────────────────
-    encoder     = SharedTransformerEncoder()
+    encoder = SharedTransformerEncoder()
     policy_head = PolicyHead()
 
     # ── 2. Try loading existing checkpoints ───────────────────────────────────
@@ -449,40 +526,51 @@ def train(
 
     # ── 3. Single optimizer over ALL parameters ───────────────────────────────
     all_params = list(encoder.parameters()) + list(policy_head.parameters())
-    optimizer  = optim.Adam(all_params, lr=3e-4)
+    optimizer = optim.Adam(all_params, lr=config.lr)
 
-    # ── 4. Off-policy replay buffer ───────────────────────────────────────────
-    replay_buf = SequenceReplayBuffer(
-        capacity=buffer_capacity,
+    # ── 4. Replay buffers (expert and sim kept separate for ratio control) ───
+    _buf_kwargs = dict(
+        capacity=config.buffer_capacity,
         t_window=T_WINDOW,
         action_dim=PolicyHead.ACTION_DIM,
         token_features=TOKEN_FEATURES,
     )
+    expert_buffer = SequenceReplayBuffer(**_buf_kwargs)
+    sim_buffer = SequenceReplayBuffer(**_buf_kwargs)
 
-    # ── 4b. Pre-fill buffer with human replay episodes ────────────────────────
+    # ── 4b. Pre-fill expert buffer with human replay episodes ─────────────────
     replay_data_dir = Path(__file__).parent / 'replay_data' / 'parsed'
     if replay_data_dir.exists():
-        load_replays_into_buffer(replay_data_dir, replay_buf)
+        load_replays_into_buffer(replay_data_dir, expert_buffer)
 
-    print(f'Configs: {len(all_configs)}   Episodes: {max_episodes}   Buffer: {len(replay_buf)} steps')
+    print(
+        f'Configs: {len(all_configs)}   Episodes: {config.max_episodes}   '
+        f'Expert buffer: {len(expert_buffer)} steps   '
+        f'Expert ratio: {config.expert_replay_ratio:.2f}'
+    )
+
+    # Rolling window for smoothed reward (used for Optuna objective)
+    episode_rewards: deque = deque(maxlen=100)
+    smoothed_reward = 0.0
 
     # ── 5. Episode loop ───────────────────────────────────────────────────────
     try:
-        for episode in range(max_episodes):
+        for episode in range(config.max_episodes):
             scenario = random.choice(all_configs)
 
             blue_traj, orange_traj = collect_episode(
                 env, scenario, encoder, policy_head,
-                entity_type_ids, explore=True,
+                entity_type_ids, config=config, explore=True,
             )
 
-            # Store trajectories in replay buffer
-            replay_buf.add_episode(
-                [(w[0], a, r, i == len(blue_traj) - 1)
+            # Store sim trajectories in the sim buffer.
+            # w has shape (1, T_WINDOW, N, F); w[0, -1] is the current (N, F) obs.
+            sim_buffer.add_episode(
+                [(w[0, -1], a, r, i == len(blue_traj) - 1)
                  for i, (w, a, r) in enumerate(blue_traj)]
             )
-            replay_buf.add_episode(
-                [(w[0], a, r, i == len(orange_traj) - 1)
+            sim_buffer.add_episode(
+                [(w[0, -1], a, r, i == len(orange_traj) - 1)
                  for i, (w, a, r) in enumerate(orange_traj)]
             )
 
@@ -491,40 +579,122 @@ def train(
             policy_head.train()
 
             # Random entity permutation for AWAC data augmentation
-            N = blue_traj[0][0].shape[2]   # entity count from window shape (1,T,N,F)
+            # entity count from window shape (1,T,N,F)
+            N = blue_traj[0][0].shape[2]
             entity_perm = torch.randperm(N, device=device)
 
-            blue_loss = compute_awac_loss(
+            blue_total, blue_pol, blue_val = compute_awac_loss(
                 encoder, policy_head, blue_traj,
-                entity_type_ids, entity_perm=entity_perm,
+                entity_type_ids, config, entity_perm=entity_perm,
             )
-            orange_loss = compute_awac_loss(
+            orange_total, orange_pol, orange_val = compute_awac_loss(
                 encoder, policy_head, orange_traj,
-                entity_type_ids, entity_perm=entity_perm,
+                entity_type_ids, config, entity_perm=entity_perm,
             )
-            total_loss = blue_loss + orange_loss
+            total_loss = blue_total + orange_total
+            policy_loss = blue_pol + orange_pol
+            value_loss = blue_val + orange_val
 
             optimizer.zero_grad()
             total_loss.backward()
+            grad_norm = _grad_norm(all_params)
             optimizer.step()
 
-            # ── logging ───────────────────────────────────────────────────────
-            if episode % 100 == 0:
-                print(
-                    f'[ep {episode:05d}] loss={float(total_loss):.4f}  '
-                    f'ticks={len(blue_traj)}'
-                )
+            # ── off-policy buffer update (expert + sim) ───────────────────────
+            buf_loss_val = 0.0
+            batch_size = config.buffer_batch_size
+            has_expert = len(expert_buffer._valid_endpoints()) > 0
+            has_sim = len(sim_buffer._valid_endpoints()) > 0
+
+            if batch_size > 0 and (has_expert or has_sim):
+                n_expert = int(
+                    batch_size * config.expert_replay_ratio) if has_expert else 0
+                n_sim = batch_size - n_expert if has_sim else 0
+                # redistribute if one source is unavailable
+                if not has_expert:
+                    n_expert, n_sim = 0, batch_size
+                if not has_sim:
+                    n_expert, n_sim = batch_size, 0
+
+                batches = []
+                try:
+                    if n_expert > 0:
+                        batches.append(expert_buffer.sample(
+                            n_expert, config.gamma))
+                    if n_sim > 0:
+                        batches.append(sim_buffer.sample(n_sim, config.gamma))
+                except RuntimeError as _sample_err:
+                    print(f'[warn] Skipping off-policy update: {_sample_err}',
+                          file=sys.stderr)
+
+                if batches:
+                    buf_windows = torch.cat([b[0] for b in batches])
+                    buf_actions = torch.cat([b[1] for b in batches])
+                    buf_returns = torch.cat([b[2] for b in batches])
+
+                    encoder.train()
+                    policy_head.train()
+                    buf_total, _, _ = _awac_loss_from_batch(
+                        encoder, policy_head, entity_type_ids,
+                        buf_windows, buf_actions, buf_returns, config,
+                        entity_perm=torch.randperm(N),
+                    )
+                    optimizer.zero_grad()
+                    buf_total.backward()
+                    optimizer.step()
+                    buf_loss_val = float(buf_total)
+
+            # ── metrics ───────────────────────────────────────────────────────
+            blue_ep_reward = sum(r for _, _, r in blue_traj)
+            orange_ep_reward = sum(r for _, _, r in orange_traj)
+            ep_reward = (blue_ep_reward + orange_ep_reward) / 2.0
+            episode_rewards.append(ep_reward)
+            smoothed_reward = float(np.mean(episode_rewards))
+
+            logger.log(
+                episode,
+                **{
+                    'train/total_loss':            float(total_loss),
+                    'train/policy_loss':           float(policy_loss),
+                    'train/value_loss':            float(value_loss),
+                    'train/buffer_loss':           buf_loss_val,
+                    'train/episode_reward':        ep_reward,
+                    'train/episode_length':        len(blue_traj),
+                    'train/grad_norm':             grad_norm,
+                    'train/expert_buffer_size':    len(expert_buffer),
+                    'train/sim_buffer_size':       len(sim_buffer),
+                    'train/smoothed_reward_100ep': smoothed_reward,
+                },
+            )
+
+            # ── Optuna pruning hook ───────────────────────────────────────────
+            if trial is not None and episode > 0 and episode % 200 == 0:
+                trial.report(smoothed_reward, step=episode)
+                if trial.should_prune():
+                    import optuna
+                    raise optuna.exceptions.TrialPruned()
 
             # ── checkpoint ────────────────────────────────────────────────────
-            if episode > 0 and episode % save_every == 0:
+            if episode > 0 and episode % config.save_every == 0:
                 _save_all(encoder, policy_head, model_path)
                 print(f'[ep {episode:05d}] Checkpointed.')
 
+    except Exception as exc:
+        # Re-raise unless it's an Optuna pruning signal
+        try:
+            import optuna
+            if not isinstance(exc, optuna.exceptions.TrialPruned):
+                raise
+        except ImportError:
+            raise
     finally:
         env.close()
+        logger.finish()
 
     # ── 6. Final save ─────────────────────────────────────────────────────────
     _save_all(encoder, policy_head, model_path)
+
+    return smoothed_reward
 
 
 def _save_all(
@@ -544,10 +714,40 @@ def main() -> None:
         '--env', default='rlgym', choices=['rlgym', 'rlbot'],
         help='Game environment: rlgym (fast sim, default) or rlbot (live game)',
     )
-    parser.add_argument('--episodes',   default=10000, type=int)
-    parser.add_argument('--save-every', default=500,   type=int)
-    parser.add_argument('--model-dir',  default='models/')
+    parser.add_argument('--episodes',    default=10000,  type=int)
+    parser.add_argument('--save-every',  default=500,    type=int)
+    parser.add_argument('--model-dir',   default='models/')
+    # Hyperparameters
+    parser.add_argument('--lr',          default=3e-4,   type=float)
+    parser.add_argument('--awac-beta',   default=1.0,    type=float)
+    parser.add_argument('--awac-max-weight', default=20.0, type=float)
+    parser.add_argument('--gamma',       default=0.99,   type=float)
+    parser.add_argument('--explore-std',       default=0.1,   type=float)
+    parser.add_argument('--expert-ratio',      default=0.5,   type=float,
+                        help='Fraction of off-policy batch from expert replays (0.0–1.0)')
+    parser.add_argument('--buffer-batch-size', default=256,   type=int,
+                        help='Off-policy batch size per episode update (0 to disable)')
+    # W&B
+    parser.add_argument('--no-wandb',    action='store_true',
+                        help='Disable W&B logging (stdout only)')
+    parser.add_argument('--wandb-project', default='mlbot')
+    parser.add_argument('--wandb-run-name', default=None)
     args = parser.parse_args()
+
+    config = TrainConfig(
+        lr=args.lr,
+        awac_beta=args.awac_beta,
+        awac_max_weight=args.awac_max_weight,
+        gamma=args.gamma,
+        explore_std=args.explore_std,
+        expert_replay_ratio=args.expert_ratio,
+        buffer_batch_size=args.buffer_batch_size,
+        max_episodes=args.episodes,
+        save_every=args.save_every,
+        model_dir=args.model_dir,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+    )
 
     configs = discover_all_configs()
     if not configs:
@@ -563,12 +763,13 @@ def main() -> None:
             'and call train() directly from your launcher script.'
         )
 
+    logger = ExperimentLogger(config, enabled=not args.no_wandb)
+
     train(
         all_configs=configs,
         env=env,
-        max_episodes=args.episodes,
-        save_every=args.save_every,
-        model_dir=args.model_dir,
+        config=config,
+        logger=logger,
     )
 
 

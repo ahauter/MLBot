@@ -80,6 +80,20 @@ def load_replays_into_buffer(
                         buffer.add_episode(trajectory)
                         total_eps += 1
                     ep_start = t + 1
+            # Flush the final episode (frames after the last done signal).
+            # Replays that end by time expiry have no trailing done=True.
+            if ep_start < T and (T - ep_start) >= min_episode_len:
+                trajectory = [
+                    (
+                        tokens[i, player],
+                        actions[i, player],
+                        float(rewards[i, player]),
+                        i == T - 1,   # mark the last frame as done
+                    )
+                    for i in range(ep_start, T)
+                ]
+                buffer.add_episode(trajectory)
+                total_eps += 1
 
         total_files += 1
 
