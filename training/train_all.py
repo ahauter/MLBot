@@ -46,6 +46,17 @@ Environment abstraction
 """
 
 from __future__ import annotations
+from skills.controller import KNNController
+from skills.skill_head import SkillHead
+from encoder import (
+    SharedTransformerEncoder,
+    N_TOKENS,
+    TOKEN_FEATURES,
+    rlgym_obs_to_tokens,
+    state_to_tokens,
+)
+from scenarios.graders import ScenarioGrader, reward_for_event, step_reward
+from scenarios.scenario_config import ScenarioConfig
 
 import abc
 import argparse
@@ -65,17 +76,6 @@ _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-from scenarios.scenario_config import ScenarioConfig
-from scenarios.graders import ScenarioGrader, reward_for_event, step_reward
-from encoder import (
-    SharedTransformerEncoder,
-    N_TOKENS,
-    TOKEN_FEATURES,
-    rlgym_obs_to_tokens,
-    state_to_tokens,
-)
-from skills.skill_head import SkillHead
-from skills.controller import KNNController
 
 # ── config discovery ──────────────────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ def compute_returns(rewards: List[float]) -> np.ndarray:
 # ── Actor-Critic loss ─────────────────────────────────────────────────────────
 
 _LOG_STD = math.log(0.5)
-_TWO_PI  = 2.0 * math.pi
+_TWO_PI = 2.0 * math.pi
 
 
 def compute_ac_loss(
@@ -136,7 +136,7 @@ def compute_ac_loss(
     if not trajectory:
         return torch.tensor(0.0)
 
-    tokens_batch  = torch.tensor(
+    tokens_batch = torch.tensor(
         np.concatenate([t[0] for t in trajectory], axis=0),
         dtype=torch.float32,
     )   # (T, N_TOKENS, TOKEN_FEATURES)
@@ -149,20 +149,23 @@ def compute_ac_loss(
         dtype=torch.float32,
     )   # (T,)
 
-    embeddings     = encoder(tokens_batch)              # (T, D_MODEL)
-    policy, values = skill_head(embeddings)             # (T, ACTION_DIM), (T, 1)
-    values         = values.squeeze(-1)                 # (T,)
+    embeddings = encoder(tokens_batch)              # (T, D_MODEL)
+    # (T, ACTION_DIM), (T, 1)
+    policy, values = skill_head(embeddings)
+    values = values.squeeze(-1)                 # (T,)
 
     advantages = returns - values.detach()              # (T,)
 
     action_dim = float(policy.shape[1])
-    log_probs  = (
-        -0.5 * ((actions_taken - policy) / math.exp(_LOG_STD)).pow(2).sum(dim=-1)
+    log_probs = (
+        -0.5 * ((actions_taken - policy) /
+                math.exp(_LOG_STD)).pow(2).sum(dim=-1)
         - action_dim * (_LOG_STD + 0.5 * math.log(_TWO_PI))
     )
-    policy_loss   = -(log_probs * advantages.detach()).mean()
-    value_loss    = (returns - values).pow(2).mean()
-    entropy_bonus = 0.01 * 0.5 * action_dim * (1.0 + math.log(_TWO_PI * math.exp(2.0 * _LOG_STD)))
+    policy_loss = -(log_probs * advantages.detach()).mean()
+    value_loss = (returns - values).pow(2).mean()
+    entropy_bonus = 0.01 * 0.5 * action_dim * \
+        (1.0 + math.log(_TWO_PI * math.exp(2.0 * _LOG_STD)))
 
     return policy_loss + 0.5 * value_loss - entropy_bonus
 
@@ -219,7 +222,7 @@ class RLGymEnv(GameEnv):
     """
 
     def __init__(self) -> None:
-        self._env  = None
+        self._env = None
         self._scenario: Optional[ScenarioConfig] = None
 
         try:
@@ -239,13 +242,14 @@ class RLGymEnv(GameEnv):
             ScenarioTerminalCondition,
         )
         return self._rlgym_sim.make(
-            obs_builder         = TokenObsBuilder(),
-            action_parser       = self._rlgym_sim.utils.action_parsers.ContinuousAction(),
-            state_setter        = ScenarioStateSetter(scenario),
-            reward_fn           = ScenarioRewardFn(scenario),
-            terminal_conditions = [ScenarioTerminalCondition(scenario)],
-            team_size           = 1,
-            tick_skip           = 8,
+            obs_builder=TokenObsBuilder(),
+            action_parser=self._rlgym_sim.utils.action_parsers.ContinuousAction(),
+            state_setter=ScenarioStateSetter(scenario),
+            reward_fn=ScenarioRewardFn(scenario),
+            terminal_conditions=[ScenarioTerminalCondition(scenario)],
+            team_size=1,
+            spawn_opponents=True,
+            tick_skip=8,
         )
 
     def reset(self, scenario: ScenarioConfig) -> _OBS_PAIR:
@@ -253,15 +257,43 @@ class RLGymEnv(GameEnv):
         if self._env is not None:
             self._env.close()
         self._env = self._build_env(scenario)
-        obs_list, _info = self._env.reset()
+
+        obs_list = self._env.reset()
+        # rlgym-sim may return gym-style (obs, info), and may supply 2-agent obs as a list or array.
+        if isinstance(obs_list, tuple) and len(obs_list) == 2:
+            obs_list = obs_list[0]
+
+        if isinstance(obs_list, np.ndarray):
+            if obs_list.ndim == 1 and obs_list.shape[0] == N_TOKENS * TOKEN_FEATURES:
+                raise RuntimeError(
+                    'RLGymEnv returned a single-player observation. '
+                    'Make sure spawn_opponents=True in RLGymEnv._build_env so both teams exist.'
+                )
+            if obs_list.ndim == 2 and obs_list.shape[0] == 2:
+                blue_obs = obs_list[0]
+                orange_obs = obs_list[1]
+            else:
+                raise ValueError(
+                    f'Unexpected RLGym observations shape: {obs_list.shape}. '
+                    'Expected (2, N) or list-like of two observations.'
+                )
+        elif isinstance(obs_list, (list, tuple)) and len(obs_list) == 2:
+            blue_obs, orange_obs = obs_list
+        else:
+            raise ValueError(
+                f'Unexpected RLGym reset return value: {type(obs_list)}. '
+                'Expected two observations for blue and orange.'
+            )
+
         return (
-            rlgym_obs_to_tokens(obs_list[0], player_idx=0),
-            rlgym_obs_to_tokens(obs_list[1], player_idx=1),
+            rlgym_obs_to_tokens(blue_obs,  player_idx=0),
+            rlgym_obs_to_tokens(orange_obs, player_idx=1),
         )
 
     def step(self, blue_action, orange_action) -> _STEP_OUT:
         actions = np.stack([blue_action, orange_action], axis=0)
-        obs_list, rewards, terminated, truncated, _info = self._env.step(actions)
+        obs_list, rewards, terminated, truncated = self._env.step(
+            actions)
         done = bool(terminated or truncated)
         return (
             rlgym_obs_to_tokens(obs_list[0], player_idx=0),
@@ -293,7 +325,7 @@ class RLBotEnv(GameEnv):
     """
 
     def __init__(self, game_runner, boost_pad_tracker=None) -> None:
-        self._runner            = game_runner
+        self._runner = game_runner
         self._boost_pad_tracker = boost_pad_tracker
         self._scenario: Optional[ScenarioConfig] = None
         self._grader:   Optional[ScenarioGrader] = None
@@ -303,8 +335,8 @@ class RLBotEnv(GameEnv):
         return self._boost_pad_tracker.get_full_boosts() if self._boost_pad_tracker else None
 
     def reset(self, scenario: ScenarioConfig) -> _OBS_PAIR:
-        self._scenario      = scenario
-        self._grader        = ScenarioGrader(scenario)
+        self._scenario = scenario
+        self._grader = ScenarioGrader(scenario)
         self._episode_start = time.monotonic()
         self._runner.reset(scenario)
         packet = self._runner.get_packet()
@@ -321,13 +353,13 @@ class RLBotEnv(GameEnv):
         packet = self._runner.get_packet()
         if self._boost_pad_tracker:
             self._boost_pad_tracker.update_boost_status(packet)
-        pads    = self._big_pads()
+        pads = self._big_pads()
         elapsed = time.monotonic() - self._episode_start
-        event   = self._grader.check(packet, elapsed)
-        blue_r  = step_reward(packet, self._scenario.reward.blue,   0)
+        event = self._grader.check(packet, elapsed)
+        blue_r = step_reward(packet, self._scenario.reward.blue,   0)
         orange_r = step_reward(packet, self._scenario.reward.orange, 1)
         if event:
-            blue_r   += reward_for_event(self._scenario.reward.blue,   event)
+            blue_r += reward_for_event(self._scenario.reward.blue,   event)
             orange_r += reward_for_event(self._scenario.reward.orange, event)
         return (
             state_to_tokens(packet, car_idx=0, big_pads=pads),
@@ -351,7 +383,7 @@ def collect_episode(
     explore:     bool = True,
 ) -> Tuple[List[Tuple], List[Tuple]]:
     """Run one episode and return (blue_trajectory, orange_trajectory)."""
-    blue_skill   = scenario.initial_state.blue.skill
+    blue_skill = scenario.initial_state.blue.skill
     orange_skill = scenario.initial_state.orange.skill
 
     blue_obs, orange_obs = env.reset(scenario)
@@ -366,19 +398,22 @@ def collect_episode(
     done = False
     while not done:
         with torch.no_grad():
-            blue_emb   = encoder(torch.tensor(blue_obs,   dtype=torch.float32)).numpy()
-            orange_emb = encoder(torch.tensor(orange_obs, dtype=torch.float32)).numpy()
+            blue_emb = encoder(torch.tensor(
+                blue_obs,   dtype=torch.float32)).numpy()
+            orange_emb = encoder(torch.tensor(
+                orange_obs, dtype=torch.float32)).numpy()
 
         blue_action,   _ = skill_heads[blue_skill].act(blue_emb)
         orange_action, _ = skill_heads[orange_skill].act(orange_emb)
 
         if explore:
-            blue_action[:5]   += np.random.normal(0, 0.1, 5)
+            blue_action[:5] += np.random.normal(0, 0.1, 5)
             orange_action[:5] += np.random.normal(0, 0.1, 5)
             np.clip(blue_action[:5],   -1.0, 1.0, out=blue_action[:5])
             np.clip(orange_action[:5], -1.0, 1.0, out=orange_action[:5])
 
-        blue_obs, orange_obs, blue_r, orange_r, done = env.step(blue_action, orange_action)
+        blue_obs, orange_obs, blue_r, orange_r, done = env.step(
+            blue_action, orange_action)
 
         blue_traj.append((blue_obs,   blue_action,   blue_r))
         orange_traj.append((orange_obs, orange_action, orange_r))
@@ -392,9 +427,9 @@ def train(
     all_configs:  List[ScenarioConfig],
     env:          GameEnv,
     skill_filter: Optional[str] = None,
-    max_episodes: int           = 10000,
-    save_every:   int           = 500,
-    model_dir:    str           = 'models/',
+    max_episodes: int = 10000,
+    save_every:   int = 500,
+    model_dir:    str = 'models/',
 ) -> None:
     model_path = Path(model_dir)
     model_path.mkdir(parents=True, exist_ok=True)
@@ -421,7 +456,8 @@ def train(
     for name, head in skill_heads.items():
         head_ckpt = model_path / f'skill_{name}.pt'
         if head_ckpt.exists():
-            head.load_state_dict(torch.load(str(head_ckpt), map_location='cpu'))
+            head.load_state_dict(torch.load(
+                str(head_ckpt), map_location='cpu'))
             print(f'Loaded skill head: {name}')
 
     # ── 4. Single optimizer over ALL parameters ───────────────────────────────
@@ -435,12 +471,13 @@ def train(
     if skill_filter:
         active_configs = [
             c for c in all_configs
-            if (c.initial_state.blue.skill   == skill_filter or
+            if (c.initial_state.blue.skill == skill_filter or
                 c.initial_state.orange.skill == skill_filter)
         ]
         if not active_configs:
             raise ValueError(f'No configs found for skill: {skill_filter!r}')
-        print(f'Fine-tuning skill: {skill_filter!r}  ({len(active_configs)} configs)')
+        print(
+            f'Fine-tuning skill: {skill_filter!r}  ({len(active_configs)} configs)')
 
     print(f'Skills: {sorted(all_skill_names)}')
     print(f'Configs: {len(active_configs)}   Episodes: {max_episodes}')
@@ -448,8 +485,8 @@ def train(
     # ── 5. Episode loop ───────────────────────────────────────────────────────
     try:
         for episode in range(max_episodes):
-            scenario     = random.choice(active_configs)
-            blue_skill   = scenario.initial_state.blue.skill
+            scenario = random.choice(active_configs)
+            blue_skill = scenario.initial_state.blue.skill
             orange_skill = scenario.initial_state.orange.skill
 
             # Collect trajectory (encoder in eval mode, no_grad)
@@ -462,9 +499,11 @@ def train(
             skill_heads[blue_skill].train()
             skill_heads[orange_skill].train()
 
-            blue_loss   = compute_ac_loss(encoder, skill_heads[blue_skill],   blue_traj)
-            orange_loss = compute_ac_loss(encoder, skill_heads[orange_skill], orange_traj)
-            total_loss  = blue_loss + orange_loss
+            blue_loss = compute_ac_loss(
+                encoder, skill_heads[blue_skill],   blue_traj)
+            orange_loss = compute_ac_loss(
+                encoder, skill_heads[orange_skill], orange_traj)
+            total_loss = blue_loss + orange_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -514,12 +553,14 @@ def _save_all(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Train all RL skills jointly.')
+    parser = argparse.ArgumentParser(
+        description='Train all RL skills jointly.')
     parser.add_argument(
         '--env', default='rlgym', choices=['rlgym', 'rlbot'],
         help='Game environment: rlgym (fast sim, default) or rlbot (live game)',
     )
-    parser.add_argument('--skill',      default=None,   help='Fine-tune a single skill')
+    parser.add_argument('--skill',      default=None,
+                        help='Fine-tune a single skill')
     parser.add_argument('--episodes',   default=10000,  type=int)
     parser.add_argument('--save-every', default=500,    type=int)
     parser.add_argument('--model-dir',  default='models/')
@@ -540,12 +581,12 @@ def main() -> None:
         )
 
     train(
-        all_configs  = configs,
-        env          = env,
-        skill_filter = args.skill,
-        max_episodes = args.episodes,
-        save_every   = args.save_every,
-        model_dir    = args.model_dir,
+        all_configs=configs,
+        env=env,
+        skill_filter=args.skill,
+        max_episodes=args.episodes,
+        save_every=args.save_every,
+        model_dir=args.model_dir,
     )
 
 

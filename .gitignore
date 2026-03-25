@@ -4,7 +4,8 @@ __pycache__/
 *$py.class
 
 # Collision meshes from the game
-meshes
+collision_meshes/
+models/
 
 # C extensions
 *.so
