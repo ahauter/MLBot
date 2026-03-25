@@ -61,7 +61,12 @@ class _TransformerEncoder(Encoder):
         self._entity_ids = None  # lazily created on correct device
 
     def forward(self, x: Union[torch.Tensor, Sequence[torch.Tensor]]) -> torch.Tensor:
-        assert isinstance(x, torch.Tensor)
+        assert isinstance(x, torch.Tensor), f"Expected Tensor, got {type(x)}"
+        assert x.dim() == 2, f"Expected 2D input (batch, flat), got {x.dim()}D"
+        expected_size = self.t_window * self.n_tokens * self.token_features
+        assert x.shape[1] == expected_size, \
+            f"Input size {x.shape[1]} != expected {expected_size} " \
+            f"(T={self.t_window} * N={self.n_tokens} * F={self.token_features})"
         batch = x.shape[0]
         # Reshape flat → (batch, T, N, F)
         tokens = x.view(batch, self.t_window, self.n_tokens, self.token_features)

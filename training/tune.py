@@ -6,21 +6,19 @@ Searches over training hyperparameters using Optuna with ASHA pruning.
 Each trial runs a shortened d3rlpy training session and reports mean
 episode reward. Best params can be loaded by train.py --params-from.
 
-The study is stored in SQLite for crash-resistant resumability.
-
 Usage
 -----
     # Run 50 trials:
     python training/tune.py
 
-    # Override trials or step budget:
-    python training/tune.py --n-trials 20 --steps-per-trial 200000
-
     # Show best trial:
     python training/tune.py --show-best
 
-    # Resume from existing study:
-    python training/tune.py --storage sqlite:///optuna_baseline.db
+    # Auto-launch 10-seed baseline after tuning:
+    python training/tune.py --auto-seeds
+
+    # Override trials or step budget:
+    python training/tune.py --n-trials 20 --steps-per-trial 200000
 
 Requirements
 ------------
@@ -29,8 +27,12 @@ Requirements
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
+from collections import deque
 from pathlib import Path
+
+import numpy as np
 
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
@@ -43,6 +45,55 @@ STUDY_NAME = 'baseline-hparam-search'
 STORAGE_PATH = 'sqlite:///optuna_baseline.db'
 
 
+# ── reward-tracking wrapper ──────────────────────────────────────────────────
+
+class RewardTracker:
+    """
+    Wraps a gymnasium env to track episode returns.
+
+    d3rlpy's fit_online doesn't expose episode rewards in its callback,
+    so we track them here and read from the callback.
+    """
+
+    def __init__(self, env):
+        self.env = env
+        self.episode_returns: deque = deque(maxlen=200)
+        self._current_return = 0.0
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
+
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    def reset(self, **kwargs):
+        self._current_return = 0.0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._current_return += reward
+        if terminated or truncated:
+            self.episode_returns.append(self._current_return)
+            self._current_return = 0.0
+        return obs, reward, terminated, truncated, info
+
+    def close(self):
+        return self.env.close()
+
+    def mean_return(self, last_n: int = 100) -> float:
+        """Mean of last N episode returns."""
+        if not self.episode_returns:
+            return 0.0
+        recent = list(self.episode_returns)[-last_n:]
+        return float(np.mean(recent))
+
+
 # ── objective ────────────────────────────────────────────────────────────────
 
 def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
@@ -50,7 +101,6 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
     """
-    import numpy as np
     import d3rlpy
     from d3rlpy.algos.qlearning.explorers import NormalNoise
     from d3rlpy.logging import FileAdapterFactory, WanDBAdapterFactory
@@ -81,7 +131,9 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
         lam=awac_lambda,
     ).create(device='cpu')
 
-    env = BaselineGymEnv(t_window=t_window)
+    raw_env = BaselineGymEnv(t_window=t_window)
+    env = RewardTracker(raw_env)
+
     buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000, env=env)
     explorer = NormalNoise(std=explore_noise)
 
@@ -92,17 +144,14 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
             root_dir=f'models/tune/trial_{trial.number}'
         )
 
-    # Track rewards for pruning
-    episode_rewards = []
     pruning_interval = 50_000  # check every 50k steps
 
     def callback(algo_obj, epoch, total_step):
         import optuna
-        # Report at pruning intervals
         if total_step > 0 and total_step % pruning_interval < 1000:
-            if episode_rewards:
-                mean_reward = float(np.mean(episode_rewards[-100:]))
-                trial.report(mean_reward, step=total_step)
+            mean_r = env.mean_return(100)
+            if len(env.episode_returns) > 0:
+                trial.report(mean_r, step=total_step)
                 if trial.should_prune():
                     raise optuna.exceptions.TrialPruned()
 
@@ -120,7 +169,6 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
             callback=callback,
         )
     except Exception as e:
-        # Check if it's an Optuna pruning signal
         try:
             import optuna
             if isinstance(e, optuna.exceptions.TrialPruned):
@@ -130,12 +178,55 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
         print(f'Trial {trial.number} failed: {e}', file=sys.stderr)
         return float('-inf')
     finally:
-        env.close()
+        raw_env.close()
 
-    # Return mean reward from last 100 episodes
-    if episode_rewards:
-        return float(np.mean(episode_rewards[-100:]))
-    return 0.0
+    mean_reward = env.mean_return(100)
+    assert not np.isnan(mean_reward), \
+        f"Trial {trial.number}: NaN reward — training diverged"
+    return mean_reward
+
+
+# ── auto-seed launcher ──────────────────────────────────────────────────────
+
+def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> list:
+    """
+    Launch baseline training with best params from Optuna study.
+
+    Returns list of (seed, subprocess.Popen) tuples.
+    """
+    best = study.best_params
+    Path('models/baseline').mkdir(parents=True, exist_ok=True)
+
+    print(f'\n=== Launching {n_seeds} seeds with best params ===')
+    for k, v in best.items():
+        print(f'  {k}: {v}')
+    print()
+
+    procs = []
+    for seed in range(n_seeds):
+        cmd = [
+            sys.executable, 'training/train.py',
+            '--seed', str(seed),
+            '--actor-lr', str(best.get('actor_lr', 3e-4)),
+            '--critic-lr', str(best.get('critic_lr', 3e-4)),
+            '--awac-lambda', str(best.get('awac_lambda', 1.0)),
+            '--tau', str(best.get('tau', 0.005)),
+            '--batch-size', str(int(best.get('batch_size', 256))),
+            '--gamma', str(best.get('gamma', 0.99)),
+            '--explore-noise', str(best.get('explore_noise', 0.1)),
+        ]
+        if extra_args:
+            cmd.extend(extra_args)
+
+        log_path = f'models/baseline/seed_{seed}.log'
+        log_file = open(log_path, 'w')
+        proc = subprocess.Popen(
+            cmd, stdout=log_file, stderr=subprocess.STDOUT
+        )
+        procs.append((seed, proc, log_file))
+        print(f'  Seed {seed}: PID {proc.pid}, log: {log_path}')
+
+    return procs
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -156,6 +247,13 @@ def main():
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
     parser.add_argument('--storage', default=STORAGE_PATH)
+    # Auto-seed launching
+    parser.add_argument('--auto-seeds', action='store_true',
+                        help='Auto-launch baseline seeds after tuning completes')
+    parser.add_argument('--n-seeds', type=int, default=10,
+                        help='Number of seeds to launch (default: 10)')
+    parser.add_argument('--wait', action='store_true',
+                        help='Wait for all seed processes to complete')
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -182,7 +280,8 @@ def main():
             print('  Hyperparameters:')
             for k, v in best.params.items():
                 print(f'    {k}: {v}')
-            print(f'\nUse with: python training/train.py --params-from {args.storage.replace("sqlite:///", "")}')
+            print(f'\nUse with: python training/train.py '
+                  f'--params-from {args.storage.replace("sqlite:///", "")}')
         return
 
     n_existing = len([t for t in study.trials if t.state.is_finished()])
@@ -200,6 +299,25 @@ def main():
     print(f'Best trial #{best.number}  reward={best.value:.4f}')
     for k, v in best.params.items():
         print(f'  {k}: {v}')
+
+    # ── auto-launch seeds ────────────────────────────────────────────────
+    if args.auto_seeds:
+        extra = []
+        if args.no_wandb:
+            extra.append('--no-wandb')
+        procs = launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
+
+        if args.wait:
+            print(f'\nWaiting for {len(procs)} seed processes...')
+            for seed, proc, log_file in procs:
+                proc.wait()
+                log_file.close()
+                status = 'OK' if proc.returncode == 0 else f'FAILED ({proc.returncode})'
+                print(f'  Seed {seed}: {status}')
+            print('All seeds complete.')
+        else:
+            print(f'\n{len(procs)} seeds launched in background.')
+            print('Monitor with: tail -f models/baseline/seed_0.log')
 
 
 if __name__ == '__main__':

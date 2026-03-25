@@ -221,16 +221,12 @@ class TrainingCallback:
 
     def _save_snapshot(self, algo, total_step: int) -> None:
         """Save current policy as self-play opponent snapshot."""
-        # Extract encoder and policy from d3rlpy's internal model
-        # For self-play we save the d3rlpy model and reload via our encoder
-        snap_dir = Path(self.config.snapshot_dir) / f'step_{total_step:010d}'
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        algo.save(str(snap_dir / 'd3rlpy_model'))
+        self.pool.save_snapshot(algo, total_step)
 
-        # Also update the env's opponent from the pool
+        # Update the env's opponent from the pool
         if self.pool.num_snapshots() > 0:
-            opp_enc, opp_pol = self.pool.sample_opponent()
-            self.env.set_opponent(opp_enc, opp_pol)
+            opponent_algo = self.pool.sample_opponent()
+            self.env.set_opponent(opponent_algo)
 
     def _run_eval(self, algo, total_step: int) -> None:
         """Run evaluation against Psyonix tiers."""
@@ -287,6 +283,11 @@ class TrainingCallback:
 
 def train(config: TrainConfig) -> None:
     """Run training with the given configuration."""
+    assert config.eval_interval > 0, "eval_interval must be positive"
+    assert config.total_steps > 0, "total_steps must be positive"
+    assert config.batch_size > 0, "batch_size must be positive"
+    assert config.algo in ALGO_MAP, f"Unknown algo: {config.algo}"
+
     set_seed(config.seed)
 
     model_dir = Path(config.model_dir) / f'seed_{config.seed}'
@@ -307,14 +308,21 @@ def train(config: TrainConfig) -> None:
     # ── environment ──────────────────────────────────────────────────────
     env = BaselineGymEnv(t_window=config.t_window)
 
-    # ── self-play opponent pool ──────────────────────────────────────────
-    pool = OpponentPool(
-        snapshot_dir=config.snapshot_dir,
-        max_snapshots=config.max_snapshots,
-    )
-
     # ── d3rlpy algorithm ─────────────────────────────────────────────────
     algo = build_algo(config)
+
+    # ── self-play opponent pool ──────────────────────────────────────────
+    # algo_builder creates a fresh algo instance for loading opponent weights
+    def _algo_builder():
+        a = build_algo(config)
+        a.build_with_env(env)
+        return a
+
+    pool = OpponentPool(
+        snapshot_dir=config.snapshot_dir,
+        algo_builder=_algo_builder,
+        max_snapshots=config.max_snapshots,
+    )
 
     # ── callback ─────────────────────────────────────────────────────────
     callback = TrainingCallback(config, env, pool)

@@ -27,20 +27,15 @@ from typing import Any, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
-import torch
 
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 from encoder import (
-    SharedTransformerEncoder,
     TOKEN_FEATURES,
     N_TOKENS,
-    ENTITY_TYPE_IDS_1V1,
-    T_MAX,
 )
-from policy_head import PolicyHead
 
 
 # ── goal detection ───────────────────────────────────────────────────────────
@@ -51,8 +46,9 @@ class BaselineGymEnv(gym.Env):
     """
     Gymnasium wrapper for 1v1 baseline training with sparse reward.
 
-    The agent controls blue (team 0). The opponent (team 1) is a frozen
-    policy snapshot that runs inside the environment.
+    The agent controls blue (team 0). The opponent (team 1) is either:
+    - A frozen d3rlpy algo snapshot (calls algo.predict())
+    - Random actions (if no opponent is set)
 
     Parameters
     ----------
@@ -62,10 +58,6 @@ class BaselineGymEnv(gym.Env):
         Physics ticks per action (default 8 ≈ 15 actions/sec at 120Hz).
     max_steps : int
         Maximum steps per episode before timeout.
-    opponent_encoder : SharedTransformerEncoder | None
-        Frozen opponent encoder. If None, opponent takes random actions.
-    opponent_policy : PolicyHead | None
-        Frozen opponent policy head.
     """
 
     metadata = {'render_modes': []}
@@ -75,8 +67,6 @@ class BaselineGymEnv(gym.Env):
         t_window: int = 8,
         tick_skip: int = 8,
         max_steps: int = 4500,  # ~5 min at 15 steps/sec
-        opponent_encoder: Optional[SharedTransformerEncoder] = None,
-        opponent_policy: Optional[PolicyHead] = None,
     ):
         super().__init__()
         self.t_window = t_window
@@ -91,28 +81,26 @@ class BaselineGymEnv(gym.Env):
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
         )
 
-        self._opponent_encoder = opponent_encoder
-        self._opponent_policy = opponent_policy
-        self._entity_type_ids = torch.tensor(
-            ENTITY_TYPE_IDS_1V1, dtype=torch.long
-        )
+        # d3rlpy algo used as opponent (or None for random)
+        self._opponent_algo = None
 
         self._env = None
-        self._rlgym_sim = None
         self._blue_buf: deque = deque(maxlen=t_window)
         self._orange_buf: deque = deque(maxlen=t_window)
         self._step_count = 0
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def set_opponent(
-        self,
-        encoder: Optional[SharedTransformerEncoder],
-        policy: Optional[PolicyHead],
-    ) -> None:
-        """Hot-swap the opponent model (e.g. from OpponentPool)."""
-        self._opponent_encoder = encoder
-        self._opponent_policy = policy
+    def set_opponent(self, algo) -> None:
+        """
+        Hot-swap the opponent model.
+
+        Parameters
+        ----------
+        algo : d3rlpy algo instance or None
+            A d3rlpy learnable with .predict() method, or None for random.
+        """
+        self._opponent_algo = algo
 
     def reset(
         self,
@@ -137,13 +125,18 @@ class BaselineGymEnv(gym.Env):
             self._blue_buf.append(blue_tokens.copy())
             self._orange_buf.append(orange_tokens.copy())
 
-        return self._get_stacked_obs(), {}
+        obs = self._get_stacked_obs()
+        assert obs.shape == self.observation_space.shape, \
+            f"Bad obs shape: {obs.shape} != {self.observation_space.shape}"
+        return obs, {}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        assert action.shape == (8,), f"Bad action shape: {action.shape}"
 
         # Get opponent action
         opp_action = self._get_opponent_action()
+        assert opp_action.shape == (8,), f"Bad opponent action: {opp_action.shape}"
 
         obs_list, rewards, terminated, truncated = self._env.step(
             np.stack([action, opp_action], axis=0)
@@ -156,14 +149,18 @@ class BaselineGymEnv(gym.Env):
         self._orange_buf.append(orange_tokens)
         self._step_count += 1
 
-        # Sparse reward: only on episode end (goal scored)
-        reward = self._compute_sparse_reward(terminated or truncated)
+        # Use rlgym-sim's computed reward directly — SparseGoalReward returns
+        # 0.0 per step via get_reward() and +1/-1 on terminal via get_final_reward().
+        # rlgym-sim combines both into the rewards array automatically.
+        reward = float(rewards[0])  # blue player's reward
+        assert -1.0 <= reward <= 1.0, f"Reward out of range: {reward}"
 
         # Timeout
         timed_out = self._step_count >= self.max_steps
         done = bool(terminated or truncated or timed_out)
 
-        return self._get_stacked_obs(), reward, done, False, {}
+        obs = self._get_stacked_obs()
+        return obs, reward, done, False, {}
 
     def close(self) -> None:
         if self._env is not None:
@@ -176,7 +173,6 @@ class BaselineGymEnv(gym.Env):
         import rlgym_sim
         from rlgym_sim.utils.action_parsers import ContinuousAction
         from rlgym_sim.utils.state_setters import DefaultState
-        self._rlgym_sim = rlgym_sim
 
         self._env = rlgym_sim.make(
             obs_builder=self._make_obs_builder(),
@@ -251,52 +247,26 @@ class BaselineGymEnv(gym.Env):
 
     def _to_tokens(self, flat_obs: np.ndarray) -> np.ndarray:
         """Flat obs (N*F,) → (N, F)."""
+        assert flat_obs.shape[0] == N_TOKENS * TOKEN_FEATURES, \
+            f"Bad flat obs size: {flat_obs.shape[0]} != {N_TOKENS * TOKEN_FEATURES}"
         return flat_obs.reshape(N_TOKENS, TOKEN_FEATURES).astype(np.float32)
 
     def _get_stacked_obs(self) -> np.ndarray:
         """Stack frame buffer into flat observation (T*N*F,)."""
+        assert len(self._blue_buf) == self.t_window, \
+            f"Buffer not full: {len(self._blue_buf)} != {self.t_window}"
         stacked = np.stack(list(self._blue_buf), axis=0)  # (T, N, F)
         return stacked.ravel().astype(np.float32)
 
     def _get_opponent_action(self) -> np.ndarray:
-        """Get opponent action from frozen model or random."""
-        if self._opponent_encoder is None or self._opponent_policy is None:
+        """Get opponent action from frozen d3rlpy model or random."""
+        if self._opponent_algo is None:
             return np.random.uniform(-1, 1, size=8).astype(np.float32)
 
-        # Build opponent's stacked window
-        window = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
-        window_t = torch.tensor(
-            window[np.newaxis], dtype=torch.float32  # (1, T, N, F)
-        )
+        # Build opponent's stacked window as flat obs (same format as agent's)
+        stacked = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
+        flat_obs = stacked.ravel().astype(np.float32)       # (T*N*F,)
 
-        with torch.no_grad():
-            emb = self._opponent_encoder(window_t, self._entity_type_ids)
-            action, _ = self._opponent_policy.act(emb.cpu().numpy())
-
-        return action.astype(np.float32)
-
-    def _compute_sparse_reward(self, done: bool) -> float:
-        """
-        Sparse reward from game state. Only nonzero when a goal is scored.
-
-        We check the underlying rlgym-sim reward which uses get_final_reward
-        on episode end. For mid-episode steps, reward is always 0.
-        """
-        if not done:
-            return 0.0
-        # rlgym-sim returns per-player rewards; index 0 = blue (our agent)
-        # The reward was already computed by SparseGoalReward in the step call.
-        # We need to extract it. Since rlgym_sim.step returns rewards,
-        # we stored them in the step method above — but actually, the rewards
-        # from rlgym_sim are step rewards + final rewards combined on the last step.
-        # Let's just check ball position directly.
-        try:
-            state = self._env._prev_state
-            ball_y = state.ball.position[1]
-            if ball_y > _GOAL_Y:
-                return 1.0   # blue scored
-            elif ball_y < -_GOAL_Y:
-                return -1.0  # orange scored
-        except Exception:
-            pass
-        return 0.0  # timeout or error
+        # d3rlpy's predict() expects (batch, obs_dim)
+        action = self._opponent_algo.predict(flat_obs[np.newaxis])  # (1, 8)
+        return action[0].astype(np.float32)
