@@ -28,12 +28,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import multiprocessing
+import multiprocessing.connection
 import random
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -98,6 +100,9 @@ class TrainConfig:
     # ── d3rlpy fit_online settings ───────────────────────────────────────────
     update_interval: int = 1          # gradient updates per env step
     n_steps_per_epoch: int = 10_000   # steps per d3rlpy epoch (logging granularity)
+
+    # ── parallel environments ─────────────────────────────────────────────
+    num_envs: int = 1                 # parallel RLGym-sim envs (1 = sequential)
 
     # ── self-play ────────────────────────────────────────────────────────────
     max_snapshots: int = 20
@@ -179,6 +184,7 @@ class TrainingCallback:
         self.config = config
         self.env = env
         self.pool = pool
+        self.parallel_envs: Optional[SubprocVecEnv] = None  # set when num_envs > 1
         self.start_time = time.time()
         self.consecutive_wins = 0
         self.converged = False
@@ -223,12 +229,21 @@ class TrainingCallback:
 
     def _save_snapshot(self, algo, total_step: int) -> None:
         """Save current policy as self-play opponent snapshot."""
-        self.pool.save_snapshot(algo, total_step)
+        snap_path = self.pool.save_snapshot(algo, total_step)
 
-        # Update the env's opponent from the pool
         if self.pool.num_snapshots() > 0:
+            # Update single env's opponent (used in sequential mode)
             opponent_algo = self.pool.sample_opponent()
             self.env.set_opponent(opponent_algo)
+
+            # Update all subprocess env opponents (used in parallel mode)
+            if self.parallel_envs is not None:
+                # Sample a random snapshot and send its path to all workers
+                snap_dirs = sorted(self.pool.snapshot_dir.iterdir())
+                if snap_dirs:
+                    chosen = random.choice(snap_dirs)
+                    model_path = str(chosen / 'model.pt')
+                    self.parallel_envs.set_opponent_path(model_path)
 
     def _run_eval(self, algo, total_step: int) -> None:
         """Run evaluation against Psyonix tiers."""
@@ -281,6 +296,255 @@ class TrainingCallback:
             self._wandb.log(eval_metrics, step=total_step)
 
 
+# ── subprocess vector environment ────────────────────────────────────────────
+
+def _env_worker(
+    pipe: multiprocessing.connection.Connection,
+    t_window: int,
+    tick_skip: int,
+    max_steps: int,
+) -> None:
+    """Persistent subprocess that owns a BaselineGymEnv."""
+    env = BaselineGymEnv(t_window=t_window, tick_skip=tick_skip, max_steps=max_steps)
+    algo_builder = None
+    try:
+        while True:
+            cmd, data = pipe.recv()
+            if cmd == 'step':
+                result = env.step(data)
+                pipe.send(result)
+            elif cmd == 'reset':
+                result = env.reset()
+                pipe.send(result)
+            elif cmd == 'set_opponent_path':
+                path, = data
+                if algo_builder is not None:
+                    env.load_opponent_from_path(path, algo_builder=algo_builder)
+                pipe.send(None)
+            elif cmd == 'set_algo_builder_args':
+                # Receive args to reconstruct algo_builder in this process
+                config_dict, = data
+                import d3rlpy as _d3
+                from baseline_encoder_factory import TransformerEncoderFactory as _TEF
+
+                def _make_builder(cfg_d):
+                    def _build():
+                        # Minimal rebuild: only need predict(), so architecture must match
+                        _cfg = TrainConfig(**cfg_d)
+                        enc = _TEF(t_window=_cfg.t_window)
+                        algo_cls = ALGO_MAP.get(_cfg.algo)
+                        common = dict(
+                            batch_size=_cfg.batch_size, gamma=_cfg.gamma,
+                            actor_learning_rate=_cfg.actor_lr,
+                            critic_learning_rate=_cfg.critic_lr,
+                            actor_encoder_factory=enc, critic_encoder_factory=enc,
+                            tau=_cfg.tau,
+                        )
+                        if _cfg.algo == 'AWAC':
+                            common['lam'] = _cfg.awac_lambda
+                            common['n_action_samples'] = 1
+                        if hasattr(algo_cls, '__dataclass_fields__') and 'n_critics' in algo_cls.__dataclass_fields__:
+                            common['n_critics'] = _cfg.n_critics
+                        valid = {f.name for f in dataclasses.fields(algo_cls)}
+                        filt = {k: v for k, v in common.items() if k in valid}
+                        a = algo_cls(**filt).create(device='cpu')
+                        a.build_with_env(env)
+                        return a
+                    return _build
+
+                algo_builder = _make_builder(config_dict)
+                pipe.send(None)
+            elif cmd == 'close':
+                break
+    finally:
+        env.close()
+        pipe.close()
+
+
+class SubprocVecEnv:
+    """Manages N BaselineGymEnv instances in separate processes."""
+
+    def __init__(self, num_envs: int, t_window: int = 8, tick_skip: int = 8,
+                 max_steps: int = 4500):
+        self.num_envs = num_envs
+        self._parents: List[multiprocessing.connection.Connection] = []
+        self._procs: List[multiprocessing.Process] = []
+
+        for _ in range(num_envs):
+            parent_conn, child_conn = multiprocessing.Pipe()
+            proc = multiprocessing.Process(
+                target=_env_worker,
+                args=(child_conn, t_window, tick_skip, max_steps),
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._parents.append(parent_conn)
+            self._procs.append(proc)
+
+    def reset(self) -> List:
+        """Reset all envs, return list of (obs, info)."""
+        for p in self._parents:
+            p.send(('reset', None))
+        return [p.recv() for p in self._parents]
+
+    def reset_one(self, idx: int):
+        """Reset a single env by index, return (obs, info)."""
+        self._parents[idx].send(('reset', None))
+        return self._parents[idx].recv()
+
+    def step(self, actions: np.ndarray) -> List:
+        """Step all envs in parallel with actions (num_envs, action_dim)."""
+        for p, a in zip(self._parents, actions):
+            p.send(('step', a))
+        return [p.recv() for p in self._parents]
+
+    def set_algo_builder_args(self, config_dict: dict) -> None:
+        """Send config dict so workers can build algo for opponent loading."""
+        for p in self._parents:
+            p.send(('set_algo_builder_args', (config_dict,)))
+        for p in self._parents:
+            p.recv()
+
+    def set_opponent_path(self, path: str) -> None:
+        """Tell all workers to load opponent from a snapshot path."""
+        for p in self._parents:
+            p.send(('set_opponent_path', (path,)))
+        for p in self._parents:
+            p.recv()
+
+    def close(self) -> None:
+        for p in self._parents:
+            try:
+                p.send(('close', None))
+                p.close()
+            except (BrokenPipeError, OSError):
+                pass
+        for proc in self._procs:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+
+
+# ── parallel online training loop ────────────────────────────────────────────
+
+def fit_online_parallel(
+    algo,
+    config: TrainConfig,
+    envs: SubprocVecEnv,
+    buffer,
+    explorer,
+    callback,
+) -> None:
+    """
+    Parallel replacement for d3rlpy's fit_online().
+
+    Steps N environments simultaneously in subprocesses. Accumulates each
+    env's episode locally and flushes completed episodes to d3rlpy's buffer
+    (which only supports one active episode at a time). Both blue and orange
+    perspectives are stored for self-play training signal.
+    """
+    from tqdm import trange
+    num_envs = config.num_envs
+
+    # Build algo if needed
+    if algo.impl is None:
+        # Need a dummy env to build with
+        dummy = BaselineGymEnv(t_window=config.t_window)
+        algo.build_with_env(dummy)
+        dummy.close()
+
+    # Reset all envs
+    reset_results = envs.reset()
+    observations = np.stack([r[0] for r in reset_results])  # (N, obs_dim)
+
+    # Local episode accumulators per env
+    local_blue = [[] for _ in range(num_envs)]
+    local_orange = [[] for _ in range(num_envs)]
+    rollout_returns = np.zeros(num_envs)
+
+    total_step = 0
+    pbar = trange(1, config.total_steps + 1, desc='Training')
+
+    while total_step < config.total_steps:
+        # ── action selection (batched) ────────────────────────────────────
+        if total_step < config.random_steps:
+            actions = np.random.uniform(-1, 1, size=(num_envs, 8)).astype(np.float32)
+        elif explorer:
+            actions = explorer.sample(algo, observations, total_step)
+        else:
+            actions = algo.predict(observations)
+
+        # ── step all envs in parallel ─────────────────────────────────────
+        step_results = envs.step(actions)
+
+        for i, (next_obs, reward, done, truncated, info) in enumerate(step_results):
+            # Accumulate blue transition
+            local_blue[i].append((observations[i].copy(), actions[i].copy(), float(reward)))
+
+            # Accumulate orange transition
+            if 'orange_obs' in info and 'orange_action' in info:
+                local_orange[i].append((
+                    info['orange_obs'].copy(),
+                    info['orange_action'].copy(),
+                    info['orange_reward'],
+                ))
+
+            rollout_returns[i] += float(reward)
+
+            if done:
+                # Flush blue episode to buffer
+                for obs, act, rew in local_blue[i]:
+                    buffer.append(obs, act, rew)
+                buffer.clip_episode(bool(not truncated))
+
+                # Flush orange episode to buffer
+                for obs, act, rew in local_orange[i]:
+                    buffer.append(obs, act, rew)
+                buffer.clip_episode(bool(not truncated))
+
+                local_blue[i] = []
+                local_orange[i] = []
+                rollout_returns[i] = 0.0
+
+                # Reset this env
+                reset_obs, _ = envs.reset_one(i)
+                observations[i] = reset_obs
+            else:
+                observations[i] = next_obs
+
+        total_step += num_envs
+        pbar.update(num_envs)
+
+        # ── gradient updates ──────────────────────────────────────────────
+        if (
+            total_step > max(config.update_start_step if hasattr(config, 'update_start_step') else 0,
+                             config.random_steps)
+            and buffer.transition_count > algo.batch_size
+        ):
+            if total_step % config.update_interval < num_envs:
+                batch = buffer.sample_transition_batch(algo.batch_size)
+                algo.update(batch)
+
+        # ── callback (epoch boundaries) ───────────────────────────────────
+        epoch = total_step // config.n_steps_per_epoch
+        if callback and total_step % config.n_steps_per_epoch < num_envs:
+            callback(algo, epoch, total_step)
+
+    pbar.close()
+
+    # Clip any in-progress episodes
+    for i in range(num_envs):
+        if local_blue[i]:
+            for obs, act, rew in local_blue[i]:
+                buffer.append(obs, act, rew)
+            buffer.clip_episode(False)
+        if local_orange[i]:
+            for obs, act, rew in local_orange[i]:
+                buffer.append(obs, act, rew)
+            buffer.clip_episode(False)
+
+
 # ── main training function ───────────────────────────────────────────────────
 
 def train(config: TrainConfig) -> None:
@@ -299,12 +563,15 @@ def train(config: TrainConfig) -> None:
     with open(model_dir / 'config.json', 'w') as f:
         json.dump(dataclasses.asdict(config), f, indent=2)
 
+    parallel = config.num_envs > 1
+
     print(f'Training config:')
     print(f'  Algorithm:  {config.algo}')
     print(f'  Seed:       {config.seed}')
     print(f'  Steps:      {config.total_steps:,}')
     print(f'  Device:     {"cuda" if torch.cuda.is_available() else "cpu"}')
     print(f'  Eval every: {config.eval_interval:,} steps')
+    print(f'  Num envs:   {config.num_envs}')
     print(f'  Model dir:  {model_dir}')
 
     # ── environment ──────────────────────────────────────────────────────
@@ -314,7 +581,6 @@ def train(config: TrainConfig) -> None:
     algo = build_algo(config)
 
     # ── self-play opponent pool ──────────────────────────────────────────
-    # algo_builder creates a fresh algo instance for loading opponent weights
     def _algo_builder():
         a = build_algo(config)
         a.build_with_env(env)
@@ -349,19 +615,42 @@ def train(config: TrainConfig) -> None:
 
     # ── train ────────────────────────────────────────────────────────────
     print(f'\nStarting training...\n')
-    algo.fit_online(
-        env=env,
-        buffer=buffer,
-        explorer=explorer,
-        n_steps=config.total_steps,
-        n_steps_per_epoch=config.n_steps_per_epoch,
-        update_interval=config.update_interval,
-        random_steps=config.random_steps,
-        experiment_name=f'{config.algo}_seed{config.seed}',
-        logger_adapter=logger_adapter,
-        show_progress=True,
-        callback=callback,
-    )
+
+    if parallel:
+        envs = SubprocVecEnv(
+            num_envs=config.num_envs,
+            t_window=config.t_window,
+        )
+        # Send config to workers so they can build algo for opponent loading
+        envs.set_algo_builder_args(dataclasses.asdict(config))
+        # Wire callback to update opponents in all subprocess envs
+        callback.parallel_envs = envs
+
+        try:
+            fit_online_parallel(
+                algo=algo,
+                config=config,
+                envs=envs,
+                buffer=buffer,
+                explorer=explorer,
+                callback=callback,
+            )
+        finally:
+            envs.close()
+    else:
+        algo.fit_online(
+            env=env,
+            buffer=buffer,
+            explorer=explorer,
+            n_steps=config.total_steps,
+            n_steps_per_epoch=config.n_steps_per_epoch,
+            update_interval=config.update_interval,
+            random_steps=config.random_steps,
+            experiment_name=f'{config.algo}_seed{config.seed}',
+            logger_adapter=logger_adapter,
+            show_progress=True,
+            callback=callback,
+        )
 
     # ── save final model ─────────────────────────────────────────────────
     algo.save(str(model_dir / 'final_model'))
@@ -425,6 +714,8 @@ def main():
     parser.add_argument('--eval-interval', type=int, default=200_000)
     parser.add_argument('--snapshot-interval', type=int, default=10_000)
     parser.add_argument('--n-steps-per-epoch', type=int, default=10_000)
+    parser.add_argument('--num-envs', type=int, default=1,
+                        help='Parallel RLGym-sim environments (default: 1 = sequential)')
 
     # Paths
     parser.add_argument('--model-dir', default='models/baseline')
@@ -456,6 +747,7 @@ def main():
         eval_interval=args.eval_interval,
         snapshot_interval=args.snapshot_interval,
         n_steps_per_epoch=args.n_steps_per_epoch,
+        num_envs=args.num_envs,
         model_dir=args.model_dir,
         no_wandb=args.no_wandb,
         wandb_project=args.wandb_project,

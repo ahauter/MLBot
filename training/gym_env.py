@@ -128,7 +128,8 @@ class BaselineGymEnv(gym.Env):
         obs = self._get_stacked_obs()
         assert obs.shape == self.observation_space.shape, \
             f"Bad obs shape: {obs.shape} != {self.observation_space.shape}"
-        return obs, {}
+        info = {'orange_obs': self._get_stacked_orange_obs()}
+        return obs, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
@@ -164,7 +165,12 @@ class BaselineGymEnv(gym.Env):
         done = bool(terminated or truncated or timed_out)
 
         obs = self._get_stacked_obs()
-        return obs, reward, done, False, {}
+        info = {
+            'orange_obs': self._get_stacked_orange_obs(),
+            'orange_action': opp_action,
+            'orange_reward': float(rewards[1]),
+        }
+        return obs, reward, done, False, info
 
     def close(self) -> None:
         if self._env is not None:
@@ -256,11 +262,29 @@ class BaselineGymEnv(gym.Env):
         return flat_obs.reshape(N_TOKENS, TOKEN_FEATURES).astype(np.float32)
 
     def _get_stacked_obs(self) -> np.ndarray:
-        """Stack frame buffer into flat observation (T*N*F,)."""
+        """Stack blue frame buffer into flat observation (T*N*F,)."""
         assert len(self._blue_buf) == self.t_window, \
             f"Buffer not full: {len(self._blue_buf)} != {self.t_window}"
         stacked = np.stack(list(self._blue_buf), axis=0)  # (T, N, F)
         return stacked.ravel().astype(np.float32)
+
+    def _get_stacked_orange_obs(self) -> np.ndarray:
+        """Stack orange frame buffer into flat observation (T*N*F,)."""
+        stacked = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
+        return stacked.ravel().astype(np.float32)
+
+    def load_opponent_from_path(self, path: str, algo_builder=None) -> None:
+        """Load opponent model from a saved snapshot path.
+
+        Used by SubprocVecEnv workers where d3rlpy algo objects can't be
+        pickled across process boundaries.
+        """
+        if algo_builder is None:
+            raise ValueError("algo_builder required to load opponent from path")
+        algo = algo_builder()
+        algo.build_with_env(self)
+        algo.load_model(path)
+        self._opponent_algo = algo
 
     def _get_opponent_action(self) -> np.ndarray:
         """Get opponent action from frozen d3rlpy model or random."""
