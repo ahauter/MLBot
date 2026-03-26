@@ -167,11 +167,38 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
                     raise optuna.exceptions.TrialPruned()
 
     envs = None
+    _wandb_run = None
     try:
         if parallel:
             from train import (
                 SubprocVecEnv, fit_online_parallel, TrainConfig as _TC,
             )
+
+            # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
+            if use_wandb:
+                try:
+                    import wandb
+                    _wandb_run = wandb.init(
+                        project='rlbot-baseline-tuning',
+                        name=f'tune_trial_{trial.number}',
+                        group='optuna',
+                        config={
+                            'trial_number': trial.number,
+                            'actor_lr': actor_lr,
+                            'critic_lr': critic_lr,
+                            'awac_lambda': awac_lambda,
+                            'tau': tau,
+                            'batch_size': batch_size,
+                            'gamma': gamma,
+                            'explore_noise': explore_noise,
+                            'num_envs': num_envs,
+                            'steps_per_trial': steps_per_trial,
+                        },
+                        reinit=True,
+                    )
+                except ImportError:
+                    pass
+
             envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
             # Build algo before parallel loop
             algo.build_with_env(raw_env)
@@ -225,6 +252,9 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
     finally:
         if envs is not None:
             envs.close()
+        if _wandb_run is not None:
+            import wandb
+            wandb.finish()
         raw_env.close()
 
     mean_reward = _mean_return(100)
