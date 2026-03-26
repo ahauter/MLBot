@@ -453,6 +453,16 @@ def fit_online_parallel(
     """
     from tqdm import trange
     num_envs = config.num_envs
+    log_interval = 10_000  # log metrics every N steps
+
+    # W&B logging (active if wandb.run was initialized by caller)
+    try:
+        import wandb as _wandb_mod
+        _wandb = _wandb_mod if _wandb_mod.run is not None else None
+    except ImportError:
+        _wandb = None
+
+    start_wall = time.time()
 
     # Build algo if needed
     if algo.impl is None:
@@ -513,6 +523,12 @@ def fit_online_parallel(
                 if on_episode_complete is not None:
                     on_episode_complete(rollout_returns[i])
 
+                if _wandb:
+                    _wandb.log({
+                        'rollout/episode_return': rollout_returns[i],
+                        'rollout/episode_length': len(local_blue[i]),
+                    }, step=total_step)
+
                 local_blue[i] = []
                 local_orange[i] = []
                 rollout_returns[i] = 0.0
@@ -534,7 +550,14 @@ def fit_online_parallel(
         ):
             if total_step % config.update_interval < num_envs:
                 batch = buffer.sample_transition_batch(algo.batch_size)
-                algo.update(batch)
+                loss_dict = algo.update(batch)
+
+                if _wandb and total_step % log_interval < num_envs:
+                    metrics = {f'train/{k}': v for k, v in loss_dict.items()}
+                    elapsed = time.time() - start_wall
+                    metrics['timing/steps_per_second'] = total_step / max(elapsed, 1e-6)
+                    metrics['timing/wall_clock_seconds'] = elapsed
+                    _wandb.log(metrics, step=total_step)
 
         # ── callback (epoch boundaries) ───────────────────────────────────
         epoch = total_step // config.n_steps_per_epoch
@@ -627,6 +650,15 @@ def train(config: TrainConfig) -> None:
     print(f'\nStarting training...\n')
 
     if parallel:
+        # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
+        if not config.no_wandb:
+            import wandb
+            wandb.init(
+                project=config.wandb_project,
+                name=f'{config.algo}_seed{config.seed}',
+                config=dataclasses.asdict(config),
+            )
+
         envs = SubprocVecEnv(
             num_envs=config.num_envs,
             t_window=config.t_window,
@@ -647,6 +679,10 @@ def train(config: TrainConfig) -> None:
             )
         finally:
             envs.close()
+            if not config.no_wandb:
+                import wandb
+                if wandb.run is not None:
+                    wandb.finish()
     else:
         algo.fit_online(
             env=env,
