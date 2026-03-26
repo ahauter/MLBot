@@ -1,18 +1,17 @@
 """
 spectral_dataset.py
 ===================
-Loads parsed replay .npz files and converts token observations to SE(3)
-spectral field observations (105-dim) for offline RL training.
+Loads parsed replay .npz files into a d3rlpy MDPDataset.
+
+Observations are raw flat token vectors (100-dim = 10 tokens × 10 features).
+The learned SpectralEncoder inside the d3rlpy encoder handles the conversion
+to SE(3) spectral fields during training (end-to-end, differentiable).
 
 Each .npz contains:
     tokens  : (T, 2, 10, 10)  float32 — pre-normalized game state tokens
     actions : (T, 2, 8)       float32 — continuous+binary actions
     rewards : (T, 2)          float32 — sparse: +1 goal, -1 concede
     dones   : (T, 2)          bool    — episode boundaries
-
-The spectral conversion uses assemble_scene() to produce a 105-dim
-observation vector per frame, encoding SE(3) field coefficients,
-covariances, wall features, interaction matrix, and game state.
 """
 
 from __future__ import annotations
@@ -20,18 +19,23 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from d3rlpy.dataset import MDPDataset
 
-from rlbot.env.scene import assemble_scene, OBS_DIM
+# Flat observation = 10 tokens × 10 features
+_N_TOKENS = 10
+_TOKEN_FEATURES = 10
+FLAT_OBS_DIM = _N_TOKENS * _TOKEN_FEATURES  # 100
 
 
 def load_spectral_dataset(
     replay_dir: str | Path,
     min_episode_len: int = 2,
 ) -> MDPDataset:
-    """Load replay .npz files and return a d3rlpy MDPDataset with spectral obs.
+    """Load replay .npz files and return a d3rlpy MDPDataset with flat token obs.
+
+    Observations are raw flat tokens (100-dim). The learned encoder converts
+    these to spectral fields during training.
 
     Parameters
     ----------
@@ -40,7 +44,7 @@ def load_spectral_dataset(
 
     Returns
     -------
-    MDPDataset with obs=(N, 105), actions=(N, 8), rewards=(N,), terminals=(N,)
+    MDPDataset with obs=(N, 100), actions=(N, 8), rewards=(N,), terminals=(N,)
     """
     replay_dir = Path(replay_dir)
     npz_files = sorted(replay_dir.glob("*.npz"))
@@ -97,7 +101,7 @@ def load_spectral_dataset(
         )
 
     obs = np.concatenate(all_obs, axis=0)
-    actions = np.concatenate(all_actions, axis=0)
+    actions_arr = np.concatenate(all_actions, axis=0)
     rewards_arr = np.concatenate(all_rewards, axis=0)
     terminals = np.concatenate(all_terminals, axis=0)
 
@@ -109,7 +113,7 @@ def load_spectral_dataset(
 
     return MDPDataset(
         observations=obs,
-        actions=actions,
+        actions=actions_arr,
         rewards=rewards_arr,
         terminals=terminals,
     )
@@ -127,19 +131,15 @@ def _append_episode(
     all_terminals: list[np.ndarray],
     force_terminal_last: bool = False,
 ) -> None:
-    """Convert a slice of tokens to spectral obs and append to accumulators."""
+    """Flatten a slice of tokens and append to accumulators."""
     ep_len = end - start
-    obs = np.empty((ep_len, OBS_DIM), dtype=np.float32)
+
+    # Flatten tokens: (ep_len, 10, 10) → (ep_len, 100)
+    obs = tokens_player[start:end].reshape(ep_len, -1).astype(np.float32)
     acts = actions_player[start:end].astype(np.float32)
     rews = rewards_player[start:end].astype(np.float32)
     terms = np.zeros(ep_len, dtype=np.float32)
-
-    for i, t in enumerate(range(start, end)):
-        tok = torch.from_numpy(tokens_player[t].astype(np.float32))
-        obs[i] = assemble_scene(tok).numpy()
-
-    # Mark terminal
-    terms[-1] = 1.0 if force_terminal_last else 1.0
+    terms[-1] = 1.0
 
     all_obs.append(obs)
     all_actions.append(acts)

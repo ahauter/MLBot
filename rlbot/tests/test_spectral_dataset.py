@@ -1,14 +1,12 @@
-"""Tests for spectral dataset loading and conversion."""
+"""Tests for spectral dataset loading."""
 
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
-from rlbot.env.scene import OBS_DIM
-from rlbot.training.spectral_dataset import load_spectral_dataset
+from rlbot.training.spectral_dataset import load_spectral_dataset, FLAT_OBS_DIM
 
 
 def _make_synthetic_replay(T: int = 50, seed: int = 42) -> dict[str, np.ndarray]:
@@ -86,19 +84,17 @@ class TestLoadSpectralDataset:
         _save_replay(tmp_path, data)
 
         dataset = load_spectral_dataset(tmp_path)
-        # 2 players x 2 episodes = 4 episodes, 50 frames each player = 100 transitions
+        # 2 players x 2 episodes = 4 episodes
         assert dataset.size() >= 2
 
     def test_observation_shape(self, tmp_path):
-        """Each observation should be 105-dim."""
+        """Each observation should be 100-dim (flat tokens)."""
         data = _make_synthetic_replay(T=20)
         _save_replay(tmp_path, data)
 
         dataset = load_spectral_dataset(tmp_path)
-        # Sample a batch to check obs shape
-        episodes = dataset.episodes
-        for ep in episodes:
-            assert ep.observations.shape[1] == OBS_DIM
+        for ep in dataset.episodes:
+            assert ep.observations.shape[1] == FLAT_OBS_DIM
 
     def test_observations_finite(self, tmp_path):
         """All observations should be finite (no NaN/Inf)."""
@@ -154,7 +150,7 @@ class TestLoadSpectralDataset:
         _save_replay(tmp_path, data)
 
         dataset = load_spectral_dataset(tmp_path, min_episode_len=3)
-        # Should get 2 episodes per player (5-frame and 4-frame), skip 1-frame
+        # Should get 2 episodes per player (10-frame and 9-frame), skip 1-frame
         assert dataset.size() == 4
 
     def test_empty_dir_raises(self, tmp_path):

@@ -1,15 +1,16 @@
 """
 train_spectral.py
 =================
-Offline RL training using SE(3) spectral field observations.
+Offline RL training with learned SE(3) spectral field encoder.
 
-Loads processed replay .npz files, converts tokens to 105-dim spectral
-observations, and trains an AWAC policy using d3rlpy.
+Loads processed replay .npz files and trains an AWAC policy end-to-end:
+raw tokens → learned SpectralEncoder → SE(3) spectral bottleneck (105-dim)
+→ policy MLP → actions. The spectral structure is learned from the data.
 
 Usage
 -----
     python -m rlbot.training.train_spectral /path/to/replay/dir
-    python -m rlbot.training.train_spectral /path/to/replay/dir --n-steps 100000 --batch-size 512
+    python -m rlbot.training.train_spectral /path/to/replay/dir --n-steps 100000
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from rlbot.training.spectral_encoder_factory import SpectralEncoderFactory
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train AWAC policy from replays using spectral field observations"
+        description="Train AWAC policy from replays with learned spectral encoder"
     )
     parser.add_argument("replay_dir", type=str, help="Directory containing .npz replay files")
     parser.add_argument("--batch-size", type=int, default=256)
@@ -35,23 +36,28 @@ def main() -> None:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=1.0, help="AWAC advantage temperature")
     parser.add_argument("--n-critics", type=int, default=2)
-    parser.add_argument("--hidden-dim", type=int, default=256, help="MLP hidden layer width")
-    parser.add_argument("--n-layers", type=int, default=3, help="Number of MLP hidden layers")
+    parser.add_argument("--encoder-hidden", type=int, default=64,
+                        help="Hidden dim for per-entity encoders in SpectralEncoder")
+    parser.add_argument("--policy-hidden", type=int, default=256,
+                        help="Hidden dim for post-bottleneck policy MLP")
+    parser.add_argument("--policy-layers", type=int, default=2,
+                        help="Number of hidden layers in policy MLP")
     parser.add_argument("--output-dir", type=str, default="spectral_checkpoints")
     parser.add_argument("--experiment-name", type=str, default="spectral_awac")
     args = parser.parse_args()
 
-    # Load and convert replay data
+    # Load replay data (raw flat tokens as observations)
     print(f"Loading replays from {args.replay_dir}...")
     dataset = load_spectral_dataset(args.replay_dir)
 
-    # Configure encoder
+    # Configure learned spectral encoder
     factory = SpectralEncoderFactory(
-        hidden_dim=args.hidden_dim,
-        n_layers=args.n_layers,
+        encoder_hidden=args.encoder_hidden,
+        policy_hidden=args.policy_hidden,
+        policy_layers=args.policy_layers,
     )
 
-    # Configure AWAC
+    # Configure AWAC with learned spectral encoder
     config = AWACConfig(
         batch_size=args.batch_size,
         gamma=args.gamma,
@@ -64,7 +70,7 @@ def main() -> None:
     )
     algo = config.create()
 
-    # Train offline
+    # Train offline — encoder learns the spectral representation end-to-end
     print(f"Training for {args.n_steps} steps (batch_size={args.batch_size})...")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
