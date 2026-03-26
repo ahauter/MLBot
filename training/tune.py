@@ -96,7 +96,7 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -146,28 +146,73 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
 
     pruning_interval = 50_000  # check every 50k steps
 
+    parallel = num_envs > 1
+
+    # Shared reward tracker for both paths
+    episode_returns: deque = env.episode_returns  # reuse RewardTracker's deque
+
+    def _mean_return(last_n: int = 100) -> float:
+        if not episode_returns:
+            return 0.0
+        recent = list(episode_returns)[-last_n:]
+        return float(np.mean(recent))
+
     def callback(algo_obj, epoch, total_step):
         import optuna
-        if total_step > 0 and total_step % pruning_interval < 1000:
-            mean_r = env.mean_return(100)
-            if len(env.episode_returns) > 0:
+        if total_step > 0 and total_step % pruning_interval < max(1000, num_envs):
+            mean_r = _mean_return(100)
+            if len(episode_returns) > 0:
                 trial.report(mean_r, step=total_step)
                 if trial.should_prune():
                     raise optuna.exceptions.TrialPruned()
 
+    envs = None
     try:
-        algo.fit_online(
-            env=env,
-            buffer=buffer,
-            explorer=explorer,
-            n_steps=steps_per_trial,
-            n_steps_per_epoch=10_000,
-            random_steps=5_000,
-            experiment_name=f'tune_trial_{trial.number}',
-            logger_adapter=logger_adapter,
-            show_progress=False,
-            callback=callback,
-        )
+        if parallel:
+            from train import (
+                SubprocVecEnv, fit_online_parallel, TrainConfig as _TC,
+            )
+            envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
+            # Build algo before parallel loop
+            algo.build_with_env(raw_env)
+
+            # Parallel path uses on_episode_complete to feed the shared deque
+            def _on_ep_complete(ep_return: float):
+                episode_returns.append(ep_return)
+
+            # Build a minimal TrainConfig for fit_online_parallel
+            par_config = _TC(
+                total_steps=steps_per_trial,
+                num_envs=num_envs,
+                t_window=t_window,
+                random_steps=5_000,
+                update_interval=1,
+                n_steps_per_epoch=10_000,
+                batch_size=batch_size,
+                explore_noise=explore_noise,
+            )
+            fit_online_parallel(
+                algo=algo,
+                config=par_config,
+                envs=envs,
+                buffer=buffer,
+                explorer=explorer,
+                callback=callback,
+                on_episode_complete=_on_ep_complete,
+            )
+        else:
+            algo.fit_online(
+                env=env,
+                buffer=buffer,
+                explorer=explorer,
+                n_steps=steps_per_trial,
+                n_steps_per_epoch=10_000,
+                random_steps=5_000,
+                experiment_name=f'tune_trial_{trial.number}',
+                logger_adapter=logger_adapter,
+                show_progress=False,
+                callback=callback,
+            )
     except Exception as e:
         try:
             import optuna
@@ -178,9 +223,11 @@ def objective(trial, steps_per_trial: int, use_wandb: bool) -> float:
         print(f'Trial {trial.number} failed: {e}', file=sys.stderr)
         return float('-inf')
     finally:
+        if envs is not None:
+            envs.close()
         raw_env.close()
 
-    mean_reward = env.mean_return(100)
+    mean_reward = _mean_return(100)
     assert not np.isnan(mean_reward), \
         f"Trial {trial.number}: NaN reward — training diverged"
     return mean_reward
@@ -243,6 +290,8 @@ def main():
     parser = argparse.ArgumentParser(description='Baseline hyperparameter tuning.')
     parser.add_argument('--n-trials', type=int, default=50)
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
+    parser.add_argument('--num-envs', type=int, default=1,
+                        help='Parallel RLGym-sim environments per trial (default: 1)')
     parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
@@ -289,7 +338,9 @@ def main():
     print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
 
     study.optimize(
-        lambda trial: objective(trial, args.steps_per_trial, not args.no_wandb),
+        lambda trial: objective(
+            trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
+        ),
         n_trials=args.n_trials,
         show_progress_bar=True,
     )

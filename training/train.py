@@ -435,9 +435,16 @@ def fit_online_parallel(
     buffer,
     explorer,
     callback,
+    on_episode_complete=None,
 ) -> None:
     """
     Parallel replacement for d3rlpy's fit_online().
+
+    Parameters
+    ----------
+    on_episode_complete : callable or None
+        Called with (episode_return: float) when a blue episode finishes.
+        Useful for reward tracking in tuning.
 
     Steps N environments simultaneously in subprocesses. Accumulates each
     env's episode locally and flushes completed episodes to d3rlpy's buffer
@@ -502,6 +509,9 @@ def fit_online_parallel(
                 for obs, act, rew in local_orange[i]:
                     buffer.append(obs, act, rew)
                 buffer.clip_episode(bool(not truncated))
+
+                if on_episode_complete is not None:
+                    on_episode_complete(rollout_returns[i])
 
                 local_blue[i] = []
                 local_orange[i] = []
