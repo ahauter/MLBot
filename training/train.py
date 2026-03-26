@@ -393,11 +393,25 @@ class SubprocVecEnv:
         self._parents[idx].send(('reset', None))
         return self._parents[idx].recv()
 
+    def send_reset(self, idx: int) -> None:
+        """Send reset command without waiting for result (non-blocking)."""
+        self._parents[idx].send(('reset', None))
+
+    def recv_reset(self, idx: int):
+        """Receive reset result from a previously sent reset command."""
+        return self._parents[idx].recv()
+
     def step(self, actions: np.ndarray) -> List:
         """Step all envs in parallel with actions (num_envs, action_dim)."""
         for p, a in zip(self._parents, actions):
             p.send(('step', a))
         return [p.recv() for p in self._parents]
+
+    def step_active(self, actions: np.ndarray, active: List[int]) -> dict:
+        """Step only the given env indices. Returns {idx: result}."""
+        for idx, a in zip(active, actions):
+            self._parents[idx].send(('step', a))
+        return {idx: self._parents[idx].recv() for idx in active}
 
     def set_algo_builder_args(self, config_dict: dict) -> None:
         """Send config dict so workers can build algo for opponent loading."""
@@ -488,23 +502,38 @@ def fit_online_parallel(
     rollout_returns = np.zeros(num_envs)
 
     total_step = 0
+    pending_resets: set = set()  # env indices waiting for async reset
     pbar = trange(1, config.total_steps + 1, desc='Training')
 
     while total_step < config.total_steps:
-        # ── action selection (batched) ────────────────────────────────────
+        # ── collect any pending resets from previous iteration ─────────────
+        for i in list(pending_resets):
+            reset_obs, _ = envs.recv_reset(i)
+            observations[i] = reset_obs
+            pending_resets.discard(i)
+
+        # ── action selection (batched for active envs) ────────────────────
+        active = [i for i in range(num_envs) if i not in pending_resets]
+        n_active = len(active)
+        if n_active == 0:
+            continue
+
+        active_obs = observations[active]
         if total_step < config.random_steps:
-            actions = np.random.uniform(-1, 1, size=(num_envs, 8)).astype(np.float32)
+            active_actions = np.random.uniform(-1, 1, size=(n_active, 8)).astype(np.float32)
         elif explorer:
-            actions = explorer.sample(algo, observations, total_step)
+            active_actions = explorer.sample(algo, active_obs, total_step)
         else:
-            actions = algo.predict(observations)
+            active_actions = algo.predict(active_obs)
 
-        # ── step all envs in parallel ─────────────────────────────────────
-        step_results = envs.step(actions)
+        # ── step active envs in parallel ──────────────────────────────────
+        step_results = envs.step_active(active_actions, active)
 
-        for i, (next_obs, reward, done, truncated, info) in enumerate(step_results):
+        for ai, i in enumerate(active):
+            next_obs, reward, done, truncated, info = step_results[i]
+
             # Accumulate blue transition
-            local_blue[i].append((observations[i].copy(), actions[i].copy(), float(reward)))
+            local_blue[i].append((observations[i].copy(), active_actions[ai].copy(), float(reward)))
 
             # Accumulate orange transition
             if 'orange_obs' in info and 'orange_action' in info:
@@ -540,14 +569,14 @@ def fit_online_parallel(
                 local_orange[i] = []
                 rollout_returns[i] = 0.0
 
-                # Reset this env
-                reset_obs, _ = envs.reset_one(i)
-                observations[i] = reset_obs
+                # Async reset — send now, recv at start of next iteration
+                envs.send_reset(i)
+                pending_resets.add(i)
             else:
                 observations[i] = next_obs
 
-        total_step += num_envs
-        pbar.update(num_envs)
+        total_step += n_active
+        pbar.update(n_active)
 
         # ── gradient updates ──────────────────────────────────────────────
         if (

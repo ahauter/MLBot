@@ -100,6 +100,8 @@ class BaselineGymEnv(gym.Env):
         algo : d3rlpy algo instance or None
             A d3rlpy learnable with .predict() method, or None for random.
         """
+        if self._opponent_algo is not None and self._opponent_algo is not algo:
+            del self._opponent_algo
         self._opponent_algo = algo
 
     def reset(
@@ -277,14 +279,18 @@ class BaselineGymEnv(gym.Env):
         """Load opponent model from a saved snapshot path.
 
         Used by SubprocVecEnv workers where d3rlpy algo objects can't be
-        pickled across process boundaries.
+        pickled across process boundaries. Reuses the existing algo instance
+        on subsequent calls to avoid rebuilding the full model architecture.
         """
         if algo_builder is None:
             raise ValueError("algo_builder required to load opponent from path")
-        algo = algo_builder()
-        algo.build_with_env(self)
-        algo.load_model(path)
-        self._opponent_algo = algo
+        if self._opponent_algo is None:
+            algo = algo_builder()
+            algo.build_with_env(self)
+            algo.load_model(path)
+            self._opponent_algo = algo
+        else:
+            self._opponent_algo.load_model(path)
 
     def _get_opponent_action(self) -> np.ndarray:
         """Get opponent action from frozen d3rlpy model or random."""
