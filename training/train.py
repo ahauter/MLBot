@@ -370,9 +370,12 @@ class SubprocVecEnv:
         self._parents: List[multiprocessing.connection.Connection] = []
         self._procs: List[multiprocessing.Process] = []
 
+        # Use 'spawn' context for Windows/macOS compatibility and CUDA safety
+        ctx = multiprocessing.get_context('spawn')
+
         for _ in range(num_envs):
-            parent_conn, child_conn = multiprocessing.Pipe()
-            proc = multiprocessing.Process(
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(
                 target=_env_worker,
                 args=(child_conn, t_window, tick_skip, max_steps),
                 daemon=True,
