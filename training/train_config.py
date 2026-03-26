@@ -33,6 +33,7 @@ class TrainConfig:
     max_episodes: int = 10_000
     save_every: int = 500
     model_dir: str = 'models/'
+    num_envs: int = 1               # parallel RLGym-sim environments for episode collection
 
     # ── Logging / W&B ─────────────────────────────────────────────────────────
     wandb_project: str = 'mlbot'

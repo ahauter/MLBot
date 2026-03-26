@@ -58,6 +58,7 @@ from logger import ExperimentLogger
 import abc
 import argparse
 import math
+import multiprocessing
 import random
 import sys
 import time
@@ -419,6 +420,54 @@ def collect_episode(
     return blue_traj, orange_traj
 
 
+# ── parallel episode collection ──────────────────────────────────────────
+
+def _collect_episode_worker(args):
+    """Subprocess worker: creates its own env + model, runs one episode."""
+    scenario, encoder_state, policy_state, entity_ids, config, t_window, explore = args
+
+    env = RLGymEnv()
+    encoder = SharedTransformerEncoder()
+    encoder.load_state_dict(encoder_state)
+    encoder.to('cpu')
+    policy_head = PolicyHead()
+    policy_head.load_state_dict(policy_state)
+    policy_head.to('cpu')
+    entity_type_ids = torch.tensor(entity_ids, dtype=torch.long)
+
+    try:
+        return collect_episode(
+            env, scenario, encoder, policy_head,
+            entity_type_ids, config=config,
+            t_window=t_window, explore=explore,
+        )
+    finally:
+        env.close()
+
+
+def collect_episodes_parallel(
+    num_envs:        int,
+    all_configs:     List[ScenarioConfig],
+    encoder:         SharedTransformerEncoder,
+    policy_head:     PolicyHead,
+    entity_type_ids: torch.Tensor,
+    config:          TrainConfig,
+    pool:            multiprocessing.pool.Pool,
+) -> List[Tuple[List[Tuple], List[Tuple]]]:
+    """Collect *num_envs* episodes in parallel using a process pool."""
+    encoder_state = {k: v.cpu() for k, v in encoder.state_dict().items()}
+    policy_state = {k: v.cpu() for k, v in policy_head.state_dict().items()}
+    entity_ids = entity_type_ids.cpu().tolist()
+
+    args_list = [
+        (random.choice(all_configs), encoder_state, policy_state,
+         entity_ids, config, T_WINDOW, True)
+        for _ in range(num_envs)
+    ]
+
+    return pool.map(_collect_episode_worker, args_list)
+
+
 # ── gradient norm helper ──────────────────────────────────────────────────────
 
 def _grad_norm(params) -> float:
@@ -488,7 +537,7 @@ def train(
     Parameters
     ----------
     all_configs : list of ScenarioConfig
-    env : GameEnv
+    env : GameEnv  (used when num_envs == 1; ignored when num_envs > 1)
     config : TrainConfig  (uses defaults if None)
     logger : ExperimentLogger  (stdout-only if None)
     entity_type_ids : entity type index tensor
@@ -545,10 +594,14 @@ def train(
     if replay_data_dir.exists():
         load_replays_into_buffer(replay_data_dir, expert_buffer)
 
+    num_envs = config.num_envs
+    parallel = num_envs > 1
+
     print(
         f'Configs: {len(all_configs)}   Episodes: {config.max_episodes}   '
         f'Expert buffer: {len(expert_buffer)} steps   '
-        f'Expert ratio: {config.expert_replay_ratio:.2f}'
+        f'Expert ratio: {config.expert_replay_ratio:.2f}   '
+        f'Parallel envs: {num_envs}'
     )
 
     # Rolling window for smoothed reward (used for Optuna objective)
@@ -556,47 +609,62 @@ def train(
     smoothed_reward = 0.0
 
     # ── 5. Episode loop ───────────────────────────────────────────────────────
+    pool = None
     try:
-        for episode in range(config.max_episodes):
-            scenario = random.choice(all_configs)
+        if parallel:
+            pool = multiprocessing.Pool(num_envs)
 
-            blue_traj, orange_traj = collect_episode(
-                env, scenario, encoder, policy_head,
-                entity_type_ids, config=config, explore=True,
-            )
+        episode = 0
+        while episode < config.max_episodes:
+            # ── collect episode(s) ────────────────────────────────────────────
+            if parallel:
+                results = collect_episodes_parallel(
+                    num_envs, all_configs, encoder, policy_head,
+                    entity_type_ids, config, pool,
+                )
+            else:
+                scenario = random.choice(all_configs)
+                results = [collect_episode(
+                    env, scenario, encoder, policy_head,
+                    entity_type_ids, config=config, explore=True,
+                )]
 
-            # Store sim trajectories in the sim buffer.
-            # w has shape (1, T_WINDOW, N, F); w[0, -1] is the current (N, F) obs.
-            sim_buffer.add_episode(
-                [(w[0, -1], a, r, i == len(blue_traj) - 1)
-                 for i, (w, a, r) in enumerate(blue_traj)]
-            )
-            sim_buffer.add_episode(
-                [(w[0, -1], a, r, i == len(orange_traj) - 1)
-                 for i, (w, a, r) in enumerate(orange_traj)]
-            )
-
-            # ── gradient update ───────────────────────────────────────────────
+            # ── store trajectories & compute AWAC loss ────────────────────────
             encoder.train()
             policy_head.train()
 
-            # Random entity permutation for AWAC data augmentation
-            # entity count from window shape (1,T,N,F)
-            N = blue_traj[0][0].shape[2]
-            entity_perm = torch.randperm(N, device=device)
+            total_loss = torch.tensor(0.0, device=device)
+            policy_loss = torch.tensor(0.0, device=device)
+            value_loss = torch.tensor(0.0, device=device)
+            N = None
 
-            blue_total, blue_pol, blue_val = compute_awac_loss(
-                encoder, policy_head, blue_traj,
-                entity_type_ids, config, entity_perm=entity_perm,
-            )
-            orange_total, orange_pol, orange_val = compute_awac_loss(
-                encoder, policy_head, orange_traj,
-                entity_type_ids, config, entity_perm=entity_perm,
-            )
-            total_loss = blue_total + orange_total
-            policy_loss = blue_pol + orange_pol
-            value_loss = blue_val + orange_val
+            for blue_traj, orange_traj in results:
+                sim_buffer.add_episode(
+                    [(w[0, -1], a, r, i == len(blue_traj) - 1)
+                     for i, (w, a, r) in enumerate(blue_traj)]
+                )
+                sim_buffer.add_episode(
+                    [(w[0, -1], a, r, i == len(orange_traj) - 1)
+                     for i, (w, a, r) in enumerate(orange_traj)]
+                )
 
+                # entity count from window shape (1,T,N,F)
+                N = blue_traj[0][0].shape[2]
+                entity_perm = torch.randperm(N, device=device)
+
+                b_total, b_pol, b_val = compute_awac_loss(
+                    encoder, policy_head, blue_traj,
+                    entity_type_ids, config, entity_perm=entity_perm,
+                )
+                o_total, o_pol, o_val = compute_awac_loss(
+                    encoder, policy_head, orange_traj,
+                    entity_type_ids, config, entity_perm=entity_perm,
+                )
+                total_loss = total_loss + b_total + o_total
+                policy_loss = policy_loss + b_pol + o_pol
+                value_loss = value_loss + b_val + o_val
+
+            # ── gradient update ───────────────────────────────────────────────
             optimizer.zero_grad()
             total_loss.backward()
             grad_norm = _grad_norm(all_params)
@@ -608,7 +676,7 @@ def train(
             has_expert = len(expert_buffer._valid_endpoints()) > 0
             has_sim = len(sim_buffer._valid_endpoints()) > 0
 
-            if batch_size > 0 and (has_expert or has_sim):
+            if batch_size > 0 and (has_expert or has_sim) and N is not None:
                 n_expert = int(
                     batch_size * config.expert_replay_ratio) if has_expert else 0
                 n_sim = batch_size - n_expert if has_sim else 0
@@ -646,11 +714,18 @@ def train(
                     optimizer.step()
                     buf_loss_val = float(buf_total)
 
-            # ── metrics ───────────────────────────────────────────────────────
-            blue_ep_reward = sum(r for _, _, r in blue_traj)
-            orange_ep_reward = sum(r for _, _, r in orange_traj)
-            ep_reward = (blue_ep_reward + orange_ep_reward) / 2.0
-            episode_rewards.append(ep_reward)
+            # ── metrics (averaged across parallel episodes) ───────────────────
+            batch_rewards = []
+            batch_lengths = []
+            for blue_traj, orange_traj in results:
+                blue_ep_reward = sum(r for _, _, r in blue_traj)
+                orange_ep_reward = sum(r for _, _, r in orange_traj)
+                batch_rewards.append((blue_ep_reward + orange_ep_reward) / 2.0)
+                batch_lengths.append(len(blue_traj))
+
+            for r in batch_rewards:
+                episode_rewards.append(r)
+            ep_reward = float(np.mean(batch_rewards))
             smoothed_reward = float(np.mean(episode_rewards))
 
             logger.log(
@@ -661,7 +736,7 @@ def train(
                     'train/value_loss':            float(value_loss),
                     'train/buffer_loss':           buf_loss_val,
                     'train/episode_reward':        ep_reward,
-                    'train/episode_length':        len(blue_traj),
+                    'train/episode_length':        float(np.mean(batch_lengths)),
                     'train/grad_norm':             grad_norm,
                     'train/expert_buffer_size':    len(expert_buffer),
                     'train/sim_buffer_size':       len(sim_buffer),
@@ -669,15 +744,17 @@ def train(
                 },
             )
 
+            episode += num_envs
+
             # ── Optuna pruning hook ───────────────────────────────────────────
-            if trial is not None and episode > 0 and episode % 200 == 0:
+            if trial is not None and episode > 0 and episode % 200 < num_envs:
                 trial.report(smoothed_reward, step=episode)
                 if trial.should_prune():
                     import optuna
                     raise optuna.exceptions.TrialPruned()
 
             # ── checkpoint ────────────────────────────────────────────────────
-            if episode > 0 and episode % config.save_every == 0:
+            if episode > 0 and episode % config.save_every < num_envs:
                 _save_all(encoder, policy_head, model_path)
                 print(f'[ep {episode:05d}] Checkpointed.')
 
@@ -690,6 +767,9 @@ def train(
         except ImportError:
             raise
     finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
         env.close()
         logger.finish()
 
@@ -729,6 +809,8 @@ def main() -> None:
                         help='Fraction of off-policy batch from expert replays (0.0–1.0)')
     parser.add_argument('--buffer-batch-size', default=256,   type=int,
                         help='Off-policy batch size per episode update (0 to disable)')
+    parser.add_argument('--num-envs',         default=1,     type=int,
+                        help='Parallel RLGym-sim environments for episode collection')
     # W&B
     parser.add_argument('--no-wandb',    action='store_true',
                         help='Disable W&B logging (stdout only)')
@@ -747,6 +829,7 @@ def main() -> None:
         max_episodes=args.episodes,
         save_every=args.save_every,
         model_dir=args.model_dir,
+        num_envs=args.num_envs,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
