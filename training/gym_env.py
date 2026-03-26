@@ -154,6 +154,10 @@ class BaselineGymEnv(gym.Env):
         # rlgym-sim combines both into the rewards array automatically.
         reward = float(rewards[0])  # blue player's reward
         assert -1.0 <= reward <= 1.0, f"Reward out of range: {reward}"
+        # Verify reward is exactly sparse: 0 mid-episode, +/-1 only on terminal
+        if not (terminated or truncated):
+            assert reward == 0.0, \
+                f"Non-zero mid-episode reward: {reward} (reward leakage!)"
 
         # Timeout
         timed_out = self._step_count >= self.max_steps
