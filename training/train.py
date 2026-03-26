@@ -414,16 +414,23 @@ class SubprocVecEnv:
             p.recv()
 
     def close(self) -> None:
+        # Signal all workers to exit
         for p in self._parents:
             try:
                 p.send(('close', None))
-                p.close()
             except (BrokenPipeError, OSError):
                 pass
+        # Join processes — give workers time to exit cleanly
         for proc in self._procs:
-            proc.join(timeout=5)
+            proc.join(timeout=10)
             if proc.is_alive():
-                proc.terminate()
+                proc.kill()
+        # Close parent pipe ends after workers have exited
+        for p in self._parents:
+            try:
+                p.close()
+            except OSError:
+                pass
 
 
 # ── parallel online training loop ────────────────────────────────────────────

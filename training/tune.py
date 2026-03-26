@@ -256,6 +256,10 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
             import wandb
             wandb.finish()
         raw_env.close()
+        # Free d3rlpy model + replay buffer to prevent memory accumulation
+        del algo, buffer
+        import gc
+        gc.collect()
 
     mean_reward = _mean_return(100)
     assert not np.isnan(mean_reward), \
