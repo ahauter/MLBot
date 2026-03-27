@@ -96,7 +96,7 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None, wandb_project: str = 'rlbot-baseline-tuning') -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -161,7 +161,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
     explorer = NormalNoise(std=explore_noise)
 
     if use_wandb:
-        logger_adapter = WanDBAdapterFactory(project='rlbot-baseline-tuning')
+        logger_adapter = WanDBAdapterFactory(project=wandb_project)
     else:
         logger_adapter = FileAdapterFactory(
             root_dir=f'models/tune/trial_{trial.number}'
@@ -207,7 +207,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
                 try:
                     import wandb
                     _wandb_run = wandb.init(
-                        project='rlbot-baseline-tuning',
+                        project=wandb_project,
                         name=f'tune_trial_{trial.number}',
                         group='optuna',
                         config={
@@ -356,6 +356,8 @@ def main():
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments per trial (default: 1)')
     parser.add_argument('--no-wandb', action='store_true')
+    parser.add_argument('--wandb-project', default='rlbot-baseline-tuning',
+                        help='W&B project name (default: rlbot-baseline-tuning)')
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
     parser.add_argument('--storage', default=STORAGE_PATH)
@@ -420,7 +422,7 @@ def main():
         study.optimize(
             lambda trial: objective(
                 trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-                shared_envs=shared_envs,
+                shared_envs=shared_envs, wandb_project=args.wandb_project,
             ),
             n_trials=args.n_trials,
             show_progress_bar=True,
