@@ -97,7 +97,7 @@ class RewardTracker:
 # ── objective ────────────────────────────────────────────────────────────────
 
 def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
-              shared_envs=None, reward_type: str = 'sparse') -> float:
+              shared_envs=None, reward_type: str = 'sparse', wandb_project: str = 'rlbot-baseline-tuning') -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -136,7 +136,11 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
         pass  # psutil not installed — skip memory guard
 
     if shared_envs is not None:
-        shared_envs.assert_workers_alive()
+        n_dead = sum(1 for p in shared_envs._procs if not p.is_alive())
+        if n_dead:
+            print(
+                f'[tune] Warning: {n_dead}/{shared_envs.num_envs} workers died — respawning before trial {trial.number}', file=sys.stderr)
+            shared_envs.respawn_dead()
 
     t_window = 8
     encoder_factory = TransformerEncoderFactory(t_window=t_window)
@@ -155,11 +159,12 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
     raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
     env = RewardTracker(raw_env)
 
-    buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000, env=env)
+    buffer = d3rlpy.dataset.create_fifo_replay_buffer(
+        limit=100_000 * num_envs, env=env)
     explorer = NormalNoise(std=explore_noise)
 
     if use_wandb:
-        logger_adapter = WanDBAdapterFactory(project='rlbot-baseline-tuning')
+        logger_adapter = WanDBAdapterFactory(project=wandb_project)
     else:
         logger_adapter = FileAdapterFactory(
             root_dir=f'models/tune/trial_{trial.number}'
@@ -206,7 +211,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
                 try:
                     import wandb
                     _wandb_run = wandb.init(
-                        project='rlbot-baseline-tuning',
+                        project=wandb_project,
                         name=f'tune_trial_{trial.number}',
                         group='optuna',
                         config={
@@ -263,7 +268,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
                 random_steps=5_000,
                 experiment_name=f'tune_trial_{trial.number}',
                 logger_adapter=logger_adapter,
-                show_progress=False,
+                show_progress=True,
                 callback=callback,
             )
     except Exception as e:
@@ -302,21 +307,19 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
 
 # ── auto-seed launcher ──────────────────────────────────────────────────────
 
-def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> list:
+def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> None:
     """
-    Launch baseline training with best params from Optuna study.
-
-    Returns list of (seed, subprocess.Popen) tuples.
+    Run baseline training sequentially for each seed using best params from
+    Optuna study. Seeds run one at a time so they don't compete for the GPU.
     """
     best = study.best_params
     Path('models/baseline').mkdir(parents=True, exist_ok=True)
 
-    print(f'\n=== Launching {n_seeds} seeds with best params ===')
+    print(f'\n=== Running {n_seeds} seeds with best params ===')
     for k, v in best.items():
         print(f'  {k}: {v}')
     print()
 
-    procs = []
     for seed in range(n_seeds):
         cmd = [
             sys.executable, 'training/train.py',
@@ -333,14 +336,11 @@ def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> list:
             cmd.extend(extra_args)
 
         log_path = f'models/baseline/seed_{seed}.log'
-        log_file = open(log_path, 'w')
-        proc = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT
-        )
-        procs.append((seed, proc, log_file))
-        print(f'  Seed {seed}: PID {proc.pid}, log: {log_path}')
-
-    return procs
+        print(f'  Seed {seed}/{n_seeds - 1}: log: {log_path}')
+        with open(log_path, 'w') as log_file:
+            subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        status = 'OK'
+        print(f'  Seed {seed} complete: {status}')
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -354,7 +354,8 @@ def main():
         print('Optuna required: pip install optuna', file=sys.stderr)
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description='Baseline hyperparameter tuning.')
+    parser = argparse.ArgumentParser(
+        description='Baseline hyperparameter tuning.')
     parser.add_argument('--n-trials', type=int, default=50)
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
     parser.add_argument('--num-envs', type=int, default=1,
@@ -362,6 +363,8 @@ def main():
     parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
                         help='Reward function: sparse (goals only) or dense (shaped)')
     parser.add_argument('--no-wandb', action='store_true')
+    parser.add_argument('--wandb-project', default='rlbot-baseline-tuning',
+                        help='W&B project name (default: rlbot-baseline-tuning)')
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
     parser.add_argument('--storage', default=STORAGE_PATH)
@@ -370,11 +373,20 @@ def main():
                         help='Auto-launch baseline seeds after tuning completes')
     parser.add_argument('--n-seeds', type=int, default=10,
                         help='Number of seeds to launch (default: 10)')
-    parser.add_argument('--wait', action='store_true',
-                        help='Wait for all seed processes to complete')
+    parser.add_argument('--reset', action='store_true',
+                        help='Delete existing study and start HP tuning from scratch')
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if args.reset:
+        try:
+            optuna.delete_study(study_name=args.study_name,
+                                storage=args.storage)
+            print(f'Deleted existing study "{args.study_name}".')
+        except KeyError:
+            print(
+                f'No existing study "{args.study_name}" found — starting fresh.')
 
     study = optuna.create_study(
         direction='maximize',
@@ -385,7 +397,7 @@ def main():
         sampler=TPESampler(seed=42),
         storage=args.storage,
         study_name=args.study_name,
-        load_if_exists=True,
+        load_if_exists=not args.reset,
     )
 
     if args.show_best:
@@ -404,7 +416,8 @@ def main():
 
     n_existing = len([t for t in study.trials if t.state.is_finished()])
     print(f'Study "{args.study_name}" — {n_existing} completed trials.')
-    print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
+    print(
+        f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
 
     # Hoist worker pool: spawn once and reuse across all trials to avoid
     # the per-trial spawn overhead (~576 MB × num_envs) that causes slowdown.
@@ -420,7 +433,8 @@ def main():
         study.optimize(
             lambda trial: objective(
                 trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-                shared_envs=shared_envs, reward_type=args.reward,
+                shared_envs=shared_envs, wandb_project=args.wandb_project,
+                reward_type=args.reward,
             ),
             n_trials=args.n_trials,
             show_progress_bar=True,
@@ -442,19 +456,8 @@ def main():
             extra.extend(['--reward', args.reward])
         if args.no_wandb:
             extra.append('--no-wandb')
-        procs = launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
-
-        if args.wait:
-            print(f'\nWaiting for {len(procs)} seed processes...')
-            for seed, proc, log_file in procs:
-                proc.wait()
-                log_file.close()
-                status = 'OK' if proc.returncode == 0 else f'FAILED ({proc.returncode})'
-                print(f'  Seed {seed}: {status}')
-            print('All seeds complete.')
-        else:
-            print(f'\n{len(procs)} seeds launched in background.')
-            print('Monitor with: tail -f models/baseline/seed_0.log')
+        launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
+        print('All seeds complete.')
 
 
 if __name__ == '__main__':
