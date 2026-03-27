@@ -97,10 +97,28 @@ class RewardTracker:
 # ── objective ────────────────────────────────────────────────────────────────
 
 def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
-              shared_envs=None, reward_type: str = 'sparse', wandb_project: str = 'rlbot-baseline-tuning') -> float:
+              shared_envs=None, reward_type: str = 'sparse', wandb_project: str = 'rlbot-baseline-tuning',
+              dense_reward_weights: dict | None = None,
+              replay_seed_dir: str | None = None,
+              pretrained_encoder_path: str | None = None,
+              algo_name: str = 'AWAC',
+              study_label: str = '') -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
+
+    Parameters
+    ----------
+    dense_reward_weights : dict or None
+        Component weight overrides for DenseRewardFunction (Axis 4 sweep).
+    replay_seed_dir : str or None
+        Directory of parsed .npz replay files to pre-load into buffer.
+    pretrained_encoder_path : str or None
+        Path to pre-trained encoder weights.
+    algo_name : str
+        Algorithm to tune (AWAC, SAC, TD3, etc.).
+    study_label : str
+        Label for logging (e.g. experiment/condition name).
     """
     import d3rlpy
     from d3rlpy.algos.qlearning.explorers import NormalNoise
@@ -112,11 +130,15 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
     # ── sample hyperparameters ───────────────────────────────────────────
     actor_lr = trial.suggest_float('actor_lr', 1e-5, 1e-3, log=True)
     critic_lr = trial.suggest_float('critic_lr', 1e-5, 1e-3, log=True)
-    awac_lambda = trial.suggest_float('awac_lambda', 0.1, 5.0)
     tau = trial.suggest_float('tau', 0.001, 0.05, log=True)
     batch_size = trial.suggest_int('batch_size', 64, 512, log=True)
     gamma = trial.suggest_float('gamma', 0.95, 0.999)
     explore_noise = trial.suggest_float('explore_noise', 0.01, 0.3)
+    # AWAC-specific param
+    if algo_name == 'AWAC':
+        awac_lambda = trial.suggest_float('awac_lambda', 0.1, 5.0)
+    else:
+        awac_lambda = 1.0
 
     # ── fast-fail guards ─────────────────────────────────────────────────
     try:
@@ -143,9 +165,20 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
             shared_envs.respawn_dead()
 
     t_window = 8
-    encoder_factory = TransformerEncoderFactory(t_window=t_window)
+    encoder_factory = TransformerEncoderFactory(
+        t_window=t_window,
+        pretrained_weights_path=pretrained_encoder_path,
+    )
 
-    algo = d3rlpy.algos.AWACConfig(
+    # ── build algorithm from algo_name ────────────────────────────────────
+    from train import ALGO_MAP
+    import dataclasses as _dc
+
+    algo_cls = ALGO_MAP.get(algo_name)
+    if algo_cls is None:
+        raise ValueError(f'Unknown algorithm: {algo_name}')
+
+    common = dict(
         batch_size=batch_size,
         gamma=gamma,
         actor_learning_rate=actor_lr,
@@ -153,14 +186,30 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
         actor_encoder_factory=encoder_factory,
         critic_encoder_factory=encoder_factory,
         tau=tau,
-        lam=awac_lambda,
-    ).create(device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
+    )
+    if algo_name == 'AWAC':
+        common['lam'] = awac_lambda
+        common['n_action_samples'] = 1
 
-    raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
+    valid_fields = {f.name for f in _dc.fields(algo_cls)}
+    filtered = {k: v for k, v in common.items() if k in valid_fields}
+    algo = algo_cls(**filtered).create(
+        device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
+
+    raw_env = BaselineGymEnv(
+        t_window=t_window,
+        reward_type=reward_type,
+        dense_reward_weights=dense_reward_weights,
+    )
     env = RewardTracker(raw_env)
 
     buffer = d3rlpy.dataset.create_fifo_replay_buffer(
         limit=100_000 * num_envs, env=env)
+
+    # ── pre-load replay data if provided ──────────────────────────────────
+    if replay_seed_dir:
+        from replay_dataset import load_replays_into_buffer
+        load_replays_into_buffer(replay_seed_dir, buffer, t_window=t_window)
     explorer = NormalNoise(std=explore_noise)
 
     if use_wandb:
@@ -305,6 +354,137 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
     return mean_reward
 
 
+# ── per-condition tuning API ─────────────────────────────────────────────────
+
+def tune_for_condition(
+    condition_name: str,
+    condition_config: dict,
+    n_trials: int = 30,
+    steps_per_trial: int = 500_000,
+    num_envs: int = 1,
+    use_wandb: bool = False,
+    wandb_project: str = 'rlbot-baseline-tuning',
+    storage: str = STORAGE_PATH,
+    reset: bool = False,
+) -> dict:
+    """
+    Run Optuna HP tuning for a specific experiment condition.
+
+    Parameters
+    ----------
+    condition_name : str
+        Unique identifier for the study (e.g. 'dense_reward_sweep/components_3').
+    condition_config : dict
+        Config dict from ExperimentConfig.to_train_configs() — includes
+        reward_type, dense_reward_weights, replay_seed_dir, etc.
+    n_trials : int
+        Number of Optuna trials.
+    steps_per_trial : int
+        Environment steps per trial.
+    num_envs : int
+        Parallel environments per trial.
+    use_wandb : bool
+        Whether to log to W&B.
+    wandb_project : str
+        W&B project for tuning runs.
+    storage : str
+        Optuna storage path.
+    reset : bool
+        Delete existing study and start fresh.
+
+    Returns
+    -------
+    dict with best hyperparameters (actor_lr, critic_lr, tau, etc.)
+    """
+    import optuna
+    from optuna.pruners import SuccessiveHalvingPruner
+    from optuna.samplers import TPESampler
+
+    study_name = f'tune/{condition_name}'
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if reset:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+        except KeyError:
+            pass
+
+    study = optuna.create_study(
+        direction='maximize',
+        pruner=SuccessiveHalvingPruner(min_resource=50_000, reduction_factor=3),
+        sampler=TPESampler(seed=42),
+        storage=storage,
+        study_name=study_name,
+        load_if_exists=not reset,
+    )
+
+    # Extract condition-specific settings
+    reward_type = condition_config.get('reward_type', 'sparse')
+    dense_reward_weights = condition_config.get('dense_reward_weights')
+    replay_seed_dir = condition_config.get('replay_seed_dir')
+    pretrained_encoder_path = condition_config.get('pretrained_encoder_path')
+    algo_name = condition_config.get('algo', 'AWAC')
+
+    n_existing = len([t for t in study.trials if t.state.is_finished()])
+    print(f'  Tuning "{condition_name}" — {n_existing} existing trials, '
+          f'running {n_trials} more ({steps_per_trial:,} steps each)...')
+
+    shared_envs = None
+    if num_envs > 1:
+        from train import SubprocVecEnv
+        shared_envs = SubprocVecEnv(
+            num_envs=num_envs, t_window=8, reward_type=reward_type)
+
+    try:
+        study.optimize(
+            lambda trial: objective(
+                trial, steps_per_trial, use_wandb, num_envs,
+                shared_envs=shared_envs,
+                reward_type=reward_type,
+                wandb_project=wandb_project,
+                dense_reward_weights=dense_reward_weights,
+                replay_seed_dir=replay_seed_dir,
+                pretrained_encoder_path=pretrained_encoder_path,
+                algo_name=algo_name,
+                study_label=condition_name,
+            ),
+            n_trials=n_trials,
+            show_progress_bar=True,
+        )
+    finally:
+        if shared_envs is not None:
+            shared_envs.close()
+
+    if not study.best_trial:
+        print(f'  WARNING: No completed trials for "{condition_name}"')
+        return {}
+
+    best = study.best_params
+    print(f'  Best trial #{study.best_trial.number} '
+          f'reward={study.best_trial.value:.4f}')
+    for k, v in best.items():
+        print(f'    {k}: {v}')
+    return dict(best)
+
+
+def load_tuned_params(condition_name: str, storage: str = STORAGE_PATH) -> dict | None:
+    """
+    Load best params from an existing Optuna study for a condition.
+
+    Returns None if no study or no completed trials exist.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study_name = f'tune/{condition_name}'
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+    except (KeyError, Exception):
+        return None
+    if not study.best_trial:
+        return None
+    return dict(study.best_params)
+
+
 # ── auto-seed launcher ──────────────────────────────────────────────────────
 
 def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> None:
@@ -355,7 +535,7 @@ def main():
         sys.exit(1)
 
     parser = argparse.ArgumentParser(
-        description='Baseline hyperparameter tuning.')
+        description='Hyperparameter tuning (standalone or per-experiment condition).')
     parser.add_argument('--n-trials', type=int, default=50)
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
     parser.add_argument('--num-envs', type=int, default=1,
@@ -368,6 +548,11 @@ def main():
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
     parser.add_argument('--storage', default=STORAGE_PATH)
+    # Per-experiment-condition tuning
+    parser.add_argument('--experiment', default=None,
+                        help='Path to experiment YAML — tune per-condition')
+    parser.add_argument('--condition', default=None,
+                        help='Specific condition to tune (default: all conditions)')
     # Auto-seed launching
     parser.add_argument('--auto-seeds', action='store_true',
                         help='Auto-launch baseline seeds after tuning completes')
@@ -379,6 +564,69 @@ def main():
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # ── experiment-mode: tune per condition from YAML ─────────────────────
+    if args.experiment:
+        from experiment_config import ExperimentConfig
+
+        exp = ExperimentConfig.from_yaml(args.experiment)
+        print(f'Experiment: {exp.name}')
+        print(f'Description: {exp.description}')
+
+        # Get unique conditions
+        configs = exp.to_train_configs()
+        seen = {}
+        for cond_name, seed, cfg_dict in configs:
+            if cond_name not in seen:
+                seen[cond_name] = cfg_dict
+
+        # Filter to specific condition if requested
+        if args.condition:
+            if args.condition not in seen:
+                print(f'ERROR: condition "{args.condition}" not found. '
+                      f'Available: {list(seen.keys())}')
+                sys.exit(1)
+            seen = {args.condition: seen[args.condition]}
+
+        print(f'Tuning {len(seen)} condition(s): {list(seen.keys())}')
+        print()
+
+        all_best = {}
+        for cond_name, cfg_dict in seen.items():
+            cfg_dict.pop('_budget', None)
+            best_params = tune_for_condition(
+                condition_name=f'{exp.name}/{cond_name}',
+                condition_config=cfg_dict,
+                n_trials=args.n_trials,
+                steps_per_trial=args.steps_per_trial,
+                num_envs=args.num_envs,
+                use_wandb=not args.no_wandb,
+                wandb_project=args.wandb_project,
+                storage=args.storage,
+                reset=args.reset,
+            )
+            all_best[cond_name] = best_params
+            print()
+
+        print('=== Per-condition best params ===')
+        for cond, params in all_best.items():
+            print(f'  {cond}: {params}')
+
+        if args.show_best:
+            for cond_name in seen:
+                study_name = f'tune/{exp.name}/{cond_name}'
+                try:
+                    study = optuna.load_study(
+                        study_name=study_name, storage=args.storage)
+                    if study.best_trial:
+                        print(f'\n  [{cond_name}] Best trial #{study.best_trial.number} '
+                              f'reward={study.best_trial.value:.4f}')
+                        for k, v in study.best_params.items():
+                            print(f'    {k}: {v}')
+                except Exception:
+                    print(f'\n  [{cond_name}] No study found.')
+        return
+
+    # ── standalone mode (original behavior) ───────────────────────────────
     if args.reset:
         try:
             optuna.delete_study(study_name=args.study_name,
