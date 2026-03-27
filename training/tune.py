@@ -154,7 +154,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
     raw_env = BaselineGymEnv(t_window=t_window)
     env = RewardTracker(raw_env)
 
-    buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000, env=env)
+    buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000 * num_envs, env=env)
     explorer = NormalNoise(std=explore_noise)
 
     if use_wandb:
@@ -261,7 +261,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
                 random_steps=5_000,
                 experiment_name=f'tune_trial_{trial.number}',
                 logger_adapter=logger_adapter,
-                show_progress=False,
+                show_progress=True,
                 callback=callback,
             )
     except Exception as e:
@@ -300,21 +300,19 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
 
 # ── auto-seed launcher ──────────────────────────────────────────────────────
 
-def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> list:
+def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> None:
     """
-    Launch baseline training with best params from Optuna study.
-
-    Returns list of (seed, subprocess.Popen) tuples.
+    Run baseline training sequentially for each seed using best params from
+    Optuna study. Seeds run one at a time so they don't compete for the GPU.
     """
     best = study.best_params
     Path('models/baseline').mkdir(parents=True, exist_ok=True)
 
-    print(f'\n=== Launching {n_seeds} seeds with best params ===')
+    print(f'\n=== Running {n_seeds} seeds with best params ===')
     for k, v in best.items():
         print(f'  {k}: {v}')
     print()
 
-    procs = []
     for seed in range(n_seeds):
         cmd = [
             sys.executable, 'training/train.py',
@@ -331,14 +329,11 @@ def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> list:
             cmd.extend(extra_args)
 
         log_path = f'models/baseline/seed_{seed}.log'
-        log_file = open(log_path, 'w')
-        proc = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT
-        )
-        procs.append((seed, proc, log_file))
-        print(f'  Seed {seed}: PID {proc.pid}, log: {log_path}')
-
-    return procs
+        print(f'  Seed {seed}/{n_seeds - 1}: log: {log_path}')
+        with open(log_path, 'w') as log_file:
+            subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        status = 'OK'
+        print(f'  Seed {seed} complete: {status}')
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -366,8 +361,6 @@ def main():
                         help='Auto-launch baseline seeds after tuning completes')
     parser.add_argument('--n-seeds', type=int, default=10,
                         help='Number of seeds to launch (default: 10)')
-    parser.add_argument('--wait', action='store_true',
-                        help='Wait for all seed processes to complete')
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -435,19 +428,8 @@ def main():
         extra = []
         if args.no_wandb:
             extra.append('--no-wandb')
-        procs = launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
-
-        if args.wait:
-            print(f'\nWaiting for {len(procs)} seed processes...')
-            for seed, proc, log_file in procs:
-                proc.wait()
-                log_file.close()
-                status = 'OK' if proc.returncode == 0 else f'FAILED ({proc.returncode})'
-                print(f'  Seed {seed}: {status}')
-            print('All seeds complete.')
-        else:
-            print(f'\n{len(procs)} seeds launched in background.')
-            print('Monitor with: tail -f models/baseline/seed_0.log')
+        launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
+        print('All seeds complete.')
 
 
 if __name__ == '__main__':
