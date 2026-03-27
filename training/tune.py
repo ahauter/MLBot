@@ -96,7 +96,8 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
+              shared_envs=None, reward_type: str = 'sparse') -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -151,7 +152,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
         lam=awac_lambda,
     ).create(device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
 
-    raw_env = BaselineGymEnv(t_window=t_window)
+    raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
     env = RewardTracker(raw_env)
 
     buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000, env=env)
@@ -196,7 +197,8 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
             )
 
             if envs is None:
-                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
+                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window,
+                                     reward_type=reward_type)
                 _owns_envs = True
 
             # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
@@ -357,6 +359,8 @@ def main():
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments per trial (default: 1)')
+    parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
+                        help='Reward function: sparse (goals only) or dense (shaped)')
     parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
@@ -407,7 +411,8 @@ def main():
     shared_envs = None
     if args.num_envs > 1:
         from train import SubprocVecEnv
-        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8)
+        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8,
+                                    reward_type=args.reward)
         print(f'Spawned {args.num_envs} persistent worker processes '
               f'(pids: {[p.pid for p in shared_envs._procs]})')
 
@@ -415,7 +420,7 @@ def main():
         study.optimize(
             lambda trial: objective(
                 trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-                shared_envs=shared_envs,
+                shared_envs=shared_envs, reward_type=args.reward,
             ),
             n_trials=args.n_trials,
             show_progress_bar=True,
@@ -433,6 +438,8 @@ def main():
     # ── auto-launch seeds ────────────────────────────────────────────────
     if args.auto_seeds:
         extra = []
+        if args.reward != 'sparse':
+            extra.extend(['--reward', args.reward])
         if args.no_wandb:
             extra.append('--no-wandb')
         procs = launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)

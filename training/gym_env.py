@@ -67,11 +67,13 @@ class BaselineGymEnv(gym.Env):
         t_window: int = 8,
         tick_skip: int = 8,
         max_steps: int = 4500,  # ~5 min at 15 steps/sec
+        reward_type: str = 'sparse',
     ):
         super().__init__()
         self.t_window = t_window
         self.tick_skip = tick_skip
         self.max_steps = max_steps
+        self.reward_type = reward_type
 
         obs_size = t_window * N_TOKENS * TOKEN_FEATURES
         self.observation_space = gym.spaces.Box(
@@ -156,11 +158,11 @@ class BaselineGymEnv(gym.Env):
         # 0.0 per step via get_reward() and +1/-1 on terminal via get_final_reward().
         # rlgym-sim combines both into the rewards array automatically.
         reward = float(rewards[0])  # blue player's reward
-        assert -1.0 <= reward <= 1.0, f"Reward out of range: {reward}"
-        # Verify reward is exactly sparse: 0 mid-episode, +/-1 only on terminal
-        if not (terminated or truncated):
-            assert reward == 0.0, \
-                f"Non-zero mid-episode reward: {reward} (reward leakage!)"
+        if self.reward_type == 'sparse':
+            assert -1.0 <= reward <= 1.0, f"Reward out of range: {reward}"
+            if not (terminated or truncated):
+                assert reward == 0.0, \
+                    f"Non-zero mid-episode reward: {reward} (reward leakage!)"
 
         # Timeout
         timed_out = self._step_count >= self.max_steps
@@ -190,7 +192,7 @@ class BaselineGymEnv(gym.Env):
             obs_builder=self._make_obs_builder(),
             action_parser=ContinuousAction(),
             state_setter=DefaultState(),
-            reward_fn=self._make_sparse_reward(),
+            reward_fn=self._make_reward(),
             terminal_conditions=[self._make_terminal()],
             team_size=1,
             spawn_opponents=True,
@@ -200,6 +202,12 @@ class BaselineGymEnv(gym.Env):
     def _make_obs_builder(self):
         from rlgym_env import TokenObsBuilder
         return TokenObsBuilder()
+
+    def _make_reward(self):
+        if self.reward_type == 'dense':
+            from dense_reward import DenseRewardFunction
+            return DenseRewardFunction()
+        return self._make_sparse_reward()
 
     def _make_sparse_reward(self):
         from rlgym_sim.utils import RewardFunction

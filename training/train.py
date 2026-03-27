@@ -107,6 +107,9 @@ class TrainConfig:
     # ── self-play ────────────────────────────────────────────────────────────
     max_snapshots: int = 20
 
+    # ── reward ──────────────────────────────────────────────────────────────
+    reward_type: str = 'sparse'       # 'sparse' or 'dense'
+
     # ── convergence ──────────────────────────────────────────────────────────
     rookie_target_wr: float = 0.60    # win rate target vs Psyonix Rookie
     consecutive_evals_required: int = 2
@@ -303,9 +306,11 @@ def _env_worker(
     t_window: int,
     tick_skip: int,
     max_steps: int,
+    reward_type: str = 'sparse',
 ) -> None:
     """Persistent subprocess that owns a BaselineGymEnv."""
-    env = BaselineGymEnv(t_window=t_window, tick_skip=tick_skip, max_steps=max_steps)
+    env = BaselineGymEnv(t_window=t_window, tick_skip=tick_skip, max_steps=max_steps,
+                         reward_type=reward_type)
     algo_builder = None
     try:
         while True:
@@ -365,7 +370,7 @@ class SubprocVecEnv:
     """Manages N BaselineGymEnv instances in separate processes."""
 
     def __init__(self, num_envs: int, t_window: int = 8, tick_skip: int = 8,
-                 max_steps: int = 4500):
+                 max_steps: int = 4500, reward_type: str = 'sparse'):
         self.num_envs = num_envs
         self._parents: List[multiprocessing.connection.Connection] = []
         self._procs: List[multiprocessing.Process] = []
@@ -377,7 +382,7 @@ class SubprocVecEnv:
             parent_conn, child_conn = ctx.Pipe()
             proc = ctx.Process(
                 target=_env_worker,
-                args=(child_conn, t_window, tick_skip, max_steps),
+                args=(child_conn, t_window, tick_skip, max_steps, reward_type),
                 daemon=True,
             )
             proc.start()
@@ -507,7 +512,7 @@ def fit_online_parallel(
     # Build algo if needed
     if algo.impl is None:
         # Need a dummy env to build with
-        dummy = BaselineGymEnv(t_window=config.t_window)
+        dummy = BaselineGymEnv(t_window=config.t_window, reward_type=config.reward_type)
         algo.build_with_env(dummy)
         dummy.close()
 
@@ -660,6 +665,7 @@ def train(config: TrainConfig) -> None:
 
     print(f'Training config:')
     print(f'  Algorithm:  {config.algo}')
+    print(f'  Reward:     {config.reward_type}')
     print(f'  Seed:       {config.seed}')
     print(f'  Steps:      {config.total_steps:,}')
     print(f'  Device:     {"cuda" if torch.cuda.is_available() else "cpu"}')
@@ -668,7 +674,7 @@ def train(config: TrainConfig) -> None:
     print(f'  Model dir:  {model_dir}')
 
     # ── environment ──────────────────────────────────────────────────────
-    env = BaselineGymEnv(t_window=config.t_window)
+    env = BaselineGymEnv(t_window=config.t_window, reward_type=config.reward_type)
 
     # ── d3rlpy algorithm ─────────────────────────────────────────────────
     algo = build_algo(config)
@@ -722,6 +728,7 @@ def train(config: TrainConfig) -> None:
         envs = SubprocVecEnv(
             num_envs=config.num_envs,
             t_window=config.t_window,
+            reward_type=config.reward_type,
         )
         # Send config to workers so they can build algo for opponent loading
         envs.set_algo_builder_args(dataclasses.asdict(config))
@@ -800,6 +807,8 @@ def main():
     # Core
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--algo', default='AWAC', choices=list(ALGO_MAP.keys()))
+    parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
+                        help='Reward function: sparse (goals only) or dense (shaped)')
     parser.add_argument('--total-steps', type=int, default=50_000_000)
 
     # Hyperparameters
@@ -839,6 +848,7 @@ def main():
     config = TrainConfig(
         seed=args.seed,
         algo=args.algo,
+        reward_type=args.reward,
         total_steps=args.total_steps,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
