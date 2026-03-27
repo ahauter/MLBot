@@ -107,9 +107,8 @@ class TrainConfig:
     # ── self-play ────────────────────────────────────────────────────────────
     max_snapshots: int = 20
 
-    # ── evaluation ─────────────────────────────────────────────────────────
-    eval_episodes: int = 50           # episodes per tier during evaluation
-    eval_target_wr: float = 0.60     # win rate target for convergence
+    # ── convergence ──────────────────────────────────────────────────────────
+    rookie_target_wr: float = 0.60    # win rate target vs Psyonix Rookie
     consecutive_evals_required: int = 2
 
     # ── paths ────────────────────────────────────────────────────────────────
@@ -247,10 +246,9 @@ class TrainingCallback:
                     self.parallel_envs.set_opponent_path(model_path)
 
     def _run_eval(self, algo, total_step: int) -> None:
-        """Run sim-based evaluation against reference opponents."""
-        from evaluate import run_evaluation
-
+        """Run evaluation against Psyonix tiers."""
         wall_clock = time.time() - self.start_time
+
         print(f'\n[step {total_step:,}] Evaluation checkpoint '
               f'(wall clock: {wall_clock/3600:.1f}h)')
 
@@ -259,39 +257,37 @@ class TrainingCallback:
             'eval/wall_clock_seconds': int(wall_clock),
         }
 
-        # Get snapshot opponent if available
-        snapshot_opp = self.pool.latest() if self.pool.num_snapshots() > 0 else None
+        # Try to run evaluation if evaluate module is available
+        try:
+            from evaluate import run_evaluation
+            model_dir = Path(self.config.model_dir) / 'eval_temp'
+            model_dir.mkdir(parents=True, exist_ok=True)
+            algo.save(str(model_dir / 'd3rlpy_model'))
 
-        tiers = {
-            'Random': self.config.eval_episodes,
-            'Snapshot': self.config.eval_episodes,
-        }
+            win_rates = run_evaluation(str(model_dir))
+            eval_metrics.update({
+                'eval/win_rate_beginner': win_rates.get('Beginner', 0.0),
+                'eval/win_rate_rookie': win_rates.get('Rookie', 0.0),
+                'eval/win_rate_pro': win_rates.get('Pro', 0.0),
+                'eval/win_rate_allstar': win_rates.get('Allstar', 0.0),
+            })
 
-        results = run_evaluation(
-            algo=algo,
-            snapshot_opponent=snapshot_opp,
-            tiers=tiers,
-            t_window=self.config.t_window,
-        )
+            rookie_wr = win_rates.get('Rookie', 0.0)
+            print(f'  Rookie win rate: {rookie_wr:.1%}')
 
-        for tier_name, result in results.items():
-            key = tier_name.lower()
-            eval_metrics[f'eval/win_rate_{key}'] = result.win_rate
-            eval_metrics[f'eval/loss_rate_{key}'] = result.loss_rate
-            eval_metrics[f'eval/draw_rate_{key}'] = result.draw_rate
-            eval_metrics[f'eval/mean_return_{key}'] = result.mean_return
+            # Convergence check
+            if rookie_wr >= self.config.rookie_target_wr:
+                self.consecutive_wins += 1
+                print(f'  Target met ({self.consecutive_wins}/'
+                      f'{self.config.consecutive_evals_required} consecutive)')
+                if self.consecutive_wins >= self.config.consecutive_evals_required:
+                    self.converged = True
+                    print('  CONVERGED — stopping training.')
+            else:
+                self.consecutive_wins = 0
 
-        # Convergence check on Random tier win rate
-        primary = results.get('Random')
-        if primary and primary.win_rate >= self.config.eval_target_wr:
-            self.consecutive_wins += 1
-            print(f'  Target met ({self.consecutive_wins}/'
-                  f'{self.config.consecutive_evals_required} consecutive)')
-            if self.consecutive_wins >= self.config.consecutive_evals_required:
-                self.converged = True
-                print('  CONVERGED — stopping training.')
-        else:
-            self.consecutive_wins = 0
+        except (ImportError, Exception) as e:
+            print(f'  Evaluation skipped: {e}')
 
         # Log to W&B
         if self._wandb is not None and self._wandb.run is not None:
@@ -765,7 +761,7 @@ def train(config: TrainConfig) -> None:
     print(f'\nTraining complete. Model saved to {model_dir}')
 
     if callback.converged:
-        print(f'Converged at win rate >= {config.eval_target_wr:.0%}')
+        print(f'Converged at Rookie win rate >= {config.rookie_target_wr:.0%}')
     else:
         print(f'Did not converge within {config.total_steps:,} steps.')
 

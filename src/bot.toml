@@ -1,0 +1,15 @@
+# RLBot v5 bot configuration
+# Referenced by eval_configs/*.toml for Psyonix bot evaluation
+
+[settings]
+name = "MLBot"
+agent_module = "bot"
+agent_class = "MyBot"
+logo_file = ""
+loadout_file = "appearance.cfg"
+maximum_tick_rate_preference = 120
+
+[details]
+developer = "MLBot Research"
+description = "RL agent trained with d3rlpy for resource-constrained RL research"
+language = "python"

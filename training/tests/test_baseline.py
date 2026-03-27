@@ -247,19 +247,36 @@ class TestAlgoBuild:
 
 class TestEvalConfig:
 
-    def test_sim_eval_tiers_defined(self):
-        from evaluate import SIM_EVAL_TIERS
-        assert 'Random' in SIM_EVAL_TIERS
-        assert 'Snapshot' in SIM_EVAL_TIERS
-        assert all(v > 0 for v in SIM_EVAL_TIERS.values())
+    def test_generate_toml_each_tier(self):
+        from evaluate import generate_match_toml
+        for tier in ['Beginner', 'Rookie', 'Pro', 'Allstar']:
+            toml = generate_match_toml(tier)
+            assert f'skill = "{tier}"' in toml, \
+                f"Tier {tier} not found in TOML"
+            assert 'type = "Psyonix"' in toml
+            assert 'type = "RLBot"' in toml
 
-    def test_eval_result_properties(self):
-        from evaluate import EvalResult
-        r = EvalResult(tier='Random', n_episodes=10, wins=6, losses=3, draws=1,
-                       mean_return=0.3)
-        assert r.win_rate == pytest.approx(0.6)
-        assert r.loss_rate == pytest.approx(0.3)
-        assert r.draw_rate == pytest.approx(0.1)
+    def test_toml_has_two_cars(self):
+        from evaluate import generate_match_toml
+        toml = generate_match_toml('Rookie')
+        assert toml.count('[[cars]]') == 2, \
+            "Expected 2 [[cars]] sections in TOML"
+
+    def test_parse_match_result_win(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Match ended: 3 - 1') == 'win'
+
+    def test_parse_match_result_loss(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Match ended: 0 - 2') == 'loss'
+
+    def test_parse_match_result_draw(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Final score: 1 - 1') == 'draw'
+
+    def test_parse_match_result_none_on_garbage(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('no score info here') is None
 
 
 # ── gym env shape tests (no rlgym-sim needed) ───────────────────────────────

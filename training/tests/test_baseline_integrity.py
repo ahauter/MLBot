@@ -455,19 +455,44 @@ class TestSeeding:
 
 class TestEvalProtocol:
 
-    def test_eval_tiers_defined(self):
-        """Sim evaluation tiers must include Random and Snapshot."""
-        from evaluate import SIM_EVAL_TIERS
-        assert 'Random' in SIM_EVAL_TIERS, "Missing Random tier"
-        assert 'Snapshot' in SIM_EVAL_TIERS, "Missing Snapshot tier"
-        assert all(v > 0 for v in SIM_EVAL_TIERS.values())
+    def test_eval_episodes_match_spec(self):
+        """Evaluation episode counts must match the baseline spec."""
+        from evaluate import EVAL_TIERS
+        assert EVAL_TIERS['Beginner'] == 50
+        assert EVAL_TIERS['Rookie'] == 100
+        assert EVAL_TIERS['Pro'] == 50
+        assert EVAL_TIERS['Allstar'] == 50
+        assert sum(EVAL_TIERS.values()) == 250
 
-    def test_eval_result_win_loss_draw_sum(self):
-        """EvalResult wins + losses + draws must equal n_episodes."""
-        from evaluate import EvalResult
-        r = EvalResult(tier='Random', n_episodes=100, wins=40, losses=30,
-                       draws=30, mean_return=0.1)
-        assert r.wins + r.losses + r.draws == r.n_episodes
+    def test_eval_toml_team_assignment(self):
+        """Our bot must be team 0, Psyonix must be team 1."""
+        from evaluate import generate_match_toml
+        toml = generate_match_toml('Rookie')
+        lines = toml.split('\n')
+
+        # Find team assignments
+        car_sections = []
+        current_team = None
+        current_type = None
+        for line in lines:
+            line = line.strip()
+            if line == '[[cars]]':
+                if current_team is not None:
+                    car_sections.append((current_team, current_type))
+                current_team = None
+                current_type = None
+            elif line.startswith('team ='):
+                current_team = int(line.split('=')[1].strip())
+            elif line.startswith('type ='):
+                current_type = line.split('=')[1].strip().strip('"')
+        if current_team is not None:
+            car_sections.append((current_team, current_type))
+
+        assert len(car_sections) == 2, f"Expected 2 cars, got {len(car_sections)}"
+        assert car_sections[0] == (0, 'RLBot'), \
+            f"Car 0 should be (team=0, RLBot), got {car_sections[0]}"
+        assert car_sections[1] == (1, 'Psyonix'), \
+            f"Car 1 should be (team=1, Psyonix), got {car_sections[1]}"
 
     def test_convergence_requires_two_consecutive(self):
         """
@@ -478,7 +503,7 @@ class TestEvalProtocol:
         from gym_env import BaselineGymEnv
         from self_play import OpponentPool
 
-        config = TrainConfig(eval_target_wr=0.60, consecutive_evals_required=2)
+        config = TrainConfig(rookie_target_wr=0.60, consecutive_evals_required=2)
         # Don't need real env/pool for this test — just test the counter logic
         cb = TrainingCallback.__new__(TrainingCallback)
         cb.config = config
@@ -491,7 +516,7 @@ class TestEvalProtocol:
         expected_converged = [False, False, False, True]
 
         for i, wr in enumerate(win_rates):
-            if wr >= config.eval_target_wr:
+            if wr >= config.rookie_target_wr:
                 cb.consecutive_wins += 1
                 if cb.consecutive_wins >= config.consecutive_evals_required:
                     cb.converged = True
@@ -503,9 +528,9 @@ class TestEvalProtocol:
             assert cb.converged == expected_converged[i], \
                 f"Step {i}: converged={cb.converged}, expected {expected_converged[i]}"
 
-    def test_all_sim_tiers_evaluated(self):
-        """All sim evaluation tiers must be in the evaluation schedule."""
-        from evaluate import SIM_EVAL_TIERS
-        required = {'Random', 'Snapshot'}
-        assert set(SIM_EVAL_TIERS.keys()) == required, \
-            f"Missing tiers: {required - set(SIM_EVAL_TIERS.keys())}"
+    def test_all_four_tiers_evaluated(self):
+        """All 4 Psyonix tiers must be in the evaluation schedule."""
+        from evaluate import EVAL_TIERS
+        required = {'Beginner', 'Rookie', 'Pro', 'Allstar'}
+        assert set(EVAL_TIERS.keys()) == required, \
+            f"Missing tiers: {required - set(EVAL_TIERS.keys())}"
