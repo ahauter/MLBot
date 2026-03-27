@@ -96,7 +96,7 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None) -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -117,6 +117,26 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
     gamma = trial.suggest_float('gamma', 0.95, 0.999)
     explore_noise = trial.suggest_float('explore_noise', 0.01, 0.3)
 
+    # ── fast-fail guards ─────────────────────────────────────────────────
+    try:
+        import os as _os
+        import psutil as _psutil
+        _proc = _psutil.Process(_os.getpid())
+        _total_mb = sum(
+            p.memory_info().rss
+            for p in [_proc] + _proc.children(recursive=True)
+            if p.is_running()
+        ) / 1024 ** 2
+        assert _total_mb < 28 * 1024, (
+            f"Memory guard: process tree using {_total_mb / 1024:.1f} GB >= 28 GB limit. "
+            f"Aborting before trial {trial.number} to prevent system thrash."
+        )
+    except ImportError:
+        pass  # psutil not installed — skip memory guard
+
+    if shared_envs is not None:
+        shared_envs.assert_workers_alive()
+
     t_window = 8
     encoder_factory = TransformerEncoderFactory(t_window=t_window)
 
@@ -129,7 +149,7 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
         critic_encoder_factory=encoder_factory,
         tau=tau,
         lam=awac_lambda,
-    ).create(device='cpu')
+    ).create(device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
 
     raw_env = BaselineGymEnv(t_window=t_window)
     env = RewardTracker(raw_env)
@@ -166,13 +186,18 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
                 if trial.should_prune():
                     raise optuna.exceptions.TrialPruned()
 
-    envs = None
+    _owns_envs = False
+    envs = shared_envs  # reuse caller-managed workers if provided
     _wandb_run = None
     try:
         if parallel:
             from train import (
                 SubprocVecEnv, fit_online_parallel, TrainConfig as _TC,
             )
+
+            if envs is None:
+                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
+                _owns_envs = True
 
             # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
             if use_wandb:
@@ -199,7 +224,6 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
                 except ImportError:
                     pass
 
-            envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
             # Build algo before parallel loop
             algo.build_with_env(raw_env)
 
@@ -250,8 +274,9 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
         print(f'Trial {trial.number} failed: {e}', file=sys.stderr)
         return float('-inf')
     finally:
-        if envs is not None:
+        if _owns_envs and envs is not None:
             envs.close()
+            envs.assert_workers_dead()
         if _wandb_run is not None:
             import wandb
             wandb.finish()
@@ -260,6 +285,12 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1) -
         del algo, buffer
         import gc
         gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     mean_reward = _mean_return(100)
     assert not np.isnan(mean_reward), \
@@ -371,13 +402,27 @@ def main():
     print(f'Study "{args.study_name}" — {n_existing} completed trials.')
     print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
 
-    study.optimize(
-        lambda trial: objective(
-            trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-        ),
-        n_trials=args.n_trials,
-        show_progress_bar=True,
-    )
+    # Hoist worker pool: spawn once and reuse across all trials to avoid
+    # the per-trial spawn overhead (~576 MB × num_envs) that causes slowdown.
+    shared_envs = None
+    if args.num_envs > 1:
+        from train import SubprocVecEnv
+        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8)
+        print(f'Spawned {args.num_envs} persistent worker processes '
+              f'(pids: {[p.pid for p in shared_envs._procs]})')
+
+    try:
+        study.optimize(
+            lambda trial: objective(
+                trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
+                shared_envs=shared_envs,
+            ),
+            n_trials=args.n_trials,
+            show_progress_bar=True,
+        )
+    finally:
+        if shared_envs is not None:
+            shared_envs.close()
 
     print('\n=== Tuning complete ===')
     best = study.best_trial

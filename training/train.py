@@ -441,13 +441,29 @@ class SubprocVecEnv:
         for proc in self._procs:
             proc.join(timeout=10)
             if proc.is_alive():
-                proc.kill()
+                proc.terminate()  # SIGTERM first — lets finally blocks run
+                proc.join(timeout=5)
+                if proc.is_alive():
+                    proc.kill()
         # Close parent pipe ends after workers have exited
         for p in self._parents:
             try:
                 p.close()
             except OSError:
                 pass
+
+    def assert_workers_alive(self) -> None:
+        """Assert all worker processes are still alive. Call at start of each trial."""
+        dead = [p.pid for p in self._procs if not p.is_alive()]
+        assert not dead, f"SubprocVecEnv: workers died unexpectedly: pids={dead}"
+
+    def assert_workers_dead(self) -> None:
+        """Assert all worker processes have exited. Call after close()."""
+        still_alive = [p.pid for p in self._procs if p.is_alive()]
+        assert not still_alive, (
+            f"SubprocVecEnv: workers failed to exit after close(): pids={still_alive}. "
+            "Kill them manually (taskkill /F /PID <pid>) before restarting."
+        )
 
 
 # ── parallel online training loop ────────────────────────────────────────────
@@ -604,6 +620,11 @@ def fit_online_parallel(
             callback(algo, epoch, total_step)
 
     pbar.close()
+
+    # Drain any pending async resets so pipes are clean for the next trial
+    for i in list(pending_resets):
+        envs.recv_reset(i)
+    pending_resets.clear()
 
     # Clip any in-progress episodes
     for i in range(num_envs):
