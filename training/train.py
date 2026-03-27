@@ -109,6 +109,7 @@ class TrainConfig:
 
     # ── reward ──────────────────────────────────────────────────────────────
     reward_type: str = 'sparse'       # 'sparse' or 'dense'
+    dense_reward_weights: Optional[dict] = None  # component weight subset for sweep
 
     # ── convergence ──────────────────────────────────────────────────────────
     rookie_target_wr: float = 0.60    # win rate target vs Psyonix Rookie
@@ -118,9 +119,16 @@ class TrainConfig:
     model_dir: str = 'models/baseline'
     snapshot_dir: str = 'models/baseline/snapshots'
 
+    # ── experiment infrastructure ────────────────────────────────────────────
+    intervention: str = 'none'                    # intervention name for metadata
+    replay_seed_dir: Optional[str] = None         # pre-load replay data into buffer
+    pretrained_encoder_path: Optional[str] = None  # load pre-trained encoder weights
+
     # ── W&B ──────────────────────────────────────────────────────────────────
     wandb_project: str = 'rlbot-baseline'
     wandb_tags: list = field(default_factory=lambda: ['baseline', 'no-intervention'])
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
     no_wandb: bool = False
 
 
@@ -140,7 +148,10 @@ def set_seed(seed: int) -> None:
 
 def build_algo(config: TrainConfig) -> d3rlpy.algos.QLearningAlgoBase:
     """Build a d3rlpy algorithm from config."""
-    encoder_factory = TransformerEncoderFactory(t_window=config.t_window)
+    encoder_factory = TransformerEncoderFactory(
+        t_window=config.t_window,
+        pretrained_weights_path=config.pretrained_encoder_path,
+    )
 
     algo_cls = ALGO_MAP.get(config.algo)
     if algo_cls is None:
@@ -183,10 +194,12 @@ class TrainingCallback:
     evaluation, convergence detection, and W&B eval logging.
     """
 
-    def __init__(self, config: TrainConfig, env: BaselineGymEnv, pool: OpponentPool):
+    def __init__(self, config: TrainConfig, env: BaselineGymEnv, pool: OpponentPool,
+                 axis_tracker=None):
         self.config = config
         self.env = env
         self.pool = pool
+        self.axis_tracker = axis_tracker
         self.parallel_envs: Optional[SubprocVecEnv] = None  # set when num_envs > 1
         self.start_time = time.time()
         self.consecutive_wins = 0
@@ -207,11 +220,12 @@ class TrainingCallback:
         """Log run metadata to W&B."""
         if self._wandb is None or self._wandb.run is None:
             return
+        rc = self.axis_tracker.reward_components if self.axis_tracker else 0
         self._wandb.run.config.update({
             'meta/algorithm': self.config.algo,
             'meta/seed': self.config.seed,
-            'meta/reward_components': 1,
-            'meta/intervention': 'none',
+            'meta/reward_components': rc if rc else (1 if self.config.reward_type == 'sparse' else 7),
+            'meta/intervention': self.config.intervention,
             'meta/reference_bot_primary': 'Psyonix_Rookie',
             'meta/observation_dim': self.config.obs_dim,
             'meta/step_budget': self.config.total_steps,
@@ -293,6 +307,10 @@ class TrainingCallback:
 
         except (ImportError, Exception) as e:
             print(f'  Evaluation skipped: {e}')
+
+        # Log axis costs alongside eval metrics
+        if self.axis_tracker is not None:
+            self.axis_tracker.log(self._wandb, total_step)
 
         # Log to W&B
         if self._wandb is not None and self._wandb.run is not None:
@@ -481,6 +499,7 @@ def fit_online_parallel(
     explorer,
     callback,
     on_episode_complete=None,
+    axis_tracker=None,
 ) -> None:
     """
     Parallel replacement for d3rlpy's fit_online().
@@ -600,6 +619,8 @@ def fit_online_parallel(
                 observations[i] = next_obs
 
         total_step += n_active
+        if axis_tracker is not None:
+            axis_tracker.record_sim_steps(n_active)
         pbar.update(n_active)
 
         # ── gradient updates ──────────────────────────────────────────────
@@ -645,7 +666,7 @@ def fit_online_parallel(
 
 # ── main training function ───────────────────────────────────────────────────
 
-def train(config: TrainConfig) -> None:
+def train(config: TrainConfig, axis_tracker=None) -> None:
     """Run training with the given configuration."""
     assert config.eval_interval > 0, "eval_interval must be positive"
     assert config.total_steps > 0, "total_steps must be positive"
@@ -674,7 +695,11 @@ def train(config: TrainConfig) -> None:
     print(f'  Model dir:  {model_dir}')
 
     # ── environment ──────────────────────────────────────────────────────
-    env = BaselineGymEnv(t_window=config.t_window, reward_type=config.reward_type)
+    env = BaselineGymEnv(
+        t_window=config.t_window,
+        reward_type=config.reward_type,
+        dense_reward_weights=config.dense_reward_weights,
+    )
 
     # ── d3rlpy algorithm ─────────────────────────────────────────────────
     algo = build_algo(config)
@@ -692,7 +717,7 @@ def train(config: TrainConfig) -> None:
     )
 
     # ── callback ─────────────────────────────────────────────────────────
-    callback = TrainingCallback(config, env, pool)
+    callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker)
 
     # ── W&B logging ──────────────────────────────────────────────────────
     if config.no_wandb:
@@ -709,6 +734,16 @@ def train(config: TrainConfig) -> None:
         env=env,
     )
 
+    # ── pre-load replay data into buffer (Axis 2) ──────────────────────
+    if config.replay_seed_dir:
+        from replay_dataset import load_replays_into_buffer
+        n_eps = load_replays_into_buffer(config.replay_seed_dir, buffer)
+        if axis_tracker is not None:
+            # Count .npz files as replays loaded
+            from pathlib import Path as _P
+            n_files = len(list(_P(config.replay_seed_dir).glob('*.npz')))
+            axis_tracker.record_replays(n_files)
+
     # ── run metadata ─────────────────────────────────────────────────────
     callback.log_metadata()
 
@@ -719,11 +754,15 @@ def train(config: TrainConfig) -> None:
         # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
         if not config.no_wandb:
             import wandb
-            wandb.init(
+            run_name = config.wandb_run_name or f'{config.algo}_seed{config.seed}'
+            init_kwargs = dict(
                 project=config.wandb_project,
-                name=f'{config.algo}_seed{config.seed}',
+                name=run_name,
                 config=dataclasses.asdict(config),
             )
+            if config.wandb_group:
+                init_kwargs['group'] = config.wandb_group
+            wandb.init(**init_kwargs)
 
         envs = SubprocVecEnv(
             num_envs=config.num_envs,
@@ -743,6 +782,7 @@ def train(config: TrainConfig) -> None:
                 buffer=buffer,
                 explorer=explorer,
                 callback=callback,
+                axis_tracker=axis_tracker,
             )
         finally:
             envs.close()

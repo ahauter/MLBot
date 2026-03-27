@@ -68,12 +68,14 @@ class BaselineGymEnv(gym.Env):
         tick_skip: int = 8,
         max_steps: int = 4500,  # ~5 min at 15 steps/sec
         reward_type: str = 'sparse',
+        dense_reward_weights: dict | None = None,
     ):
         super().__init__()
         self.t_window = t_window
         self.tick_skip = tick_skip
         self.max_steps = max_steps
         self.reward_type = reward_type
+        self.dense_reward_weights = dense_reward_weights
 
         obs_size = t_window * N_TOKENS * TOKEN_FEATURES
         self.observation_space = gym.spaces.Box(
@@ -206,7 +208,7 @@ class BaselineGymEnv(gym.Env):
     def _make_reward(self):
         if self.reward_type == 'dense':
             from dense_reward import DenseRewardFunction
-            return DenseRewardFunction()
+            return DenseRewardFunction(weights=self.dense_reward_weights)
         return self._make_sparse_reward()
 
     def _make_sparse_reward(self):

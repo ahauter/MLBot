@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -112,12 +112,26 @@ class TransformerEncoderFactory(EncoderFactory):
     ----------
     t_window : int
         Frame history length (must match the gym env's t_window).
+    pretrained_weights_path : str or None
+        Path to pre-trained SharedTransformerEncoder weights. If set, the
+        encoder's weights are initialised from this checkpoint before
+        d3rlpy training begins.
     """
 
     t_window: int = 8
+    pretrained_weights_path: Optional[str] = None
+
+    def _load_pretrained(self, enc: _TransformerEncoder) -> None:
+        """Load pre-trained weights into the encoder if path is set."""
+        if self.pretrained_weights_path is None:
+            return
+        state_dict = torch.load(self.pretrained_weights_path, map_location='cpu')
+        enc.encoder.load_state_dict(state_dict, strict=False)
 
     def create(self, observation_shape: Shape) -> _TransformerEncoder:
-        return _TransformerEncoder(self.t_window)
+        enc = _TransformerEncoder(self.t_window)
+        self._load_pretrained(enc)
+        return enc
 
     def create_with_action(
         self,
@@ -125,7 +139,11 @@ class TransformerEncoderFactory(EncoderFactory):
         action_size: int,
         discrete_action: bool = False,
     ) -> _TransformerEncoderWithAction:
-        return _TransformerEncoderWithAction(self.t_window, action_size)
+        enc = _TransformerEncoderWithAction(self.t_window, action_size)
+        if self.pretrained_weights_path is not None:
+            state_dict = torch.load(self.pretrained_weights_path, map_location='cpu')
+            enc.obs_encoder.encoder.load_state_dict(state_dict, strict=False)
+        return enc
 
     @staticmethod
     def get_type() -> str:

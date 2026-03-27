@@ -1,0 +1,51 @@
+# Algorithm Comparison
+# ====================
+# Same conditions (sparse reward, no data), different algorithms.
+# Establishes whether algorithm choice itself is a meaningful
+# axis of variation before testing cross-axis interactions.
+
+name: algo_comparison
+description: >
+  Compare AWAC, SAC, and TD3 under identical conditions (sparse reward,
+  no data, same hyperparameters where applicable). Isolates algorithm
+  choice from the five resource axes.
+intervention: none
+
+base_config:
+  reward_type: sparse
+  total_steps: 50000000
+  eval_interval: 200000
+  batch_size: 256
+  gamma: 0.99
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  tau: 0.005
+  explore_noise: 0.1
+
+budget:
+  sim_steps: 50000000
+  num_replays: 0
+  num_labels: 0
+  reward_components: 0
+  pretrain_gpu_hours: 0.0
+
+seeds: [0, 1, 2, 3, 4]
+
+sweep:
+  - name: awac
+    overrides:
+      algo: AWAC
+      awac_lambda: 1.0
+
+  - name: sac
+    overrides:
+      algo: SAC
+
+  - name: td3
+    overrides:
+      algo: TD3
+
+wandb_project: rlbot-baseline
+wandb_tags:
+  - comparison
+  - algorithm

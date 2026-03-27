@@ -1,0 +1,70 @@
+# Cross-Axis: Axis 2 × 4 (Data vs Reward Engineering)
+# ====================================================
+# Tests whether more replay data reduces the need for
+# reward engineering, or vice versa.
+# 2×2 factorial: {no_data, data} × {sparse, dense}
+
+name: data_vs_reward
+description: >
+  2×2 factorial crossing replay data (0 vs 500 replays) with reward
+  type (sparse vs dense). Tests whether Axis 2 and Axis 4 are
+  substitutes, complements, or independent.
+intervention: data_x_reward
+
+base_config:
+  algo: AWAC
+  total_steps: 50000000
+  eval_interval: 200000
+  batch_size: 256
+  gamma: 0.99
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  tau: 0.005
+  awac_lambda: 1.0
+  explore_noise: 0.1
+
+budget:
+  sim_steps: 50000000
+  num_replays: 0
+  num_labels: 0
+  reward_components: 0
+  pretrain_gpu_hours: 0.0
+
+seeds: [0, 1, 2, 3, 4]
+
+sweep:
+  - name: no_data_sparse
+    overrides:
+      reward_type: sparse
+    budget_overrides:
+      num_replays: 0
+      reward_components: 0
+
+  - name: no_data_dense
+    overrides:
+      reward_type: dense
+    budget_overrides:
+      num_replays: 0
+      reward_components: 7
+
+  - name: data_500_sparse
+    overrides:
+      reward_type: sparse
+      replay_seed_dir: training/replay_data/parsed_500
+    budget_overrides:
+      num_replays: 500
+      reward_components: 0
+
+  - name: data_500_dense
+    overrides:
+      reward_type: dense
+      replay_seed_dir: training/replay_data/parsed_500
+    budget_overrides:
+      num_replays: 500
+      reward_components: 7
+
+wandb_project: rlbot-baseline
+wandb_tags:
+  - cross-axis
+  - axis2-x-axis4
+  - data-vs-reward

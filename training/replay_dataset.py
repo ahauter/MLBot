@@ -1,52 +1,53 @@
 """
 replay_dataset.py
 =================
-Loads parsed replay .npz files into the SequenceReplayBuffer for offline RL.
+Loads parsed replay .npz files into a d3rlpy replay buffer for offline RL
+or online buffer seeding.
 
-Each .npz is segmented into episodes using the `dones` array (split on True).
-Each episode is added as a trajectory of (obs, action, reward, done) tuples,
-matching the format expected by SequenceReplayBuffer.add_episode().
+Each .npz is segmented into episodes using the ``dones`` array (split on True).
+Observations are frame-stacked from the raw (T, N, F) tokens to match the
+flat (T_WINDOW * N * F,) format used by BaselineGymEnv.
 
 Files missing the 'actions' key (old format) are silently skipped — re-parse
 them with collect_replays.py --no-resume to regenerate.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
 
-from replay_buffer import SequenceReplayBuffer
-
 
 def load_replays_into_buffer(
     parsed_dir: str | Path,
-    buffer: SequenceReplayBuffer,
+    buffer,
+    t_window: int = 8,
     min_episode_len: int = 2,
 ) -> int:
     """
-    Load all replay npz files from `parsed_dir` into `buffer`.
+    Load all replay npz files from ``parsed_dir`` into a d3rlpy replay buffer.
 
     Segments each replay into episodes by splitting on done=True per player,
-    then calls buffer.add_episode() for each valid episode.
+    then appends transitions using d3rlpy's ``buffer.append()`` /
+    ``buffer.clip_episode()`` interface.
 
     Parameters
     ----------
     parsed_dir      : directory containing .npz files from replay_sampler.py
-    buffer          : SequenceReplayBuffer to fill
-    min_episode_len : skip episodes shorter than this (e.g. stray frames)
+    buffer          : d3rlpy FIFOReplayBuffer (supports append/clip_episode)
+    t_window        : number of frames to stack (must match training env)
+    min_episode_len : skip episodes shorter than this
 
     Returns
     -------
     Total number of episodes added.
     """
     parsed_dir = Path(parsed_dir)
-    npz_files  = sorted(parsed_dir.glob('*.npz'))
+    npz_files = sorted(parsed_dir.glob('*.npz'))
 
-    total_eps   = 0
+    total_eps = 0
     total_files = 0
-    skipped     = 0
+    skipped = 0
 
     for path in npz_files:
         data = np.load(path)
@@ -55,10 +56,10 @@ def load_replays_into_buffer(
             skipped += 1
             continue
 
-        tokens  = data['tokens']   # (T, 2, N, F)
+        tokens = data['tokens']    # (T, 2, N, F)
         actions = data['actions']  # (T, 2, 8)
         rewards = data['rewards']  # (T, 2)
-        dones   = data['dones']    # (T, 2) bool
+        dones = data['dones']      # (T, 2) bool
         T = len(tokens)
 
         # Each player perspective is an independent trajectory
@@ -68,31 +69,19 @@ def load_replays_into_buffer(
                 if dones[t, player]:
                     ep_len = t - ep_start + 1
                     if ep_len >= min_episode_len:
-                        trajectory = [
-                            (
-                                tokens[i, player],          # (N, F) float32
-                                actions[i, player],         # (8,)   float32
-                                float(rewards[i, player]),  # scalar
-                                bool(dones[i, player]),     # done
-                            )
-                            for i in range(ep_start, t + 1)
-                        ]
-                        buffer.add_episode(trajectory)
+                        _flush_episode(
+                            buffer, tokens, actions, rewards, dones,
+                            player, ep_start, t + 1, t_window,
+                        )
                         total_eps += 1
                     ep_start = t + 1
-            # Flush the final episode (frames after the last done signal).
-            # Replays that end by time expiry have no trailing done=True.
+
+            # Flush the final episode (frames after the last done signal)
             if ep_start < T and (T - ep_start) >= min_episode_len:
-                trajectory = [
-                    (
-                        tokens[i, player],
-                        actions[i, player],
-                        float(rewards[i, player]),
-                        i == T - 1,   # mark the last frame as done
-                    )
-                    for i in range(ep_start, T)
-                ]
-                buffer.add_episode(trajectory)
+                _flush_episode(
+                    buffer, tokens, actions, rewards, dones,
+                    player, ep_start, T, t_window,
+                )
                 total_eps += 1
 
         total_files += 1
@@ -102,3 +91,36 @@ def load_replays_into_buffer(
         + (f' ({skipped} skipped — missing actions, re-parse to fix)' if skipped else '')
     )
     return total_eps
+
+
+def _flush_episode(
+    buffer, tokens, actions, rewards, dones,
+    player: int, start: int, end: int, t_window: int,
+) -> None:
+    """
+    Frame-stack and flush one episode segment to the d3rlpy buffer.
+
+    Each transition's observation is a flat vector matching BaselineGymEnv's
+    (T_WINDOW * N * F,) format.
+    """
+    N, F = tokens.shape[2], tokens.shape[3]
+
+    for i in range(start, end):
+        # Build frame-stacked observation: take t_window frames ending at i
+        frames = []
+        for t_idx in range(i - t_window + 1, i + 1):
+            if t_idx < start:
+                frames.append(tokens[start, player])  # pad with first frame
+            else:
+                frames.append(tokens[t_idx, player])
+        stacked = np.stack(frames, axis=0)  # (T_WINDOW, N, F)
+        obs_flat = stacked.ravel().astype(np.float32)
+
+        action = actions[i, player].astype(np.float32)
+        reward = float(rewards[i, player])
+
+        buffer.append(obs_flat, action, reward)
+
+    # Clip episode — True if it ended naturally (done), False if truncated
+    is_terminal = bool(dones[end - 1, player]) if end > 0 else False
+    buffer.clip_episode(is_terminal)
