@@ -361,9 +361,18 @@ def main():
                         help='Auto-launch baseline seeds after tuning completes')
     parser.add_argument('--n-seeds', type=int, default=10,
                         help='Number of seeds to launch (default: 10)')
+    parser.add_argument('--reset', action='store_true',
+                        help='Delete existing study and start HP tuning from scratch')
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if args.reset:
+        try:
+            optuna.delete_study(study_name=args.study_name, storage=args.storage)
+            print(f'Deleted existing study "{args.study_name}".')
+        except KeyError:
+            print(f'No existing study "{args.study_name}" found — starting fresh.')
 
     study = optuna.create_study(
         direction='maximize',
@@ -374,7 +383,7 @@ def main():
         sampler=TPESampler(seed=42),
         storage=args.storage,
         study_name=args.study_name,
-        load_if_exists=True,
+        load_if_exists=not args.reset,
     )
 
     if args.show_best:

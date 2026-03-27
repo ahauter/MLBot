@@ -32,6 +32,7 @@ import multiprocessing
 import multiprocessing.connection
 import random
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,8 +99,12 @@ class TrainConfig:
     random_steps: int = 10_000        # random actions before training starts
 
     # ── d3rlpy fit_online settings ───────────────────────────────────────────
-    update_interval: int = 1          # gradient updates per env step
+    update_interval: int = 1          # gradient updates per env step (sequential path only)
     n_steps_per_epoch: int = 10_000   # steps per d3rlpy epoch (logging granularity)
+
+    # ── async training (parallel path) ───────────────────────────────────────
+    collection_buffer_size: int = 50_000  # transitions to collect before triggering training
+    updates_per_swap: int = 500           # gradient steps per training trigger
 
     # ── parallel environments ─────────────────────────────────────────────
     num_envs: int = 1                 # parallel RLGym-sim envs (1 = sequential)
@@ -466,6 +471,71 @@ class SubprocVecEnv:
         )
 
 
+# ── async gradient trainer ───────────────────────────────────────────────────
+
+class AsyncTrainer:
+    """
+    Runs gradient updates in a background thread, decoupled from env collection.
+
+    The main collection loop calls trigger() when enough transitions have been
+    gathered. The training thread wakes up, does N gradient steps, then sleeps
+    until the next trigger. Collection never blocks on GPU.
+    """
+
+    def __init__(self, algo, buffer, batch_size: int, lock: threading.Lock, wandb=None):
+        self.algo = algo
+        self.buffer = buffer
+        self.batch_size = batch_size
+        self.lock = lock
+        self.last_loss: dict = {}
+
+        self._wandb = wandb
+        self._trigger_step = 0    # total_step at time of trigger — W&B x-axis anchor
+        self._total_updates = 0   # running count of gradient steps across all triggers
+
+        self._trigger = threading.Event()
+        self._stop = threading.Event()
+        self._n_updates = 0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def trigger(self, n_updates: int, total_step: int) -> None:
+        """Called from main thread: kick off n_updates gradient steps."""
+        self._n_updates = n_updates
+        self._trigger_step = total_step
+        self._trigger.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._trigger.set()  # unblock if waiting
+        self._thread.join()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._trigger.wait()
+            self._trigger.clear()
+            if self._stop.is_set():
+                break
+            for _ in range(self._n_updates):
+                with self.lock:
+                    if self.buffer.transition_count < self.batch_size:
+                        break
+                    batch = self.buffer.sample_transition_batch(self.batch_size)
+
+                update_start = time.time()
+                self.last_loss = self.algo.update(batch)
+                update_ms = (time.time() - update_start) * 1000
+                self._total_updates += 1
+
+                if self._wandb is not None and self._wandb.run is not None:
+                    metrics = {f'train/{k}': v for k, v in self.last_loss.items()}
+                    metrics['train/total_gradient_updates'] = self._total_updates
+                    metrics['train/update_ms'] = update_ms
+                    with self.lock:
+                        metrics['buffer/transition_count'] = self.buffer.transition_count
+                    self._wandb.log(metrics, step=self._trigger_step)
+
+
 # ── parallel online training loop ────────────────────────────────────────────
 
 def fit_online_parallel(
@@ -493,7 +563,7 @@ def fit_online_parallel(
     """
     from tqdm import trange
     num_envs = config.num_envs
-    log_interval = 10_000  # log metrics every N steps
+
 
     # W&B logging (active if wandb.run was initialized by caller)
     try:
@@ -519,6 +589,11 @@ def fit_online_parallel(
     local_blue = [[] for _ in range(num_envs)]
     local_orange = [[] for _ in range(num_envs)]
     rollout_returns = np.zeros(num_envs)
+
+    # Async trainer: GPU updates run in background, never blocking collection
+    buf_lock = threading.Lock()
+    trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock, wandb=_wandb)
+    collected_since_trigger = 0
 
     total_step = 0
     pending_resets: set = set()  # env indices waiting for async reset
@@ -565,15 +640,15 @@ def fit_online_parallel(
             rollout_returns[i] += float(reward)
 
             if done:
-                # Flush blue episode to buffer
-                for obs, act, rew in local_blue[i]:
-                    buffer.append(obs, act, rew)
-                buffer.clip_episode(bool(not truncated))
+                # Flush blue and orange episodes to buffer (locked for trainer thread safety)
+                with buf_lock:
+                    for obs, act, rew in local_blue[i]:
+                        buffer.append(obs, act, rew)
+                    buffer.clip_episode(bool(not truncated))
 
-                # Flush orange episode to buffer
-                for obs, act, rew in local_orange[i]:
-                    buffer.append(obs, act, rew)
-                buffer.clip_episode(bool(not truncated))
+                    for obs, act, rew in local_orange[i]:
+                        buffer.append(obs, act, rew)
+                    buffer.clip_episode(bool(not truncated))
 
                 if on_episode_complete is not None:
                     on_episode_complete(rollout_returns[i])
@@ -595,31 +670,45 @@ def fit_online_parallel(
                 observations[i] = next_obs
 
         total_step += n_active
+        collected_since_trigger += n_active
         pbar.update(n_active)
 
-        # ── gradient updates ──────────────────────────────────────────────
+        # ── trigger async training ────────────────────────────────────────
         if (
-            total_step > max(config.update_start_step if hasattr(config, 'update_start_step') else 0,
-                             config.random_steps)
-            and buffer.transition_count > algo.batch_size
+            total_step > config.random_steps
+            and collected_since_trigger >= config.collection_buffer_size
         ):
-            if total_step % config.update_interval < num_envs:
-                batch = buffer.sample_transition_batch(algo.batch_size)
-                loss_dict = algo.update(batch)
+            trainer.trigger(config.updates_per_swap, total_step)
+            collected_since_trigger = 0
 
-                if _wandb and total_step % log_interval < num_envs:
-                    metrics = {f'train/{k}': v for k, v in loss_dict.items()}
-                    elapsed = time.time() - start_wall
-                    metrics['timing/steps_per_second'] = total_step / max(elapsed, 1e-6)
-                    metrics['timing/wall_clock_seconds'] = elapsed
-                    _wandb.log(metrics, step=total_step)
-
-        # ── callback (epoch boundaries) ───────────────────────────────────
+        # ── callback + axis logging (epoch boundaries) ────────────────────
         epoch = total_step // config.n_steps_per_epoch
         if callback and total_step % config.n_steps_per_epoch < num_envs:
             callback(algo, epoch, total_step)
+            if _wandb is not None and _wandb.run is not None:
+                elapsed = time.time() - start_wall
+                with buf_lock:
+                    buf_count = buffer.transition_count
+                _wandb.log({
+                    # Axis 1 — simulation steps (key research metric)
+                    'axis1/total_env_steps': total_step,
+                    # Axes 2-5 — zero for baseline, always logged for cross-run consistency
+                    'axis2/total_replays_loaded': 0,
+                    'axis3/total_labels_consumed': 0,
+                    'axis4/reward_components': 1,
+                    'axis5/pretrain_gpu_hours': 0.0,
+                    # Collection health
+                    'collect/buffer_transition_count': buf_count,
+                    'collect/num_envs': num_envs,
+                    # Throughput
+                    'timing/steps_per_second': total_step / max(elapsed, 1e-6),
+                    'timing/wall_clock_seconds': int(elapsed),
+                }, step=total_step)
 
     pbar.close()
+
+    # Stop async trainer thread
+    trainer.stop()
 
     # Drain any pending async resets so pipes are clean for the next trial
     for i in list(pending_resets):
@@ -822,6 +911,10 @@ def main():
     parser.add_argument('--n-steps-per-epoch', type=int, default=10_000)
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments (default: 1 = sequential)')
+    parser.add_argument('--collection-buffer-size', type=int, default=50_000,
+                        help='Transitions to collect before triggering async training (parallel path)')
+    parser.add_argument('--updates-per-swap', type=int, default=500,
+                        help='Gradient steps per training trigger (parallel path)')
 
     # Paths
     parser.add_argument('--model-dir', default='models/baseline')
@@ -854,6 +947,8 @@ def main():
         snapshot_interval=args.snapshot_interval,
         n_steps_per_epoch=args.n_steps_per_epoch,
         num_envs=args.num_envs,
+        collection_buffer_size=args.collection_buffer_size,
+        updates_per_swap=args.updates_per_swap,
         model_dir=args.model_dir,
         no_wandb=args.no_wandb,
         wandb_project=args.wandb_project,
