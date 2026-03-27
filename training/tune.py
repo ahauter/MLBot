@@ -96,10 +96,11 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None) -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
+              shared_envs=None, eval_episodes: int = 20) -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
-    return mean episode reward.
+    return win rate against random opponent.
     """
     import d3rlpy
     from d3rlpy.algos.qlearning.explorers import NormalNoise
@@ -264,6 +265,16 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
                 show_progress=False,
                 callback=callback,
             )
+        # Run sim evaluation to get win rate as objective
+        from evaluate import run_sim_evaluation
+        eval_result = run_sim_evaluation(
+            algo=algo,
+            opponent=None,
+            n_episodes=eval_episodes,
+            t_window=t_window,
+            tier_name='Random',
+        )
+        objective_value = eval_result.win_rate
     except Exception as e:
         try:
             import optuna
@@ -292,10 +303,9 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
         except ImportError:
             pass
 
-    mean_reward = _mean_return(100)
-    assert not np.isnan(mean_reward), \
-        f"Trial {trial.number}: NaN reward — training diverged"
-    return mean_reward
+    assert not np.isnan(objective_value), \
+        f"Trial {trial.number}: NaN objective — evaluation failed"
+    return objective_value
 
 
 # ── auto-seed launcher ──────────────────────────────────────────────────────
@@ -357,6 +367,8 @@ def main():
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments per trial (default: 1)')
+    parser.add_argument('--eval-episodes', type=int, default=20,
+                        help='Episodes per evaluation at end of each trial (default: 20)')
     parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--show-best', action='store_true')
     parser.add_argument('--study-name', default=STUDY_NAME)
@@ -415,7 +427,7 @@ def main():
         study.optimize(
             lambda trial: objective(
                 trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-                shared_envs=shared_envs,
+                shared_envs=shared_envs, eval_episodes=args.eval_episodes,
             ),
             n_trials=args.n_trials,
             show_progress_bar=True,
