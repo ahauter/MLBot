@@ -29,6 +29,7 @@ import argparse
 import dataclasses
 import json
 import multiprocessing
+from collections import deque
 import multiprocessing.connection
 import random
 import sys
@@ -647,6 +648,8 @@ def fit_online_parallel(
     local_blue = [[] for _ in range(num_envs)]
     local_orange = [[] for _ in range(num_envs)]
     rollout_returns = np.zeros(num_envs)
+    recent_returns: deque = deque(maxlen=100)  # rolling window for avg reward logging
+    recent_goals: deque = deque(maxlen=100)    # 1=blue scored, -1=orange scored, 0=timeout
 
     # Async trainer: GPU updates run in background, never blocking collection
     buf_lock = threading.Lock()
@@ -711,10 +714,14 @@ def fit_online_parallel(
                 if on_episode_complete is not None:
                     on_episode_complete(rollout_returns[i])
 
+                recent_returns.append(rollout_returns[i])
+                recent_goals.append(info.get('goal', 0))
+
                 if _wandb:
                     _wandb.log({
                         'rollout/episode_return': rollout_returns[i],
                         'rollout/episode_length': len(local_blue[i]),
+                        'rollout/goal': info.get('goal', 0),
                     }, step=total_step)
 
                 local_blue[i] = []
@@ -753,7 +760,12 @@ def fit_online_parallel(
                 elapsed = time.time() - start_wall
                 with buf_lock:
                     buf_count = buffer.transition_count
+                goals = list(recent_goals)
                 _wandb.log({
+                    # Rolling average reward and goal rates (last 100 episodes)
+                    'rollout/avg_episode_return': float(np.mean(recent_returns)) if recent_returns else 0.0,
+                    'rollout/score_rate': float(np.mean([g == 1 for g in goals])) if goals else 0.0,
+                    'rollout/concede_rate': float(np.mean([g == -1 for g in goals])) if goals else 0.0,
                     # Axis 1 — simulation steps (key research metric)
                     'consumed_resources/env_steps': total_step,
                     # Axes 2-5 — zero for baseline, always logged for cross-run consistency

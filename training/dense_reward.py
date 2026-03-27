@@ -143,6 +143,11 @@ class DenseRewardFunction(RewardFunction):
         """Number of active (non-zero weight) step components."""
         return sum(1 for w in self._weights.values() if w != 0.0)
 
+    @property
+    def max_step_reward(self) -> float:
+        """Theoretical maximum per-step reward (all components at their peak)."""
+        return sum(max(0.0, v) for v in self._weights.values())
+
     def reset(self, initial_state: GameState) -> None:
         self._prev_ball_dist.clear()
 

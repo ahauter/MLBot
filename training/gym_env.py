@@ -92,6 +92,7 @@ class BaselineGymEnv(gym.Env):
         self._blue_buf: deque = deque(maxlen=t_window)
         self._orange_buf: deque = deque(maxlen=t_window)
         self._step_count = 0
+        self._dense_reward_fn = None
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -145,7 +146,8 @@ class BaselineGymEnv(gym.Env):
         opp_action = self._get_opponent_action()
         assert opp_action.shape == (8,), f"Bad opponent action: {opp_action.shape}"
 
-        obs_list, rewards, terminated, truncated = self._env.step(
+        # rlgym-sim returns a 4-tuple: (obs, rewards, done, info)
+        obs_list, rewards, terminated, _info = self._env.step(
             np.stack([action, opp_action], axis=0)
         )
         blue_obs, orange_obs = self._parse_obs(obs_list)
@@ -159,23 +161,42 @@ class BaselineGymEnv(gym.Env):
         # Use rlgym-sim's computed reward directly — SparseGoalReward returns
         # 0.0 per step via get_reward() and +1/-1 on terminal via get_final_reward().
         # rlgym-sim combines both into the rewards array automatically.
-        reward = float(rewards[0])  # blue player's reward
+        blue_reward = float(rewards[0])
+        orange_reward = float(rewards[1])
+
         if self.reward_type == 'sparse':
-            assert -1.0 <= reward <= 1.0, f"Reward out of range: {reward}"
-            if not (terminated or truncated):
-                assert reward == 0.0, \
-                    f"Non-zero mid-episode reward: {reward} (reward leakage!)"
+            assert -1.0 <= blue_reward <= 1.0, f"Reward out of range: {blue_reward}"
+            if not terminated:
+                assert blue_reward == 0.0, \
+                    f"Non-zero mid-episode reward: {blue_reward} (reward leakage!)"
+
+        # When a goal is scored in dense mode, credit the scorer with the max
+        # per-step reward for each remaining frame so early scoring is never
+        # penalised relative to passively collecting dense reward until timeout.
+        if terminated and self.reward_type == 'dense' and self._dense_reward_fn is not None:
+            remaining = max(0, self.max_steps - self._step_count)
+            if remaining > 0:
+                bonus = remaining * self._dense_reward_fn.max_step_reward
+                ball_y = _info['state'].ball.position[1]
+                if ball_y > _GOAL_Y:       # blue scored
+                    blue_reward += bonus
+                elif ball_y < -_GOAL_Y:    # orange scored
+                    orange_reward += bonus
 
         # Timeout
         timed_out = self._step_count >= self.max_steps
-        done = bool(terminated or truncated or timed_out)
+        done = bool(terminated or timed_out)
 
         obs = self._get_stacked_obs()
+        ball_y = _info['state'].ball.position[1]
+        goal = (1 if ball_y > _GOAL_Y else -1) if terminated else 0
         info = {
             'orange_obs': self._get_stacked_orange_obs(),
             'orange_action': opp_action,
-            'orange_reward': float(rewards[1]),
+            'orange_reward': orange_reward,
+            'goal': goal,  # 1=blue scored, -1=orange scored, 0=no goal
         }
+        reward = blue_reward
         return obs, reward, done, False, info
 
     def close(self) -> None:
@@ -208,7 +229,8 @@ class BaselineGymEnv(gym.Env):
     def _make_reward(self):
         if self.reward_type == 'dense':
             from dense_reward import DenseRewardFunction
-            return DenseRewardFunction(weights=self.dense_reward_weights)
+            self._dense_reward_fn = DenseRewardFunction(weights=self.dense_reward_weights)
+            return self._dense_reward_fn
         return self._make_sparse_reward()
 
     def _make_sparse_reward(self):
