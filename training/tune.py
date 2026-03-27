@@ -135,7 +135,10 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
         pass  # psutil not installed — skip memory guard
 
     if shared_envs is not None:
-        shared_envs.assert_workers_alive()
+        n_dead = sum(1 for p in shared_envs._procs if not p.is_alive())
+        if n_dead:
+            print(f'[tune] Warning: {n_dead}/{shared_envs.num_envs} workers died — respawning before trial {trial.number}', file=sys.stderr)
+            shared_envs.respawn_dead()
 
     t_window = 8
     encoder_factory = TransformerEncoderFactory(t_window=t_window)

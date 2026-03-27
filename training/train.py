@@ -372,6 +372,9 @@ class SubprocVecEnv:
     def __init__(self, num_envs: int, t_window: int = 8, tick_skip: int = 8,
                  max_steps: int = 4500):
         self.num_envs = num_envs
+        self._t_window = t_window
+        self._tick_skip = tick_skip
+        self._max_steps = max_steps
         self._parents: List[multiprocessing.connection.Connection] = []
         self._procs: List[multiprocessing.Process] = []
 
@@ -457,6 +460,29 @@ class SubprocVecEnv:
             except OSError:
                 pass
 
+    def respawn_dead(self) -> int:
+        """Respawn any dead worker processes. Returns number respawned."""
+        ctx = multiprocessing.get_context('spawn')
+        respawned = 0
+        for i, proc in enumerate(self._procs):
+            if not proc.is_alive():
+                try:
+                    self._parents[i].close()
+                except OSError:
+                    pass
+                parent_conn, child_conn = ctx.Pipe()
+                new_proc = ctx.Process(
+                    target=_env_worker,
+                    args=(child_conn, self._t_window, self._tick_skip, self._max_steps),
+                    daemon=True,
+                )
+                new_proc.start()
+                child_conn.close()
+                self._parents[i] = parent_conn
+                self._procs[i] = new_proc
+                respawned += 1
+        return respawned
+
     def assert_workers_alive(self) -> None:
         """Assert all worker processes are still alive. Call at start of each trial."""
         dead = [p.pid for p in self._procs if not p.is_alive()]
@@ -482,16 +508,16 @@ class AsyncTrainer:
     until the next trigger. Collection never blocks on GPU.
     """
 
-    def __init__(self, algo, buffer, batch_size: int, lock: threading.Lock, wandb=None):
+    def __init__(self, algo, buffer, batch_size: int, lock: threading.Lock):
         self.algo = algo
         self.buffer = buffer
         self.batch_size = batch_size
         self.lock = lock
         self.last_loss: dict = {}
 
-        self._wandb = wandb
-        self._trigger_step = 0    # total_step at time of trigger — W&B x-axis anchor
         self._total_updates = 0   # running count of gradient steps across all triggers
+        self._pending_metrics: dict = {}
+        self._metrics_lock = threading.Lock()
 
         self._trigger = threading.Event()
         self._stop = threading.Event()
@@ -499,11 +525,17 @@ class AsyncTrainer:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def trigger(self, n_updates: int, total_step: int) -> None:
+    def trigger(self, n_updates: int) -> None:
         """Called from main thread: kick off n_updates gradient steps."""
         self._n_updates = n_updates
-        self._trigger_step = total_step
         self._trigger.set()
+
+    def pop_metrics(self) -> dict:
+        """Drain pending training metrics. Thread-safe. Call from main thread."""
+        with self._metrics_lock:
+            m = self._pending_metrics
+            self._pending_metrics = {}
+            return m
 
     def stop(self) -> None:
         self._stop.set()
@@ -516,24 +548,26 @@ class AsyncTrainer:
             self._trigger.clear()
             if self._stop.is_set():
                 break
+            losses, update_ms_list = [], []
             for _ in range(self._n_updates):
                 with self.lock:
                     if self.buffer.transition_count < self.batch_size:
                         break
                     batch = self.buffer.sample_transition_batch(self.batch_size)
-
                 update_start = time.time()
                 self.last_loss = self.algo.update(batch)
-                update_ms = (time.time() - update_start) * 1000
+                update_ms_list.append((time.time() - update_start) * 1000)
                 self._total_updates += 1
-
-                if self._wandb is not None and self._wandb.run is not None:
-                    metrics = {f'train/{k}': v for k, v in self.last_loss.items()}
-                    metrics['train/total_gradient_updates'] = self._total_updates
-                    metrics['train/update_ms'] = update_ms
-                    with self.lock:
-                        metrics['buffer/transition_count'] = self.buffer.transition_count
-                    self._wandb.log(metrics, step=self._trigger_step)
+                losses.append(self.last_loss)
+            if losses:
+                avg = {f'train/{k}': float(np.mean([l[k] for l in losses]))
+                       for k in losses[0]}
+                avg['train/total_gradient_updates'] = self._total_updates
+                avg['train/update_ms'] = float(np.mean(update_ms_list))
+                with self.lock:
+                    avg['buffer/transition_count'] = self.buffer.transition_count
+                with self._metrics_lock:
+                    self._pending_metrics = avg
 
 
 # ── parallel online training loop ────────────────────────────────────────────
@@ -592,7 +626,7 @@ def fit_online_parallel(
 
     # Async trainer: GPU updates run in background, never blocking collection
     buf_lock = threading.Lock()
-    trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock, wandb=_wandb)
+    trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock)
     collected_since_trigger = 0
 
     total_step = 0
@@ -678,7 +712,11 @@ def fit_online_parallel(
             total_step > config.random_steps
             and collected_since_trigger >= config.collection_buffer_size
         ):
-            trainer.trigger(config.updates_per_swap, total_step)
+            if _wandb is not None and _wandb.run is not None:
+                pending = trainer.pop_metrics()
+                if pending:
+                    _wandb.log(pending, step=total_step)
+            trainer.trigger(config.updates_per_swap)
             collected_since_trigger = 0
 
         # ── callback + axis logging (epoch boundaries) ────────────────────
@@ -691,12 +729,12 @@ def fit_online_parallel(
                     buf_count = buffer.transition_count
                 _wandb.log({
                     # Axis 1 — simulation steps (key research metric)
-                    'axis1/total_env_steps': total_step,
+                    'consumed_resources/env_steps': total_step,
                     # Axes 2-5 — zero for baseline, always logged for cross-run consistency
-                    'axis2/total_replays_loaded': 0,
-                    'axis3/total_labels_consumed': 0,
-                    'axis4/reward_components': 1,
-                    'axis5/pretrain_gpu_hours': 0.0,
+                    'consumed_resources/replays_loaded': 0,
+                    'consumed_resources/labels_consumed': 0,
+                    'consumed_resources/reward_components': 1,
+                    'consumed_resources/pretrain_gpu_hours': 0.0,
                     # Collection health
                     'collect/buffer_transition_count': buf_count,
                     'collect/num_envs': num_envs,
