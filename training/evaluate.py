@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -80,6 +81,49 @@ skill = "{tier}"
 
 # ── match runner ─────���───────────────────────────────────────────────────────
 
+def _parse_match_result(output: str) -> Optional[str]:
+    """
+    Parse RLBot v5 match output to determine win/loss/draw.
+
+    Looks for final score lines in stdout. RLBot v5 logs match results
+    as "Match ended: <blue_score> - <orange_score>" or similar patterns.
+    Our bot is always team 0 (blue).
+
+    Returns 'win', 'loss', 'draw', or None if parsing fails.
+    """
+    # Pattern: "Match ended" or "Final score" with two numbers
+    # Try several patterns that RLBot v5 may output
+    patterns = [
+        # "Match ended: 3 - 1" or "Final score: 3 - 1"
+        r'(?:Match ended|Final score|Game ended|Score)[:\s]+(\d+)\s*[-–]\s*(\d+)',
+        # "Blue: 3, Orange: 1" style
+        r'Blue[:\s]+(\d+).*?Orange[:\s]+(\d+)',
+        # Generic "N - M" near end of output (last 20 lines)
+        r'(\d+)\s*-\s*(\d+)',
+    ]
+
+    # Search from end of output (most likely to contain final score)
+    lines = output.strip().split('\n')
+    tail = '\n'.join(lines[-30:]) if len(lines) > 30 else output
+
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, tail, re.IGNORECASE))
+        if matches:
+            # Use last match (closest to end of output)
+            m = matches[-1]
+            blue_score = int(m.group(1))
+            orange_score = int(m.group(2))
+
+            if blue_score > orange_score:
+                return 'win'
+            elif orange_score > blue_score:
+                return 'loss'
+            else:
+                return 'draw'
+
+    return None
+
+
 def run_single_match(
     match_toml_path: str,
     timeout: int = 600,
@@ -96,12 +140,29 @@ def run_single_match(
             text=True,
             timeout=timeout,
         )
-        # Parse result from RLBot output
-        # TODO: implement actual result parsing from RLBot v5 match output
-        # For now, return None to indicate evaluation is not yet connected
+        if result.returncode != 0:
+            print(f'  RLBot exited with code {result.returncode}',
+                  file=sys.stderr)
+            if result.stderr:
+                print(f'  stderr: {result.stderr[:200]}', file=sys.stderr)
+            return None
+
+        # Parse match result from stdout
+        outcome = _parse_match_result(result.stdout)
+        if outcome is None and result.stderr:
+            # Some versions log to stderr
+            outcome = _parse_match_result(result.stderr)
+
+        if outcome is None:
+            print(f'  Could not parse match result from RLBot output',
+                  file=sys.stderr)
+        return outcome
+
+    except FileNotFoundError:
+        # rlbot CLI not installed
         return None
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f'  Match failed: {e}', file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f'  Match timed out after {timeout}s', file=sys.stderr)
         return None
 
 

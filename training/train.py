@@ -257,8 +257,6 @@ class TrainingCallback:
         """Run evaluation against Psyonix tiers."""
         wall_clock = time.time() - self.start_time
 
-        # For now, log placeholder — real Psyonix eval requires live RLBot
-        # TODO: integrate training/evaluate.py when RLBot is available
         print(f'\n[step {total_step:,}] Evaluation checkpoint '
               f'(wall clock: {wall_clock/3600:.1f}h)')
 

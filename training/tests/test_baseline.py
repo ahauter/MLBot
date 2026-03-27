@@ -262,6 +262,22 @@ class TestEvalConfig:
         assert toml.count('[[cars]]') == 2, \
             "Expected 2 [[cars]] sections in TOML"
 
+    def test_parse_match_result_win(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Match ended: 3 - 1') == 'win'
+
+    def test_parse_match_result_loss(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Match ended: 0 - 2') == 'loss'
+
+    def test_parse_match_result_draw(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('Final score: 1 - 1') == 'draw'
+
+    def test_parse_match_result_none_on_garbage(self):
+        from evaluate import _parse_match_result
+        assert _parse_match_result('no score info here') is None
+
 
 # ── gym env shape tests (no rlgym-sim needed) ───────────────────────────────
 
