@@ -96,7 +96,8 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, shared_envs=None, wandb_project: str = 'rlbot-baseline-tuning') -> float:
+def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
+              shared_envs=None, reward_type: str = 'sparse', wandb_project: str = 'rlbot-baseline-tuning') -> float:
     """
     Single Optuna trial: sample hyperparams, run shortened training,
     return mean episode reward.
@@ -137,7 +138,8 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
     if shared_envs is not None:
         n_dead = sum(1 for p in shared_envs._procs if not p.is_alive())
         if n_dead:
-            print(f'[tune] Warning: {n_dead}/{shared_envs.num_envs} workers died — respawning before trial {trial.number}', file=sys.stderr)
+            print(
+                f'[tune] Warning: {n_dead}/{shared_envs.num_envs} workers died — respawning before trial {trial.number}', file=sys.stderr)
             shared_envs.respawn_dead()
 
     t_window = 8
@@ -154,10 +156,11 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
         lam=awac_lambda,
     ).create(device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
 
-    raw_env = BaselineGymEnv(t_window=t_window)
+    raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
     env = RewardTracker(raw_env)
 
-    buffer = d3rlpy.dataset.create_fifo_replay_buffer(limit=100_000 * num_envs, env=env)
+    buffer = d3rlpy.dataset.create_fifo_replay_buffer(
+        limit=100_000 * num_envs, env=env)
     explorer = NormalNoise(std=explore_noise)
 
     if use_wandb:
@@ -199,7 +202,8 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1, s
             )
 
             if envs is None:
-                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window)
+                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window,
+                                     reward_type=reward_type)
                 _owns_envs = True
 
             # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
@@ -350,11 +354,14 @@ def main():
         print('Optuna required: pip install optuna', file=sys.stderr)
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description='Baseline hyperparameter tuning.')
+    parser = argparse.ArgumentParser(
+        description='Baseline hyperparameter tuning.')
     parser.add_argument('--n-trials', type=int, default=50)
     parser.add_argument('--steps-per-trial', type=int, default=500_000)
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments per trial (default: 1)')
+    parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
+                        help='Reward function: sparse (goals only) or dense (shaped)')
     parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--wandb-project', default='rlbot-baseline-tuning',
                         help='W&B project name (default: rlbot-baseline-tuning)')
@@ -374,10 +381,12 @@ def main():
 
     if args.reset:
         try:
-            optuna.delete_study(study_name=args.study_name, storage=args.storage)
+            optuna.delete_study(study_name=args.study_name,
+                                storage=args.storage)
             print(f'Deleted existing study "{args.study_name}".')
         except KeyError:
-            print(f'No existing study "{args.study_name}" found — starting fresh.')
+            print(
+                f'No existing study "{args.study_name}" found — starting fresh.')
 
     study = optuna.create_study(
         direction='maximize',
@@ -407,14 +416,16 @@ def main():
 
     n_existing = len([t for t in study.trials if t.state.is_finished()])
     print(f'Study "{args.study_name}" — {n_existing} completed trials.')
-    print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
+    print(
+        f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
 
     # Hoist worker pool: spawn once and reuse across all trials to avoid
     # the per-trial spawn overhead (~576 MB × num_envs) that causes slowdown.
     shared_envs = None
     if args.num_envs > 1:
         from train import SubprocVecEnv
-        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8)
+        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8,
+                                    reward_type=args.reward)
         print(f'Spawned {args.num_envs} persistent worker processes '
               f'(pids: {[p.pid for p in shared_envs._procs]})')
 
@@ -423,6 +434,7 @@ def main():
             lambda trial: objective(
                 trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
                 shared_envs=shared_envs, wandb_project=args.wandb_project,
+                reward_type=args.reward,
             ),
             n_trials=args.n_trials,
             show_progress_bar=True,
@@ -440,6 +452,8 @@ def main():
     # ── auto-launch seeds ────────────────────────────────────────────────
     if args.auto_seeds:
         extra = []
+        if args.reward != 'sparse':
+            extra.extend(['--reward', args.reward])
         if args.no_wandb:
             extra.append('--no-wandb')
         launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
