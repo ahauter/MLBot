@@ -2,19 +2,15 @@
 Frozen Opponent Self-Play
 =========================
 Performance-gated self-play: the opponent is a frozen snapshot that only
-updates when the live agent demonstrates offensive mastery.
+updates when the live agent demonstrates mastery.
 
 Swap condition (over rolling 100-episode window):
-  - Win rate > 70%  (wins / decisive games, excluding draws)
-  - Goals scored per episode > 0.5
-
-This breaks the defensive equilibrium that arises in co-evolving self-play
-with sparse rewards, creating a stepwise curriculum without reward shaping.
+  - Mean outcome score > 0.5  (goal=+1, concede=-1, timeout=0)
 
 Classes
 -------
 EpisodeOutcomeTracker
-    Rolling window tracker for win rate and goals-per-episode.
+    Rolling window tracker for mean-outcome score.
 FrozenOpponentPool(OpponentPool)
     Pool of up to 5 frozen snapshots with performance-gated promotion.
 OutcomeTrackingEnv
@@ -65,56 +61,17 @@ class EpisodeOutcomeTracker:
     def episode_count(self) -> int:
         return len(self._outcomes)
 
-    def win_rate(self) -> float:
-        """Win rate over decisive games (excludes draws).
-
-        Returns 0.0 if no decisive games in the window.
-        """
+    def score(self) -> float:
+        """Mean outcome over the rolling window. goal=+1, concede=-1, timeout=0."""
         if not self._outcomes:
             return 0.0
-        wins = sum(1 for g in self._outcomes if g == 1)
-        losses = sum(1 for g in self._outcomes if g == -1)
-        decisive = wins + losses
-        if decisive == 0:
-            return 0.0
-        return wins / decisive
+        return sum(self._outcomes) / len(self._outcomes)
 
-    def goals_per_episode(self) -> float:
-        """Average goals scored by the agent per episode."""
-        if not self._outcomes:
-            return 0.0
-        goals = sum(1 for g in self._outcomes if g == 1)
-        return goals / len(self._outcomes)
-
-    def should_swap(
-        self,
-        win_rate_threshold: float = 0.7,
-        goals_threshold: float = 0.5,
-    ) -> Tuple[bool, Optional[str]]:
-        """Check whether the frozen opponent should be promoted.
-
-        Returns
-        -------
-        (should_swap, warning_or_none)
-            (True, None) if both conditions met.
-            (False, warning_str) if win rate met but goals too low (defensive play).
-            (False, None) otherwise.
-        """
+    def should_swap(self, score_threshold: float = 0.5) -> bool:
+        """Return True if mean outcome exceeds the threshold."""
         if len(self._outcomes) < self.window_size:
-            return False, None
-
-        wr = self.win_rate()
-        gpe = self.goals_per_episode()
-
-        if wr > win_rate_threshold:
-            if gpe > goals_threshold:
-                return True, None
-            else:
-                return False, (
-                    f"Defensive play detected: win_rate={wr:.2f} > {win_rate_threshold} "
-                    f"but goals_per_episode={gpe:.2f} <= {goals_threshold}"
-                )
-        return False, None
+            return False
+        return self.score() > score_threshold
 
     def reset(self) -> None:
         """Clear the outcome window (e.g. after a swap event)."""
@@ -127,8 +84,8 @@ class FrozenOpponentPool(OpponentPool):
 
     Maintains up to ``max_snapshots`` (default 5) policy snapshots.
     Opponents are sampled uniformly from the pool. New snapshots are added
-    only when the live agent meets the swap condition (>70% win rate AND
-    >0.5 goals/episode over 100 episodes).
+    only when the live agent's mean outcome score exceeds ``score_threshold``
+    over a rolling window of episodes (goal=+1, concede=-1, timeout=0).
 
     Parameters
     ----------
@@ -140,10 +97,8 @@ class FrozenOpponentPool(OpponentPool):
         Maximum snapshots to retain (default 5).
     window_size : int
         Episode window for outcome tracking (default 100).
-    win_rate_threshold : float
-        Win rate threshold for promotion (default 0.7).
-    goals_threshold : float
-        Goals-per-episode threshold for promotion (default 0.5).
+    score_threshold : float
+        Mean-outcome threshold for promotion (default 0.5).
     """
 
     def __init__(
@@ -152,12 +107,10 @@ class FrozenOpponentPool(OpponentPool):
         algo_builder=None,
         max_snapshots: int = 5,
         window_size: int = 100,
-        win_rate_threshold: float = 0.7,
-        goals_threshold: float = 0.5,
+        score_threshold: float = 0.5,
     ):
         super().__init__(snapshot_dir, algo_builder, max_snapshots)
-        self.win_rate_threshold = win_rate_threshold
-        self.goals_threshold = goals_threshold
+        self.score_threshold = score_threshold
         self.tracker = EpisodeOutcomeTracker(window_size=window_size)
         self.swap_count = 0
 
@@ -193,46 +146,23 @@ class FrozenOpponentPool(OpponentPool):
         self.tracker.record(goal)
 
     def should_swap(self, total_step: int) -> bool:
-        """Return True if the agent has mastered the current frozen opponent.
-
-        Checks the rolling window for win rate > threshold AND
-        goals per episode > threshold. Logs a warning if defensive play
-        is detected (high win rate but low scoring).
-        """
-        do_swap, warning = self.tracker.should_swap(
-            self.win_rate_threshold, self.goals_threshold
-        )
-        if warning:
-            print(f"[step {total_step:,}] WARNING: {warning}")
-            # Log to W&B if available
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({
-                        'frozen_self_play/defensive_play_warning': 1,
-                        'frozen_self_play/win_rate_at_warning': self.tracker.win_rate(),
-                        'frozen_self_play/goals_per_ep_at_warning': self.tracker.goals_per_episode(),
-                    }, step=total_step)
-            except ImportError:
-                pass
-        return do_swap
+        """Return True if mean outcome score exceeds the threshold."""
+        return self.tracker.should_swap(self.score_threshold)
 
     def log_swap_event(self, total_step: int) -> None:
         """Log a swap event to stdout and W&B."""
-        wr = self.tracker.win_rate()
-        gpe = self.tracker.goals_per_episode()
+        s = self.tracker.score()
         n = self.num_snapshots()
         print(
             f"[step {total_step:,}] SWAP #{self.swap_count}: "
-            f"win_rate={wr:.2f}, goals_per_ep={gpe:.2f}, pool_size={n}"
+            f"score={s:.2f}, pool_size={n}"
         )
         try:
             import wandb
             if wandb.run is not None:
                 wandb.log({
                     'frozen_self_play/swap_event': self.swap_count,
-                    'frozen_self_play/win_rate_at_swap': wr,
-                    'frozen_self_play/goals_per_ep_at_swap': gpe,
+                    'frozen_self_play/score_at_swap': s,
                     'frozen_self_play/pool_size': n,
                 }, step=total_step)
         except ImportError:

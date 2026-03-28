@@ -55,99 +55,78 @@ class TestEpisodeOutcomeTracker:
 
     def test_empty_tracker(self):
         t = EpisodeOutcomeTracker(window_size=100)
-        assert t.win_rate() == 0.0
-        assert t.goals_per_episode() == 0.0
+        assert t.score() == 0.0
         assert t.episode_count == 0
 
     def test_all_wins(self):
         t = EpisodeOutcomeTracker(window_size=10)
         for _ in range(10):
             t.record(1)
-        assert t.win_rate() == 1.0
-        assert t.goals_per_episode() == 1.0
+        assert t.score() == 1.0
 
     def test_all_losses(self):
         t = EpisodeOutcomeTracker(window_size=10)
         for _ in range(10):
             t.record(-1)
-        assert t.win_rate() == 0.0
-        assert t.goals_per_episode() == 0.0
+        assert t.score() == -1.0
 
     def test_all_draws(self):
         t = EpisodeOutcomeTracker(window_size=10)
         for _ in range(10):
             t.record(0)
-        # No decisive games → win rate 0.0
-        assert t.win_rate() == 0.0
-        assert t.goals_per_episode() == 0.0
+        assert t.score() == 0.0
 
     def test_mixed_outcomes(self):
         t = EpisodeOutcomeTracker(window_size=10)
-        # 7 wins, 2 losses, 1 draw
+        # 7 wins, 2 losses, 1 draw → score = (7 - 2) / 10 = 0.5
         for g in [1, 1, 1, 1, 1, 1, 1, -1, -1, 0]:
             t.record(g)
-        # win_rate = 7 / (7+2) = 7/9
-        assert abs(t.win_rate() - 7 / 9) < 1e-6
-        # goals_per_episode = 7 / 10
-        assert abs(t.goals_per_episode() - 0.7) < 1e-6
+        assert abs(t.score() - 0.5) < 1e-6
 
     def test_rolling_window(self):
         t = EpisodeOutcomeTracker(window_size=5)
-        # Fill with wins
         for _ in range(5):
             t.record(1)
-        assert t.win_rate() == 1.0
+        assert t.score() == 1.0
         # Add 5 losses — should push out all wins
         for _ in range(5):
             t.record(-1)
-        assert t.win_rate() == 0.0
-        assert t.goals_per_episode() == 0.0
+        assert t.score() == -1.0
 
     def test_should_swap_not_ready(self):
         t = EpisodeOutcomeTracker(window_size=100)
         for _ in range(50):
             t.record(1)
-        do_swap, warning = t.should_swap()
-        assert do_swap is False
-        assert warning is None
+        assert t.should_swap() is False
 
-    def test_should_swap_both_conditions_met(self):
+    def test_should_swap_above_threshold(self):
         t = EpisodeOutcomeTracker(window_size=10)
-        # 8 wins, 2 losses → WR=0.8, GPE=0.8
+        # 8 wins, 2 losses → score = 0.6 > 0.5
         for g in [1, 1, 1, 1, 1, 1, 1, 1, -1, -1]:
             t.record(g)
-        do_swap, warning = t.should_swap(win_rate_threshold=0.7, goals_threshold=0.5)
-        assert do_swap is True
-        assert warning is None
+        assert t.should_swap(score_threshold=0.5) is True
 
-    def test_should_swap_defensive_play_warning(self):
+    def test_should_swap_draws_not_sufficient(self):
         t = EpisodeOutcomeTracker(window_size=10)
-        # 4 wins, 1 loss, 5 draws → WR=4/5=0.8, GPE=4/10=0.4
-        for g in [1, 1, 1, 1, -1, 0, 0, 0, 0, 0]:
-            t.record(g)
-        do_swap, warning = t.should_swap(win_rate_threshold=0.7, goals_threshold=0.5)
-        assert do_swap is False
-        assert warning is not None
-        assert "Defensive play" in warning
+        # All draws → score = 0.0, not > 0.5
+        for _ in range(10):
+            t.record(0)
+        assert t.should_swap(score_threshold=0.5) is False
 
-    def test_should_swap_neither_condition(self):
+    def test_should_swap_below_threshold(self):
         t = EpisodeOutcomeTracker(window_size=10)
-        # 5 wins, 5 losses → WR=0.5, GPE=0.5
+        # 5 wins, 5 losses → score = 0.0
         for g in [1, 1, 1, 1, 1, -1, -1, -1, -1, -1]:
             t.record(g)
-        do_swap, warning = t.should_swap(win_rate_threshold=0.7, goals_threshold=0.5)
-        assert do_swap is False
-        assert warning is None
+        assert t.should_swap(score_threshold=0.5) is False
 
     def test_should_swap_at_exact_threshold(self):
-        """Thresholds are strict > (not >=)."""
+        """Threshold is strict > (not >=)."""
         t = EpisodeOutcomeTracker(window_size=10)
-        # 7 wins, 3 losses → WR=0.7 exactly, GPE=0.7
-        for g in [1, 1, 1, 1, 1, 1, 1, -1, -1, -1]:
+        # 7 wins, 2 losses, 1 draw → score = (7-2)/10 = 0.5 exactly
+        for g in [1, 1, 1, 1, 1, 1, 1, -1, -1, 0]:
             t.record(g)
-        do_swap, warning = t.should_swap(win_rate_threshold=0.7, goals_threshold=0.5)
-        # WR == 0.7, not > 0.7
-        assert do_swap is False
+        assert t.should_swap(score_threshold=0.5) is False
 
     def test_reset_clears_window(self):
         t = EpisodeOutcomeTracker(window_size=10)
@@ -156,7 +135,7 @@ class TestEpisodeOutcomeTracker:
         assert t.episode_count == 10
         t.reset()
         assert t.episode_count == 0
-        assert t.win_rate() == 0.0
+        assert t.score() == 0.0
 
 
 # ── FrozenOpponentPool tests ───────────────────────────────────────────────
@@ -229,7 +208,7 @@ class TestFrozenOpponentPool:
     def test_should_swap_delegates_to_tracker(self):
         pool = FrozenOpponentPool(
             self.tmpdir, algo_builder=_make_algo,
-            window_size=10, win_rate_threshold=0.7, goals_threshold=0.5,
+            window_size=10, score_threshold=0.5,
         )
         # Not enough episodes
         assert pool.should_swap(total_step=0) is False
