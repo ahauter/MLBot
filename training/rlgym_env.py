@@ -258,8 +258,10 @@ class ScenarioRewardFn(RewardFunction):
     Per-step reward from ScenarioConfig.reward.{blue,orange}.step events.
 
     Supported step event types:
-      ball_toward_goal   — ball vy / MAX_VEL  (positive = toward orange goal)
-      ball_from_goal     — -ball vy / MAX_VEL
+      ball_toward_goal   — max(0, ball vy / MAX_VEL)  (team-aware, non-negative)
+      ball_from_goal     — max(0, -ball vy / MAX_VEL)  (team-aware, non-negative)
+      ball_center_angle  — (1 - cos_angle) / dist(ball, own_goal); default weight 0.0001
+                           cos_angle = projection of own_goal→ball onto goal axis
       car_near_ball      — max(0, 1 - dist(car, ball) / 5000)
 
     Terminal rewards (goal_scored, timeout, etc.) are handled separately
@@ -287,13 +289,35 @@ class ScenarioRewardFn(RewardFunction):
         car  = player.car_data
         total = 0.0
 
+        # Goal-line y positions (signed, absolute)
+        own_goal_y  = -_GOAL_Y if player.team_num == 0 else  _GOAL_Y
+        # Forward axis: +1 for blue (toward +y), -1 for orange (toward -y)
+        fwd_sign    = 1.0       if player.team_num == 0 else -1.0
+
         for evt in reward_cfg.step:
             w = evt.weight
             t = evt.type
             if t == 'ball_toward_goal':
-                total += w * float(np.clip(ball.linear_velocity[1] / MAX_VEL, -1.0, 1.0))
+                # Non-negative: only reward when ball moves toward opponent goal
+                total += w * max(0.0, float(fwd_sign * ball.linear_velocity[1] / MAX_VEL))
             elif t == 'ball_from_goal':
-                total += w * float(np.clip(-ball.linear_velocity[1] / MAX_VEL, -1.0, 1.0))
+                # Non-negative: only reward when ball moves away from own goal
+                total += w * max(0.0, float(-fwd_sign * ball.linear_velocity[1] / MAX_VEL))
+            elif t == 'ball_center_angle':
+                # (1 - cos_angle) / dist_to_own_goal
+                # cos_angle = projection of own_goal→ball unit vector onto goal axis.
+                # Default weight 0.0001.
+                dx = float(ball.position[0])
+                dy = float(ball.position[1]) - own_goal_y
+                dz = float(ball.position[2])
+                dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                dist_2d = math.sqrt(dx * dx + dy * dy)
+                if dist_2d > 1e-6:
+                    cos_angle = max(0.0, fwd_sign * dy / dist_2d)
+                else:
+                    cos_angle = 0.0
+                dist_to_goal = max(dist_3d, 1.0)  # avoid div-by-zero
+                total += w * (1.0 - cos_angle) / dist_to_goal
             elif t == 'car_near_ball':
                 d = float(np.linalg.norm(car.position - ball.position))
                 total += w * max(0.0, 1.0 - d / 5000.0)
