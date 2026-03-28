@@ -755,6 +755,14 @@ def fit_online_parallel(
         # ── callback + axis logging (epoch boundaries) ────────────────────
         epoch = total_step // config.n_steps_per_epoch
         if callback and total_step % config.n_steps_per_epoch < num_envs:
+            # Drain pending resets before callback fires set_opponent_path.
+            # set_opponent_path does p.recv() on every pipe to get its None ack,
+            # but if a worker already has a queued reset result it would read that
+            # instead, leaving None in the pipe for the next recv_reset() call.
+            for _i in list(pending_resets):
+                _reset_obs, _ = envs.recv_reset(_i)
+                observations[_i] = _reset_obs
+                pending_resets.discard(_i)
             callback(algo, epoch, total_step)
             if _wandb is not None and _wandb.run is not None:
                 elapsed = time.time() - start_wall
