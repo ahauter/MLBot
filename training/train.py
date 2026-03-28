@@ -958,7 +958,7 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
 
 # ── Optuna parameter loading ────────────────────────────────────────────────
 
-def load_params_from_optuna(db_path: str) -> dict:
+def load_params_from_optuna(db_path: str, study_name: str = 'baseline-hparam-search') -> dict:
     """Load best hyperparameters from an Optuna study database."""
     try:
         import optuna
@@ -966,7 +966,7 @@ def load_params_from_optuna(db_path: str) -> dict:
         raise ImportError('optuna required: pip install optuna')
 
     study = optuna.load_study(
-        study_name='baseline-hparam-search',
+        study_name=study_name,
         storage=f'sqlite:///{db_path}',
     )
     if not study.best_trial:
@@ -1025,6 +1025,8 @@ def main():
     # Optuna integration
     parser.add_argument('--params-from', default=None,
                         help='Load best hyperparams from Optuna SQLite DB')
+    parser.add_argument('--study-name', default='baseline-hparam-search',
+                        help='Optuna study name to load best params from (used with --params-from)')
 
     args = parser.parse_args()
 
@@ -1056,7 +1058,7 @@ def main():
 
     # Override with Optuna-tuned params if requested
     if args.params_from:
-        params = load_params_from_optuna(args.params_from)
+        params = load_params_from_optuna(args.params_from, study_name=args.study_name)
         param_map = {
             'actor_lr': 'actor_lr',
             'critic_lr': 'critic_lr',
