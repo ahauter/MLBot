@@ -216,6 +216,19 @@ class FrozenOpponentPool(OpponentPool):
             f"win_rate={wr:.2f}, goals_per_ep={gpe:.2f}, pool_size={n}"
         )
 
+    def get_metrics(self) -> dict:
+        """Return current metrics for MetricsRegistry collection.
+
+        Called by the main thread at each logging point. Read-only access
+        to pool state — safe to call from any thread.
+        """
+        return {
+            'swap_count': self.swap_count,
+            'pool_size': self.num_snapshots(),
+            'win_rate': self.tracker.win_rate(),
+            'goals_per_ep': self.tracker.goals_per_episode(),
+        }
+
 
 class OutcomeTrackingEnv:
     """

@@ -52,6 +52,7 @@ from d3rlpy.logging import WanDBAdapterFactory, FileAdapterFactory
 
 from baseline_encoder_factory import TransformerEncoderFactory
 from gym_env import BaselineGymEnv
+from logger import MetricsRegistry
 from self_play import OpponentPool
 from frozen_self_play import FrozenOpponentPool, OutcomeTrackingEnv
 from encoder import N_TOKENS, TOKEN_FEATURES
@@ -204,11 +205,12 @@ class TrainingCallback:
     """
 
     def __init__(self, config: TrainConfig, env, pool: OpponentPool,
-                 axis_tracker=None):
+                 axis_tracker=None, metrics_registry: Optional[MetricsRegistry] = None):
         self.config = config
         self.env = env
         self.pool = pool
         self.axis_tracker = axis_tracker
+        self.metrics_registry = metrics_registry
         self.parallel_envs: Optional[SubprocVecEnv] = None  # set when num_envs > 1
         self.start_time = time.time()
         self.consecutive_wins = 0
@@ -335,12 +337,9 @@ class TrainingCallback:
         if self.axis_tracker is not None:
             self.axis_tracker.log(self._wandb, total_step)
 
-        # Frozen self-play swap tracking (logged from main thread to avoid race conditions)
-        if hasattr(self.pool, 'swap_count'):
-            eval_metrics['frozen_self_play/swap_count'] = self.pool.swap_count
-            eval_metrics['frozen_self_play/pool_size'] = self.pool.num_snapshots()
-            eval_metrics['frozen_self_play/win_rate'] = self.pool.tracker.win_rate()
-            eval_metrics['frozen_self_play/goals_per_ep'] = self.pool.tracker.goals_per_episode()
+        # Collect custom metrics from registered providers (main-thread safe)
+        if self.metrics_registry is not None:
+            eval_metrics.update(self.metrics_registry.collect())
 
         # Log to W&B
         if self._wandb is not None and self._wandb.run is not None:
@@ -629,6 +628,7 @@ def fit_online_parallel(
     callback,
     on_episode_complete=None,
     axis_tracker=None,
+    metrics_registry: Optional[MetricsRegistry] = None,
 ) -> None:
     """
     Parallel replacement for d3rlpy's fit_online().
@@ -816,13 +816,9 @@ def fit_online_parallel(
                     'timing/steps_per_second': total_step / max(elapsed, 1e-6),
                     'timing/wall_clock_seconds': int(elapsed),
                 }
-                # Frozen self-play swap tracking (logged here to avoid race conditions)
-                pool = callback.pool
-                if hasattr(pool, 'swap_count'):
-                    epoch_metrics['frozen_self_play/swap_count'] = pool.swap_count
-                    epoch_metrics['frozen_self_play/pool_size'] = pool.num_snapshots()
-                    epoch_metrics['frozen_self_play/win_rate'] = pool.tracker.win_rate()
-                    epoch_metrics['frozen_self_play/goals_per_ep'] = pool.tracker.goals_per_episode()
+                # Collect custom metrics from registered providers (main-thread safe)
+                if metrics_registry is not None:
+                    epoch_metrics.update(metrics_registry.collect())
                 _wandb.log(epoch_metrics, step=total_step)
 
     pbar.close()
@@ -908,8 +904,13 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
         max_snapshots=config.max_snapshots,
     )
 
+    # ── metrics registry ─────────────────────────────────────────────────
+    metrics_registry = MetricsRegistry()
+    metrics_registry.register('frozen_self_play', pool.get_metrics)
+
     # ── callback ─────────────────────────────────────────────────────────
-    callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker)
+    callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker,
+                                metrics_registry=metrics_registry)
 
     # ── W&B logging ──────────────────────────────────────────────────────
     if config.no_wandb:
@@ -975,6 +976,7 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
                 explorer=explorer,
                 callback=callback,
                 axis_tracker=axis_tracker,
+                metrics_registry=metrics_registry,
             )
         finally:
             envs.close()
