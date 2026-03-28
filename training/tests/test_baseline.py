@@ -124,14 +124,14 @@ class TestOpponentPool:
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_empty_pool_returns_none(self):
-        from self_play import OpponentPool
-        pool = OpponentPool(self.tmpdir, algo_builder=_make_algo)
+        from self_play import PeriodicOpponentPool
+        pool = PeriodicOpponentPool(self.tmpdir, algo_builder=_make_algo)
         assert pool.sample_opponent() is None
         assert pool.num_snapshots() == 0
 
     def test_save_and_load(self):
-        from self_play import OpponentPool
-        pool = OpponentPool(self.tmpdir, algo_builder=_make_algo)
+        from self_play import PeriodicOpponentPool
+        pool = PeriodicOpponentPool(self.tmpdir, algo_builder=_make_algo)
         algo = _make_algo()
 
         pool.save_snapshot(algo, step=1000)
@@ -146,8 +146,8 @@ class TestOpponentPool:
         assert action.shape == (1, 8), f"Bad action shape: {action.shape}"
 
     def test_predict_matches_original(self):
-        from self_play import OpponentPool
-        pool = OpponentPool(self.tmpdir, algo_builder=_make_algo)
+        from self_play import PeriodicOpponentPool
+        pool = PeriodicOpponentPool(self.tmpdir, algo_builder=_make_algo)
         algo = _make_algo()
 
         pool.save_snapshot(algo, step=1000)
@@ -160,8 +160,8 @@ class TestOpponentPool:
                                    err_msg="Loaded model doesn't match original")
 
     def test_max_snapshots_cleanup(self):
-        from self_play import OpponentPool
-        pool = OpponentPool(self.tmpdir, algo_builder=_make_algo, max_snapshots=3)
+        from self_play import PeriodicOpponentPool
+        pool = PeriodicOpponentPool(self.tmpdir, algo_builder=_make_algo, max_snapshots=3)
         algo = _make_algo()
 
         for step in range(5):
@@ -171,8 +171,8 @@ class TestOpponentPool:
             f"Expected 3 snapshots after cleanup, got {pool.num_snapshots()}"
 
     def test_action_range(self):
-        from self_play import OpponentPool
-        pool = OpponentPool(self.tmpdir, algo_builder=_make_algo)
+        from self_play import PeriodicOpponentPool
+        pool = PeriodicOpponentPool(self.tmpdir, algo_builder=_make_algo)
         algo = _make_algo()
         pool.save_snapshot(algo, step=1000)
         loaded = pool.sample_opponent()

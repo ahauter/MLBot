@@ -1,0 +1,43 @@
+# Frozen Opponent Self-Play — Axis 1 Intervention
+# ================================================
+# AWAC with sparse reward and performance-gated self-play.
+# Opponent freezes until agent achieves >70% win rate AND >0.5 goals/ep.
+# Tests whether structured self-play curriculum reduces simulation cost.
+
+name: frozen_self_play
+description: >
+  Self-play with performance-gated opponent promotion. The opponent is a
+  frozen snapshot that only updates when the live agent achieves >70% win
+  rate and >0.5 goals per episode over 100 games. This breaks defensive
+  equilibrium collapse and creates a stepwise curriculum without reward
+  shaping or human labels.
+intervention: frozen_self_play
+
+base_config:
+  algo: AWAC
+  reward_type: sparse
+  total_steps: 50000000
+  eval_interval: 200000
+  batch_size: 256
+  gamma: 0.99
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  tau: 0.005
+  awac_lambda: 1.0
+  explore_noise: 0.1
+  max_snapshots: 5
+
+budget:
+  sim_steps: 50000000
+  num_replays: 0
+  num_labels: 0
+  reward_components: 0
+  pretrain_gpu_hours: 0.0
+
+seeds: [0, 1, 2, 3, 4]
+
+wandb_project: rlbot-baseline
+wandb_tags:
+  - self-play
+  - frozen-opponent
+  - axis1

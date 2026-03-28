@@ -238,11 +238,11 @@ class TestSelfPlayIntegrity:
     def test_snapshot_weights_are_reproducible(self):
         """Save → load should produce identical predictions."""
         import tempfile, shutil
-        from self_play import OpponentPool
+        from self_play import PeriodicOpponentPool
 
         tmpdir = tempfile.mkdtemp()
         try:
-            pool = OpponentPool(tmpdir, algo_builder=_make_algo)
+            pool = PeriodicOpponentPool(tmpdir, algo_builder=_make_algo)
             algo = _make_algo()
 
             pool.save_snapshot(algo, step=1000)
@@ -259,11 +259,11 @@ class TestSelfPlayIntegrity:
     def test_opponent_produces_bounded_actions(self):
         """Opponent actions must be in [-1, 1]."""
         import tempfile, shutil
-        from self_play import OpponentPool
+        from self_play import PeriodicOpponentPool
 
         tmpdir = tempfile.mkdtemp()
         try:
-            pool = OpponentPool(tmpdir, algo_builder=_make_algo)
+            pool = PeriodicOpponentPool(tmpdir, algo_builder=_make_algo)
             algo = _make_algo()
             pool.save_snapshot(algo, step=1000)
             loaded = pool.sample_opponent()
@@ -501,7 +501,7 @@ class TestEvalProtocol:
         """
         from train import TrainingCallback, TrainConfig
         from gym_env import BaselineGymEnv
-        from self_play import OpponentPool
+        from self_play import PeriodicOpponentPool
 
         config = TrainConfig(rookie_target_wr=0.60, consecutive_evals_required=2)
         # Don't need real env/pool for this test — just test the counter logic
