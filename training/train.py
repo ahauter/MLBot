@@ -53,6 +53,7 @@ from d3rlpy.logging import WanDBAdapterFactory, FileAdapterFactory
 from baseline_encoder_factory import TransformerEncoderFactory
 from gym_env import BaselineGymEnv
 from self_play import OpponentPool
+from frozen_self_play import FrozenOpponentPool, OutcomeTrackingEnv
 from encoder import N_TOKENS, TOKEN_FEATURES
 
 
@@ -79,7 +80,6 @@ class TrainConfig:
     # ── budget ───────────────────────────────────────────────────────────────
     total_steps: int = 50_000_000
     eval_interval: int = 200_000       # env steps between Psyonix evaluations
-    snapshot_interval: int = 10_000    # env steps between self-play snapshots
 
     # ── architecture ─────────────────────────────────────────────────────────
     t_window: int = 8
@@ -110,8 +110,8 @@ class TrainConfig:
     # ── parallel environments ─────────────────────────────────────────────
     num_envs: int = 1                 # parallel RLGym-sim envs (1 = sequential)
 
-    # ── self-play ────────────────────────────────────────────────────────────
-    max_snapshots: int = 20
+    # ── self-play (frozen opponent) ─────────────────────────────────────────
+    max_snapshots: int = 5
 
     # ── reward ──────────────────────────────────────────────────────────────
     reward_type: str = 'sparse'       # 'sparse' or 'dense'
@@ -122,17 +122,17 @@ class TrainConfig:
     consecutive_evals_required: int = 2
 
     # ── paths ────────────────────────────────────────────────────────────────
-    model_dir: str = 'models/baseline'
-    snapshot_dir: str = 'models/baseline/snapshots'
+    model_dir: str = 'models/frozen_self_play'
+    snapshot_dir: str = 'models/frozen_self_play/snapshots'
 
     # ── experiment infrastructure ────────────────────────────────────────────
-    intervention: str = 'none'                    # intervention name for metadata
+    intervention: str = 'frozen_self_play'        # intervention name for metadata
     replay_seed_dir: Optional[str] = None         # pre-load replay data into buffer
     pretrained_encoder_path: Optional[str] = None  # load pre-trained encoder weights
 
     # ── W&B ──────────────────────────────────────────────────────────────────
     wandb_project: str = 'rlbot-baseline'
-    wandb_tags: list = field(default_factory=lambda: ['baseline', 'no-intervention'])
+    wandb_tags: list = field(default_factory=lambda: ['self-play', 'frozen-opponent', 'axis1'])
     wandb_run_name: Optional[str] = None
     wandb_group: Optional[str] = None
     no_wandb: bool = False
@@ -196,11 +196,14 @@ def build_algo(config: TrainConfig) -> d3rlpy.algos.QLearningAlgoBase:
 
 class TrainingCallback:
     """
-    Callback for d3rlpy's fit_online. Handles self-play snapshots,
+    Callback for d3rlpy's fit_online. Handles self-play opponent swaps,
     evaluation, convergence detection, and W&B eval logging.
+
+    Swap timing is delegated to the OpponentPool: the callback calls
+    pool.should_swap() and pool.on_episode_end() and acts on the result.
     """
 
-    def __init__(self, config: TrainConfig, env: BaselineGymEnv, pool: OpponentPool,
+    def __init__(self, config: TrainConfig, env, pool: OpponentPool,
                  axis_tracker=None):
         self.config = config
         self.env = env
@@ -210,7 +213,6 @@ class TrainingCallback:
         self.start_time = time.time()
         self.consecutive_wins = 0
         self.converged = False
-        self._last_snapshot_step = 0
         self._last_eval_step = 0
         self._wandb = None
 
@@ -240,19 +242,35 @@ class TrainingCallback:
         })
 
     def __call__(self, algo, epoch: int, total_step: int) -> None:
-        # ── self-play snapshot ───────────────────────────────────────────
-        if total_step - self._last_snapshot_step >= self.config.snapshot_interval:
-            self._save_snapshot(algo, total_step)
-            self._last_snapshot_step = total_step
+        # ── frozen self-play: drain sequential env outcomes ──────────────
+        if hasattr(self.env, 'episode_outcomes'):
+            while self.env.episode_outcomes:
+                goal = self.env.episode_outcomes.popleft()
+                self.pool.on_episode_end(goal)
+                if self.pool.should_swap(total_step):
+                    self._do_swap(algo, total_step)
 
         # ── evaluation ───────────────────────────────────────────────────
         if total_step - self._last_eval_step >= self.config.eval_interval:
             self._run_eval(algo, total_step)
             self._last_eval_step = total_step
 
-    def _save_snapshot(self, algo, total_step: int) -> None:
-        """Save current policy as self-play opponent snapshot."""
-        snap_path = self.pool.save_snapshot(algo, total_step)
+    def on_episode_end(self, algo, total_step: int, goal: int) -> None:
+        """Post-episode hook for parallel training path.
+
+        Notifies the pool of the outcome and triggers a swap if conditions are met.
+        """
+        self.pool.on_episode_end(goal)
+        if self.pool.should_swap(total_step):
+            self._do_swap(algo, total_step)
+
+    def _do_swap(self, algo, total_step: int) -> None:
+        """Save snapshot, sample new opponent, update envs."""
+        self.pool.save_snapshot(algo, total_step)
+
+        # Log swap event if pool supports it
+        if hasattr(self.pool, 'log_swap_event'):
+            self.pool.log_swap_event(total_step)
 
         if self.pool.num_snapshots() > 0:
             # Update single env's opponent (used in sequential mode)
@@ -261,7 +279,6 @@ class TrainingCallback:
 
             # Update all subprocess env opponents (used in parallel mode)
             if self.parallel_envs is not None:
-                # Sample a random snapshot and send its path to all workers
                 snap_dirs = sorted(self.pool.snapshot_dir.iterdir())
                 if snap_dirs:
                     chosen = random.choice(snap_dirs)
@@ -717,6 +734,10 @@ def fit_online_parallel(
                 recent_returns.append(rollout_returns[i])
                 recent_goals.append(info.get('goal', 0))
 
+                # Notify pool of episode outcome for swap condition check
+                if hasattr(callback, 'on_episode_end'):
+                    callback.on_episode_end(algo, total_step, info.get('goal', 0))
+
                 if _wandb:
                     _wandb.log({
                         'rollout/episode_return': rollout_returns[i],
@@ -842,22 +863,31 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
     print(f'  Model dir:  {model_dir}')
 
     # ── environment ──────────────────────────────────────────────────────
-    env = BaselineGymEnv(
-        t_window=config.t_window,
-        reward_type=config.reward_type,
-        dense_reward_weights=config.dense_reward_weights,
-    )
+    # Sequential path uses OutcomeTrackingEnv so callback can drain episode
+    # outcomes; parallel path uses plain BaselineGymEnv (outcomes come via hook).
+    if parallel:
+        env = BaselineGymEnv(
+            t_window=config.t_window,
+            reward_type=config.reward_type,
+            dense_reward_weights=config.dense_reward_weights,
+        )
+    else:
+        env = OutcomeTrackingEnv(
+            t_window=config.t_window,
+            reward_type=config.reward_type,
+            dense_reward_weights=config.dense_reward_weights,
+        )
 
     # ── d3rlpy algorithm ─────────────────────────────────────────────────
     algo = build_algo(config)
 
-    # ── self-play opponent pool ──────────────────────────────────────────
+    # ── self-play opponent pool (frozen) ─────────────────────────────────
     def _algo_builder():
         a = build_algo(config)
         a.build_with_env(env)
         return a
 
-    pool = OpponentPool(
+    pool = FrozenOpponentPool(
         snapshot_dir=config.snapshot_dir,
         algo_builder=_algo_builder,
         max_snapshots=config.max_snapshots,
@@ -1014,7 +1044,6 @@ def main():
 
     # Training loop
     parser.add_argument('--eval-interval', type=int, default=200_000)
-    parser.add_argument('--snapshot-interval', type=int, default=10_000)
     parser.add_argument('--n-steps-per-epoch', type=int, default=10_000)
     parser.add_argument('--num-envs', type=int, default=1,
                         help='Parallel RLGym-sim environments (default: 1 = sequential)')
@@ -1024,7 +1053,7 @@ def main():
                         help='Gradient steps per training trigger (parallel path)')
 
     # Paths
-    parser.add_argument('--model-dir', default='models/baseline')
+    parser.add_argument('--model-dir', default='models/frozen_self_play')
 
     # W&B
     parser.add_argument('--no-wandb', action='store_true')
@@ -1054,7 +1083,6 @@ def main():
         random_steps=args.random_steps,
         t_window=args.t_window,
         eval_interval=args.eval_interval,
-        snapshot_interval=args.snapshot_interval,
         n_steps_per_epoch=args.n_steps_per_epoch,
         num_envs=args.num_envs,
         collection_buffer_size=args.collection_buffer_size,
