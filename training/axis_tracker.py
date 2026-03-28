@@ -73,8 +73,24 @@ class AxisTracker:
             f'{prefix}axis5_pretrain_gpu_hours': self.pretrain_gpu_hours,
         }
 
+    def get_metrics(self) -> dict:
+        """Return current axis values for MetricsRegistry collection.
+
+        Keys are unprefixed — the registry adds the namespace prefix.
+        """
+        return {
+            'axis1_sim_steps': self.sim_steps,
+            'axis2_replays_loaded': self.replays_loaded,
+            'axis3_labels_consumed': self.labels_consumed,
+            'axis4_reward_components': self.reward_components,
+            'axis5_pretrain_gpu_hours': self.pretrain_gpu_hours,
+        }
+
     def log(self, wandb_mod, step: int) -> None:
-        """Log current axis values to W&B (no-op if wandb_mod is None)."""
+        """Log current axis values to W&B (no-op if wandb_mod is None).
+
+        Deprecated: prefer registering get_metrics with MetricsRegistry.
+        """
         if wandb_mod is None or wandb_mod.run is None:
             return
         wandb_mod.log(self.as_dict(), step=step)

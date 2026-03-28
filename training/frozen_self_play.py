@@ -150,23 +150,25 @@ class FrozenOpponentPool(OpponentPool):
         return self.tracker.should_swap(self.score_threshold)
 
     def log_swap_event(self, total_step: int) -> None:
-        """Log a swap event to stdout and W&B."""
+        """Log a swap event to stdout. W&B logging is handled by the main thread."""
         s = self.tracker.score()
         n = self.num_snapshots()
         print(
             f"[step {total_step:,}] SWAP #{self.swap_count}: "
             f"score={s:.2f}, pool_size={n}"
         )
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    'frozen_self_play/swap_event': self.swap_count,
-                    'frozen_self_play/score_at_swap': s,
-                    'frozen_self_play/pool_size': n,
-                }, step=total_step)
-        except ImportError:
-            pass
+
+    def get_metrics(self) -> dict:
+        """Return current metrics for MetricsRegistry collection.
+
+        Called by the main thread at each logging point. Read-only access
+        to pool state — safe to call from any thread.
+        """
+        return {
+            'swap_count': self.swap_count,
+            'pool_size': self.num_snapshots(),
+            'score': self.tracker.score(),
+        }
 
 
 class OutcomeTrackingEnv:

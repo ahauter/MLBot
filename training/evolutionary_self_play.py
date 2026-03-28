@@ -282,16 +282,16 @@ class EvolutionaryOpponentPool(OpponentPool):
         self._agent_scores.clear()
         self._current_opponent_idx = None
 
-        # Log to W&B if available
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    'evolutionary_pool/generation': self.generation,
-                    'evolutionary_pool/population_size': self.population_size,
-                    'evolutionary_pool/num_survivors': len(survivor_indices),
-                }, step=step)
-        except ImportError:
-            pass
-
         print(f'[EvolutionaryPool] Generation {self.generation} complete\n')
+
+    def get_metrics(self) -> dict:
+        """Return current metrics for MetricsRegistry collection.
+
+        Called by the main thread at each logging point. Read-only access
+        to pool state — safe to call from any thread.
+        """
+        return {
+            'generation': self.generation,
+            'population_size': self.population_size,
+            'num_survivors': self.num_survivors,
+        }

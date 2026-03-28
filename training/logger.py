@@ -1,17 +1,25 @@
 """
 Experiment Logger
 =================
-Thin wrapper around Weights & Biases with a graceful stdout fallback.
+Thin wrapper around Weights & Biases with a graceful stdout fallback,
+plus a MetricsRegistry for decoupled, main-thread-safe custom metric logging.
 
 Usage
 -----
-    from logger import ExperimentLogger
+    from logger import ExperimentLogger, MetricsRegistry
     from train_config import TrainConfig
 
     config = TrainConfig()
     logger = ExperimentLogger(config)          # W&B if available, else stdout
     logger.log(episode, total_loss=0.5, ...)
     logger.finish()
+
+    # Registry pattern — components register metric providers,
+    # main thread collects them all at each logging point:
+    registry = MetricsRegistry()
+    registry.register('frozen_self_play', pool.get_metrics)
+    registry.register('reward', reward_fn.get_metrics)
+    metrics = registry.collect()               # {'frozen_self_play/swap_count': 3, ...}
 
 W&B is enabled when:
   - The `wandb` package is installed, AND
@@ -24,8 +32,8 @@ from __future__ import annotations
 import dataclasses
 import os
 import sys
-from collections import deque
-from typing import Any, Optional
+from collections import OrderedDict, deque
+from typing import Any, Callable, Dict, Optional
 
 
 class ExperimentLogger:
@@ -110,3 +118,78 @@ class ExperimentLogger:
             print(f'[logger] W&B init failed ({exc}) — falling back to stdout.',
                   file=sys.stderr)
             return None
+
+
+class MetricsRegistry:
+    """
+    Collects custom metrics from registered providers for main-thread logging.
+
+    Components (opponent pools, reward functions, encoders, etc.) register a
+    callable that returns a flat dict of metric names to scalar values. The
+    main training loop calls ``collect()`` at each logging point, which
+    invokes every provider and returns a single merged dict with namespaced
+    keys (``"{namespace}/{key}"``).
+
+    This keeps wandb.log() calls exclusively in the main thread, avoiding
+    step-count race conditions from background threads or subprocesses.
+
+    Usage
+    -----
+        registry = MetricsRegistry()
+        registry.register('frozen_self_play', pool.get_metrics)
+        registry.register('reward', reward_fn.get_metrics)
+
+        # In the main-thread logging block:
+        metrics = registry.collect()
+        wandb.log(metrics, step=total_step)
+
+    Provider contract
+    -----------------
+    Each provider callable must:
+      - Accept no arguments: ``def get_metrics() -> dict[str, float | int]``
+      - Return a flat dict of metric names to scalar values
+      - Be safe to call from the main thread (read-only access to shared state)
+    """
+
+    def __init__(self) -> None:
+        self._providers: OrderedDict[str, Callable[[], Dict[str, Any]]] = OrderedDict()
+
+    def register(self, namespace: str, provider: Callable[[], Dict[str, Any]]) -> None:
+        """Register a metrics provider under the given namespace.
+
+        Parameters
+        ----------
+        namespace : str
+            Prefix for all keys returned by this provider (e.g. 'frozen_self_play').
+        provider : callable
+            No-arg callable returning ``{metric_name: scalar_value}``.
+        """
+        self._providers[namespace] = provider
+
+    def unregister(self, namespace: str) -> None:
+        """Remove a previously registered provider."""
+        self._providers.pop(namespace, None)
+
+    def collect(self) -> Dict[str, Any]:
+        """Call all providers and return a merged, namespaced metrics dict.
+
+        Keys are formatted as ``"{namespace}/{metric_name}"``.
+        If a provider raises an exception it is silently skipped and a warning
+        is printed to stderr.
+        """
+        merged: Dict[str, Any] = {}
+        for namespace, provider in self._providers.items():
+            try:
+                raw = provider()
+            except Exception as exc:
+                print(f'[metrics] Provider {namespace!r} failed: {exc}',
+                      file=sys.stderr)
+                continue
+            for key, value in raw.items():
+                merged[f'{namespace}/{key}'] = value
+        return merged
+
+    @property
+    def namespaces(self) -> list[str]:
+        """Return list of registered namespace names."""
+        return list(self._providers.keys())
