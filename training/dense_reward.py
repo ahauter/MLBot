@@ -11,13 +11,16 @@ the default and is unaffected by this module.
 
 Components
 ----------
-1. ball_touch         — event reward on first contact with ball
-2. shot_line          — proximity of car to the ball→own-goal line
-3. ball_proximity     — distance from car to ball
-4. ball_to_goal       — distance from ball to enemy goal
-5. grounded           — binary: car on the ground
-6. car_velocity       — car speed (normalized)
-7. velocity_shot_axis — car velocity projected onto ball→enemy-goal axis
+1. ball_touch            — event reward on first contact with ball
+2. shot_line             — proximity of car to the ball→own-goal line
+3. ball_proximity        — distance from car to ball
+4. offensive_goal_angle  — angle subtended by enemy goalposts at ball position
+5. defensive_goal_angle  — angle subtended by own goalposts at ball position (penalty)
+6. grounded              — binary: car on the ground
+7. car_velocity          — car speed (normalized)
+8. velocity_shot_axis    — car velocity projected onto ball→enemy-goal axis
+9. boost_amount          — current boost level (normalized)
+10. ball_toward_goal     — ball velocity projected onto ball→enemy-goal axis
 """
 from __future__ import annotations
 
@@ -30,7 +33,9 @@ from rlgym_sim.utils.gamestates import GameState, PlayerData
 # ── Arena constants ──────────────────────────────────────────────────────────
 _GOAL_Y = 5124.0
 _MAX_VEL = 2300.0
+_MAX_BALL_VEL = 6000.0
 _FIELD_DIAG = float(np.linalg.norm([4096.0, 5120.0, 2044.0]))
+_GOAL_HALF_WIDTH = 893.0   # from scenario_visualizer.GOAL_HW
 
 # ── Component thresholds ────────────────────────────────────────────────────
 _TOUCH_RADIUS = 200.0       # car-ball distance to count as a touch
@@ -40,13 +45,16 @@ _GROUND_THRESH = 50.0       # car z below this counts as grounded
 
 # ── Default weights ─────────────────────────────────────────────────────────
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    'ball_touch':         0.05,
-    'shot_line':          0.003,
-    'ball_proximity':     0.005,
-    'ball_to_goal':       0.005,
-    'grounded':           0.001,
-    'car_velocity':       0.001,
-    'velocity_shot_axis': 0.003,
+    'ball_touch':            0.05,
+    'shot_line':             0.003,
+    'ball_proximity':        0.005,
+    'offensive_goal_angle':  0.010,
+    'defensive_goal_angle':  0.003,
+    'grounded':              0.001,
+    'car_velocity':          0.001,
+    'velocity_shot_axis':    0.003,
+    'boost_amount':          0.001,
+    'ball_toward_goal':      0.005,
 }
 
 
@@ -91,10 +99,23 @@ def ball_proximity(car_pos: np.ndarray, ball_pos: np.ndarray) -> float:
     return max(0.0, 1.0 - dist / _BALL_PROX_MAX)
 
 
-def ball_to_goal(ball_pos: np.ndarray, enemy_goal_pos: np.ndarray) -> float:
-    """How close the ball is to the enemy goal. [0, 1]."""
-    dist = float(np.linalg.norm(ball_pos - enemy_goal_pos))
-    return max(0.0, 1.0 - dist / _FIELD_DIAG)
+def goal_angle(ball_pos: np.ndarray, goal_y: float) -> float:
+    """
+    Angle (radians) subtended by the goal opening at ball_pos.
+    Projects to the XY plane; returns a value in [0, π].
+    Larger when the ball is closer to and more centered on the goal.
+    """
+    left_post = np.array([-_GOAL_HALF_WIDTH, goal_y])
+    right_post = np.array([_GOAL_HALF_WIDTH, goal_y])
+    bxy = ball_pos[:2]
+
+    v_left = left_post - bxy
+    v_right = right_post - bxy
+
+    cos_theta = np.dot(v_left, v_right) / (
+        np.linalg.norm(v_left) * np.linalg.norm(v_right) + 1e-8
+    )
+    return float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
 
 
 def grounded(car_pos: np.ndarray) -> float:
@@ -116,6 +137,17 @@ def velocity_shot_axis(car_vel: np.ndarray, ball_pos: np.ndarray,
         return 0.0
     axis_unit = axis / norm
     return float(np.clip(np.dot(car_vel, axis_unit) / _MAX_VEL, -1.0, 1.0))
+
+
+def ball_toward_goal(ball_vel: np.ndarray, ball_pos: np.ndarray,
+                     enemy_goal_pos: np.ndarray) -> float:
+    """Ball velocity projected onto ball→enemy-goal axis. [-1, 1]."""
+    axis = enemy_goal_pos - ball_pos
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-8:
+        return 0.0
+    axis_unit = axis / norm
+    return float(np.clip(np.dot(ball_vel, axis_unit) / _MAX_BALL_VEL, -1.0, 1.0))
 
 
 # ── Composite reward function ──────────────────────────────────────────────
@@ -160,6 +192,7 @@ class DenseRewardFunction(RewardFunction):
         car_pos = player.car_data.position
         car_vel = player.car_data.linear_velocity
         ball_pos = state.ball.position
+        ball_vel = state.ball.linear_velocity
         team = player.team_num
         pid = id(player)
 
@@ -183,8 +216,11 @@ class DenseRewardFunction(RewardFunction):
         if w.get('ball_proximity', 0.0):
             total += w['ball_proximity'] * ball_proximity(car_pos, ball_pos)
 
-        if w.get('ball_to_goal', 0.0):
-            total += w['ball_to_goal'] * ball_to_goal(ball_pos, enemy)
+        if w.get('offensive_goal_angle', 0.0):
+            total += w['offensive_goal_angle'] * goal_angle(ball_pos, enemy[1])
+
+        if w.get('defensive_goal_angle', 0.0):
+            total -= w['defensive_goal_angle'] * goal_angle(ball_pos, own[1])
 
         if w.get('grounded', 0.0):
             total += w['grounded'] * grounded(car_pos)
@@ -195,6 +231,14 @@ class DenseRewardFunction(RewardFunction):
         if w.get('velocity_shot_axis', 0.0):
             total += w['velocity_shot_axis'] * velocity_shot_axis(
                 car_vel, ball_pos, enemy
+            )
+
+        if w.get('boost_amount', 0.0):
+            total += w['boost_amount'] * (player.boost_amount / 100.0)
+
+        if w.get('ball_toward_goal', 0.0):
+            total += w['ball_toward_goal'] * ball_toward_goal(
+                ball_vel, ball_pos, enemy
             )
 
         return total

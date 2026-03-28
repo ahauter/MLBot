@@ -288,14 +288,22 @@ def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
             import wandb
             wandb.finish()
         raw_env.close()
-        # Free d3rlpy model + replay buffer to prevent memory accumulation
+        # Free d3rlpy model + replay buffer to prevent memory accumulation.
+        # Delete all local objects that may hold GPU tensors or reference cycles
+        # before invoking the GC, so that torch.cuda.empty_cache() actually
+        # reclaims VRAM. Two gc.collect() passes are needed: the first breaks
+        # reference cycles, the second collects objects freed by the first pass.
+        del encoder_factory, explorer, env, raw_env
         del algo, buffer
         import gc
+        gc.collect()
         gc.collect()
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                from src.encoder import _causal_mask
+                _causal_mask.cache_clear()
         except ImportError:
             pass
 
