@@ -335,6 +335,13 @@ class TrainingCallback:
         if self.axis_tracker is not None:
             self.axis_tracker.log(self._wandb, total_step)
 
+        # Frozen self-play swap tracking (logged from main thread to avoid race conditions)
+        if hasattr(self.pool, 'swap_count'):
+            eval_metrics['frozen_self_play/swap_count'] = self.pool.swap_count
+            eval_metrics['frozen_self_play/pool_size'] = self.pool.num_snapshots()
+            eval_metrics['frozen_self_play/win_rate'] = self.pool.tracker.win_rate()
+            eval_metrics['frozen_self_play/goals_per_ep'] = self.pool.tracker.goals_per_episode()
+
         # Log to W&B
         if self._wandb is not None and self._wandb.run is not None:
             self._wandb.log(eval_metrics, step=total_step)
@@ -790,7 +797,7 @@ def fit_online_parallel(
                 with buf_lock:
                     buf_count = buffer.transition_count
                 goals = list(recent_goals)
-                _wandb.log({
+                epoch_metrics = {
                     # Rolling average reward and goal rates (last 100 episodes)
                     'rollout/avg_episode_return': float(np.mean(recent_returns)) if recent_returns else 0.0,
                     'rollout/score_rate': float(np.mean([g == 1 for g in goals])) if goals else 0.0,
@@ -808,7 +815,15 @@ def fit_online_parallel(
                     # Throughput
                     'timing/steps_per_second': total_step / max(elapsed, 1e-6),
                     'timing/wall_clock_seconds': int(elapsed),
-                }, step=total_step)
+                }
+                # Frozen self-play swap tracking (logged here to avoid race conditions)
+                pool = callback.pool
+                if hasattr(pool, 'swap_count'):
+                    epoch_metrics['frozen_self_play/swap_count'] = pool.swap_count
+                    epoch_metrics['frozen_self_play/pool_size'] = pool.num_snapshots()
+                    epoch_metrics['frozen_self_play/win_rate'] = pool.tracker.win_rate()
+                    epoch_metrics['frozen_self_play/goals_per_ep'] = pool.tracker.goals_per_episode()
+                _wandb.log(epoch_metrics, step=total_step)
 
     pbar.close()
 

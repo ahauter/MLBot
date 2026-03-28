@@ -204,21 +204,10 @@ class FrozenOpponentPool(OpponentPool):
         )
         if warning:
             print(f"[step {total_step:,}] WARNING: {warning}")
-            # Log to W&B if available
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({
-                        'frozen_self_play/defensive_play_warning': 1,
-                        'frozen_self_play/win_rate_at_warning': self.tracker.win_rate(),
-                        'frozen_self_play/goals_per_ep_at_warning': self.tracker.goals_per_episode(),
-                    }, step=total_step)
-            except ImportError:
-                pass
         return do_swap
 
     def log_swap_event(self, total_step: int) -> None:
-        """Log a swap event to stdout and W&B."""
+        """Log a swap event to stdout. W&B logging is handled by the main thread."""
         wr = self.tracker.win_rate()
         gpe = self.tracker.goals_per_episode()
         n = self.num_snapshots()
@@ -226,17 +215,6 @@ class FrozenOpponentPool(OpponentPool):
             f"[step {total_step:,}] SWAP #{self.swap_count}: "
             f"win_rate={wr:.2f}, goals_per_ep={gpe:.2f}, pool_size={n}"
         )
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    'frozen_self_play/swap_event': self.swap_count,
-                    'frozen_self_play/win_rate_at_swap': wr,
-                    'frozen_self_play/goals_per_ep_at_swap': gpe,
-                    'frozen_self_play/pool_size': n,
-                }, step=total_step)
-        except ImportError:
-            pass
 
 
 class OutcomeTrackingEnv:
