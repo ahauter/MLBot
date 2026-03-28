@@ -1,31 +1,35 @@
 """
 Evolutionary Opponent Pool
 ==========================
-Neuroevolution-style self-play: maintain a population of agents, run
-round-robin tournaments, select survivors by cumulative reward, and
-breed new agents via weight crossover with mutation.
+Population-based self-play: maintain a pool of agents, score them by how
+often they beat the training agent during normal training episodes, keep the
+top survivors, and fill remaining slots with Gaussian-noise-perturbed copies
+of the current training agent.
+
+No separate tournament is run — all scoring comes from outcomes already
+observed during training.
 
 Evolution cycle (every ``evolution_interval`` training steps):
   1. Inject the current training agent into population slot 0
-  2. Round-robin tournament: every pair plays ``tournament_matches`` games
-  3. Top ``num_survivors`` by cumulative reward survive
-  4. Fill remaining slots by crossing two random survivors (50% weight
-     swap + small Gaussian mutation noise)
+  2. Score each agent by wins-as-opponent accumulated since last evolution
+  3. Keep top ``num_survivors`` agents (slot 0 always kept)
+  4. Fill remaining slots with slot-0 weights + Gaussian noise
 
 Classes
 -------
 EvolutionaryOpponentPool(OpponentPool)
-    Population-based opponent pool with tournament selection and crossover.
+    Population-based opponent pool with training-tracked selection and
+    noise-only mutation.
 """
 from __future__ import annotations
 
 import random
+import shutil
 import sys
-from itertools import combinations
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 
 _REPO = Path(__file__).parent.parent
@@ -39,15 +43,17 @@ _MODEL_FILE = 'model.pt'
 
 class EvolutionaryOpponentPool(OpponentPool):
     """
-    Population-based opponent pool with tournament selection and crossover.
+    Population-based opponent pool with training-tracked selection and
+    noise-only mutation.
 
     Maintains ``population_size`` agents. Every ``evolution_interval``
-    training steps, runs a full round-robin tournament, keeps the top
-    ``num_survivors``, and fills the remaining slots with offspring
-    created by crossing two random survivors' weights.
+    training steps, scores each agent by how many times it beat the training
+    agent during normal play, keeps the top ``num_survivors`` (plus the
+    current training agent), and fills the remaining slots with noisy copies
+    of the current training agent.
 
-    The current training agent is injected into slot 0 before each
-    tournament so it competes alongside the population.
+    No separate tournament matches are played — all scoring is derived from
+    episode outcomes already observed during training.
 
     Parameters
     ----------
@@ -59,18 +65,11 @@ class EvolutionaryOpponentPool(OpponentPool):
         Number of agents in the population (default 10).
     num_survivors : int
         Number of agents kept after selection (default 3).
-    tournament_matches : int
-        Number of matches each pair plays in the round-robin (default 100).
+        The current training agent (slot 0) is always kept regardless.
     evolution_interval : int
         Training steps between evolution cycles (default 50000).
     mutation_noise : float
-        Std of Gaussian noise added to crossed-over weights (default 0.01).
-    t_window : int
-        Frame history length for tournament match environments.
-    tick_skip : int
-        Physics ticks per action for tournament environments.
-    max_steps : int
-        Max steps per tournament episode.
+        Std of Gaussian noise added to offspring weights (default 0.01).
     """
 
     def __init__(
@@ -79,31 +78,28 @@ class EvolutionaryOpponentPool(OpponentPool):
         algo_builder=None,
         population_size: int = 10,
         num_survivors: int = 3,
-        tournament_matches: int = 100,
         evolution_interval: int = 50_000,
         mutation_noise: float = 0.01,
-        t_window: int = 8,
-        tick_skip: int = 8,
-        max_steps: int = 4500,
     ):
         super().__init__(snapshot_dir, algo_builder, max_snapshots=population_size)
         self.population_size = population_size
         self.num_survivors = num_survivors
-        self.tournament_matches = tournament_matches
         self.evolution_interval = evolution_interval
         self.mutation_noise = mutation_noise
-        self.t_window = t_window
-        self.tick_skip = tick_skip
-        self.max_steps = max_steps
 
         self._last_evolution_step = 0
         self.generation = 0
         self._initialized = False
 
+        # Per-agent outcome tracking: agent_idx -> list of goal values
+        self._agent_scores: Dict[int, List[int]] = {}
+        # Which agent index is currently the opponent (set in sample_opponent)
+        self._current_opponent_idx: Optional[int] = None
+
     # ── OpponentPool interface ──────────────────────────────────────────────
 
     def save_snapshot(self, algo, step: int) -> Path:
-        """Trigger an evolution cycle: inject trainee, tournament, breed."""
+        """Inject training agent into slot 0 and trigger an evolution cycle."""
         if not self._initialized:
             self._initialize_population()
 
@@ -112,20 +108,27 @@ class EvolutionaryOpponentPool(OpponentPool):
         slot_dir.mkdir(parents=True, exist_ok=True)
         algo.save_model(str(slot_dir / _MODEL_FILE))
 
-        # Evolve
         self._evolve(step)
         return self.snapshot_dir
 
     def sample_opponent(self):
-        """Load a random agent from the population."""
+        """Load a random agent from the population and record its index."""
         if not self._initialized:
             self._initialize_population()
 
         agent_dirs = self._list_agent_dirs()
         if not agent_dirs:
+            self._current_opponent_idx = None
             return None
-        snap_dir = random.choice(agent_dirs)
-        return self._load_snapshot(snap_dir)
+
+        chosen = random.choice(agent_dirs)
+        # Extract numeric index from directory name "agent_XX"
+        try:
+            self._current_opponent_idx = int(chosen.name.split('_')[1])
+        except (IndexError, ValueError):
+            self._current_opponent_idx = None
+
+        return self._load_snapshot(chosen)
 
     def latest(self):
         agent_dirs = self._list_agent_dirs()
@@ -141,6 +144,11 @@ class EvolutionaryOpponentPool(OpponentPool):
             self._last_evolution_step = total_step
             return True
         return False
+
+    def on_episode_end(self, goal: int) -> None:
+        """Record the episode outcome against the current opponent agent."""
+        if self._current_opponent_idx is not None:
+            self._agent_scores.setdefault(self._current_opponent_idx, []).append(goal)
 
     # ── population management ───────────────────────────────────────────────
 
@@ -163,7 +171,6 @@ class EvolutionaryOpponentPool(OpponentPool):
             agent_dir = self._agent_dir(i)
             if (agent_dir / _MODEL_FILE).exists():
                 continue  # Already exists (e.g. resumed run)
-            # Each agent gets fresh random weights (different seed per agent)
             torch.manual_seed(random.randint(0, 2**31))
             algo = self._algo_builder()
             agent_dir.mkdir(parents=True, exist_ok=True)
@@ -172,188 +179,108 @@ class EvolutionaryOpponentPool(OpponentPool):
         self._initialized = True
         print(f'[EvolutionaryPool] Population initialized ({self.population_size} agents)')
 
-    # ── tournament ──────────────────────────────────────────────────────────
-
-    def _play_match(self, algo_a, algo_b) -> Tuple[float, float]:
-        """Play one episode between two agents. Returns (reward_a, reward_b)."""
-        from gym_env import BaselineGymEnv
-
-        env = BaselineGymEnv(
-            t_window=self.t_window,
-            tick_skip=self.tick_skip,
-            max_steps=self.max_steps,
-        )
-        env.set_opponent(algo_b)
-
-        obs, _info = env.reset()
-        total_reward_a = 0.0
-        done = False
-
-        while not done:
-            action = algo_a.predict(obs[np.newaxis])[0]
-            obs, reward, done, _, info = env.step(action)
-            total_reward_a += reward
-
-        env.close()
-
-        # Sparse reward is symmetric: if blue gets +1, orange gets -1
-        total_reward_b = -total_reward_a
-        return total_reward_a, total_reward_b
-
-    def _run_tournament(self) -> List[int]:
-        """
-        Round-robin tournament across all population agents.
-
-        Returns indices of the top ``num_survivors`` agents by cumulative reward.
-        """
-        agent_dirs = self._list_agent_dirs()
-        n = len(agent_dirs)
-        rewards = np.zeros(n, dtype=np.float64)
-
-        # Load all agents
-        agents = []
-        for d in agent_dirs:
-            agents.append(self._load_snapshot(d))
-
-        total_pairs = n * (n - 1) // 2
-        pair_count = 0
-
-        for i, j in combinations(range(n), 2):
-            pair_count += 1
-            print(
-                f'[EvolutionaryPool] Tournament pair {pair_count}/{total_pairs}: '
-                f'agent_{i:02d} vs agent_{j:02d}',
-                end='',
-                flush=True,
-            )
-            pair_reward_i = 0.0
-            pair_reward_j = 0.0
-
-            for m in range(self.tournament_matches):
-                # Alternate who is blue/orange for fairness
-                if m % 2 == 0:
-                    r_a, r_b = self._play_match(agents[i], agents[j])
-                    pair_reward_i += r_a
-                    pair_reward_j += r_b
-                else:
-                    r_a, r_b = self._play_match(agents[j], agents[i])
-                    pair_reward_j += r_a
-                    pair_reward_i += r_b
-
-            rewards[i] += pair_reward_i
-            rewards[j] += pair_reward_j
-            print(f'  -> {pair_reward_i:+.1f} / {pair_reward_j:+.1f}')
-
-        # Clean up loaded agents
-        del agents
-
-        # Rank by cumulative reward, return top survivors
-        ranked = np.argsort(rewards)[::-1]  # descending
-        survivors = ranked[:self.num_survivors].tolist()
-
-        print(f'[EvolutionaryPool] Tournament results:')
-        for rank, idx in enumerate(ranked):
-            marker = ' *' if idx in survivors else ''
-            print(f'  #{rank+1} agent_{idx:02d}: reward={rewards[idx]:+.1f}{marker}')
-
-        return survivors
-
-    # ── crossover + mutation ────────────────────────────────────────────────
-
-    def _crossover(self, parent_a_path: Path, parent_b_path: Path) -> dict:
-        """
-        Create a child state_dict by crossing two parents' weights.
-
-        For each parameter tensor, ~50% of elements come from parent A
-        and ~50% from parent B, plus small Gaussian mutation noise.
-        """
-        state_a = torch.load(str(parent_a_path), map_location='cpu')
-        state_b = torch.load(str(parent_b_path), map_location='cpu')
-
-        child_state = {}
-        for key in state_a:
-            tensor_a = state_a[key]
-            tensor_b = state_b[key]
-
-            if tensor_a.is_floating_point():
-                mask = torch.rand_like(tensor_a) > 0.5
-                child = torch.where(mask, tensor_a, tensor_b)
-                # Mutation: tiny Gaussian noise
-                child = child + torch.randn_like(child) * self.mutation_noise
-            else:
-                # Non-float tensors (e.g. int indices): just pick from parent A
-                child = tensor_a.clone()
-
-            child_state[key] = child
-
-        return child_state
-
     # ── evolution cycle ─────────────────────────────────────────────────────
 
+    def _add_noise(self, obj):
+        """Recursively add Gaussian noise to all float tensors in a nested structure."""
+        import collections
+        if isinstance(obj, torch.Tensor):
+            if obj.is_floating_point():
+                return obj + torch.randn_like(obj) * self.mutation_noise
+            return obj.clone()
+        if isinstance(obj, (dict, collections.OrderedDict)):
+            return type(obj)((k, self._add_noise(v)) for k, v in obj.items())
+        if isinstance(obj, (list, tuple)):
+            result = [self._add_noise(v) for v in obj]
+            return type(obj)(result)
+        return obj
+
     def _evolve(self, step: int) -> None:
-        """Run one evolution cycle: tournament, selection, crossover."""
+        """Score agents from training outcomes, select survivors, breed with noise."""
         self.generation += 1
         print(
             f'\n[EvolutionaryPool] === Generation {self.generation} '
             f'(step {step:,}) ==='
         )
 
-        # Run tournament
-        survivor_indices = self._run_tournament()
-
-        # Collect survivor model paths
         agent_dirs = self._list_agent_dirs()
-        survivor_paths = [agent_dirs[i] / _MODEL_FILE for i in survivor_indices]
 
-        # Save survivors to temp location, then rebuild population
-        import shutil
-        import tempfile
+        # Score each agent: count of episodes where it scored against the trainer
+        # (goal == -1 means the opponent scored, i.e. the agent won as opponent)
+        scores: Dict[int, int] = {}
+        for d in agent_dirs:
+            try:
+                idx = int(d.name.split('_')[1])
+            except (IndexError, ValueError):
+                continue
+            results = self._agent_scores.get(idx, [])
+            scores[idx] = sum(1 for g in results if g == -1)
+            print(
+                f'  agent_{idx:02d}: {scores[idx]} wins as opponent '
+                f'({len(results)} games)'
+            )
 
+        # Slot 0 is always the current training agent — always keep it
+        # Fill remaining survivor slots from highest-scoring opponents
+        ranked = sorted(
+            (i for i in scores if i != 0),
+            key=lambda i: scores[i],
+            reverse=True,
+        )
+        survivor_indices = [0] + ranked[: self.num_survivors - 1]
+        print(f'[EvolutionaryPool] Survivors: {[f"agent_{i:02d}" for i in survivor_indices]}')
+
+        # Preserve survivors via temp directory, then rebuild population
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-
-            # Copy survivors
+            tmp_path = Path(tmp)
             for rank, idx in enumerate(survivor_indices):
-                src = agent_dirs[idx]
-                dst = tmp / f'survivor_{rank:02d}'
-                shutil.copytree(str(src), str(dst))
+                shutil.copytree(
+                    str(self._agent_dir(idx)),
+                    str(tmp_path / f's_{rank:02d}'),
+                )
 
-            # Clear population directory
+            # Clear existing population
             for d in agent_dirs:
                 shutil.rmtree(str(d), ignore_errors=True)
 
-            # Place survivors in first slots
+            # Restore survivors to first slots
             for rank in range(len(survivor_indices)):
-                src = tmp / f'survivor_{rank:02d}'
-                dst = self._agent_dir(rank)
-                shutil.copytree(str(src), str(dst))
+                shutil.copytree(
+                    str(tmp_path / f's_{rank:02d}'),
+                    str(self._agent_dir(rank)),
+                )
 
-        # Fill remaining slots with offspring
-        n_offspring = self.population_size - self.num_survivors
-        print(f'[EvolutionaryPool] Breeding {n_offspring} offspring...')
+        # Build 3:2:1 parent assignment across survivors by rank
+        n_offspring = self.population_size - len(survivor_indices)
+        base_counts = [3, 2, 1]
+        parent_assignments: List[int] = []
+        for rank in range(len(survivor_indices)):
+            count = base_counts[rank] if rank < len(base_counts) else 1
+            parent_assignments.extend([rank] * count)
+        # Extras go to rank 0
+        while len(parent_assignments) < n_offspring:
+            parent_assignments.insert(0, 0)
+        parent_assignments = parent_assignments[:n_offspring]
 
-        for i in range(n_offspring):
-            child_idx = self.num_survivors + i
+        print(f'[EvolutionaryPool] Breeding {n_offspring} offspring (noise std={self.mutation_noise})...')
 
-            # Pick two random (distinct) survivors as parents
-            parent_a_idx, parent_b_idx = random.sample(
-                range(self.num_survivors), 2
-            )
-            parent_a_path = self._agent_dir(parent_a_idx) / _MODEL_FILE
-            parent_b_path = self._agent_dir(parent_b_idx) / _MODEL_FILE
+        # Load survivor states (only those actually needed)
+        survivor_states: Dict[int, object] = {}
+        for rank in set(parent_assignments):
+            path = self._agent_dir(rank) / _MODEL_FILE
+            survivor_states[rank] = torch.load(str(path), map_location='cpu')
 
-            # Crossover + mutation
-            child_state = self._crossover(parent_a_path, parent_b_path)
-
-            # Save child
+        for i, parent_rank in enumerate(parent_assignments):
+            child_idx = len(survivor_indices) + i
+            noisy_state = self._add_noise(survivor_states[parent_rank])
             child_dir = self._agent_dir(child_idx)
             child_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(child_state, str(child_dir / _MODEL_FILE))
+            torch.save(noisy_state, str(child_dir / _MODEL_FILE))
+            print(f'  agent_{child_idx:02d} = survivor_rank{parent_rank} + noise')
 
-            print(
-                f'  agent_{child_idx:02d} = '
-                f'crossover(agent_{parent_a_idx:02d}, agent_{parent_b_idx:02d})'
-            )
+        # Reset tracking for next generation
+        self._agent_scores.clear()
+        self._current_opponent_idx = None
 
         # Log to W&B if available
         try:
@@ -362,7 +289,7 @@ class EvolutionaryOpponentPool(OpponentPool):
                 wandb.log({
                     'evolutionary_pool/generation': self.generation,
                     'evolutionary_pool/population_size': self.population_size,
-                    'evolutionary_pool/num_survivors': self.num_survivors,
+                    'evolutionary_pool/num_survivors': len(survivor_indices),
                 }, step=step)
         except ImportError:
             pass

@@ -22,6 +22,9 @@ Usage
 
     # Short test run:
     python training/train.py --total-steps 10000 --eval-interval 5000
+
+    # Resume a checkpointed run:
+    python training/train.py --resume-from models/frozen_self_play/seed_0
 """
 from __future__ import annotations
 
@@ -118,9 +121,8 @@ class TrainConfig:
     pool_type: str = 'frozen'         # 'frozen' or 'evolutionary'
     population_size: int = 10         # evolutionary pool: population size
     num_survivors: int = 3            # evolutionary pool: survivors per generation
-    tournament_matches: int = 100     # evolutionary pool: matches per pair in tournament
     evolution_interval: int = 50_000  # evolutionary pool: steps between evolutions
-    mutation_noise: float = 0.01      # evolutionary pool: crossover mutation std
+    mutation_noise: float = 0.01      # evolutionary pool: mutation noise std
 
     # ── reward ──────────────────────────────────────────────────────────────
     reward_type: str = 'sparse'       # 'sparse' or 'dense'
@@ -138,6 +140,7 @@ class TrainConfig:
     intervention: str = 'frozen_self_play'        # intervention name for metadata
     replay_seed_dir: Optional[str] = None         # pre-load replay data into buffer
     pretrained_encoder_path: Optional[str] = None  # load pre-trained encoder weights
+    resume_from: Optional[str] = None             # path to checkpoint dir to resume from
 
     # ── W&B ──────────────────────────────────────────────────────────────────
     wandb_project: str = 'rlbot-baseline'
@@ -311,9 +314,18 @@ class TrainingCallback:
         # Try to run evaluation if evaluate module is available
         try:
             from evaluate import run_evaluation
-            model_dir = Path(self.config.model_dir) / 'eval_temp'
+            model_dir = Path(self.config.model_dir) / f'seed_{self.config.seed}'
             model_dir.mkdir(parents=True, exist_ok=True)
             algo.save(str(model_dir / 'd3rlpy_model'))
+            _wandb_run_id = None
+            if self._wandb is not None and self._wandb.run is not None:
+                _wandb_run_id = self._wandb.run.id
+            with open(model_dir / 'checkpoint_meta.json', 'w') as _f:
+                json.dump({
+                    'total_steps': total_step,
+                    'consecutive_wins': self.consecutive_wins,
+                    'wandb_run_id': _wandb_run_id,
+                }, _f)
 
             win_rates = run_evaluation(str(model_dir))
             eval_metrics.update({
@@ -631,6 +643,7 @@ def fit_online_parallel(
     callback,
     on_episode_complete=None,
     axis_tracker=None,
+    start_step: int = 0,
 ) -> None:
     """
     Parallel replacement for d3rlpy's fit_online().
@@ -682,9 +695,10 @@ def fit_online_parallel(
     trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock)
     collected_since_trigger = 0
 
-    total_step = 0
+    total_step = start_step
     pending_resets: set = set()  # env indices waiting for async reset
-    pbar = trange(1, config.total_steps + 1, desc='Training')
+    pbar = trange(start_step + 1, config.total_steps + 1, initial=start_step,
+                  total=config.total_steps, desc='Training')
 
     while total_step < config.total_steps:
         # ── collect any pending resets from previous iteration ─────────────
@@ -748,11 +762,16 @@ def fit_online_parallel(
                     callback.on_episode_end(algo, total_step, info.get('goal', 0))
 
                 if _wandb:
-                    _wandb.log({
+                    episode_metrics = {
                         'rollout/episode_return': rollout_returns[i],
                         'rollout/episode_length': len(local_blue[i]),
                         'rollout/goal': info.get('goal', 0),
-                    }, step=total_step)
+                    }
+                    pool = getattr(callback, 'pool', None)
+                    tracker = getattr(pool, 'tracker', None)
+                    if tracker is not None and tracker.episode_count >= tracker.window_size:
+                        episode_metrics['frozen_self_play/score'] = tracker.score()
+                    _wandb.log(episode_metrics, step=total_step)
 
                 local_blue[i] = []
                 local_orange[i] = []
@@ -859,6 +878,38 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
     with open(model_dir / 'config.json', 'w') as f:
         json.dump(dataclasses.asdict(config), f, indent=2)
 
+    # ── resume from checkpoint ────────────────────────────────────────────
+    resume_step = 0
+    wandb_resume_id = None
+    if config.resume_from:
+        resume_path = Path(config.resume_from)
+        meta_path = resume_path / 'checkpoint_meta.json'
+        if not resume_path.exists():
+            raise FileNotFoundError(f'Resume path not found: {resume_path}')
+        if meta_path.exists():
+            with open(meta_path) as f:
+                meta = json.load(f)
+            resume_step = meta.get('total_steps', 0)
+            wandb_resume_id = meta.get('wandb_run_id')
+            print(f'Resuming from checkpoint: {resume_path}')
+            print(f'  Restoring from step {resume_step:,}')
+            if wandb_resume_id:
+                print(f'  Linking to W&B run: {wandb_resume_id}')
+        else:
+            print(f'Resuming from checkpoint: {resume_path} (no meta, starting step count from 0)')
+
+    # ── pre-init W&B for resume (must happen before d3rlpy or parallel path) ──
+    if wandb_resume_id and not config.no_wandb:
+        try:
+            import wandb as _wandb_pre
+            _wandb_pre.init(
+                id=wandb_resume_id,
+                resume='must',
+                project=config.wandb_project,
+            )
+        except Exception as e:
+            print(f'  W&B resume init failed ({e}), will start a new run.')
+
     parallel = config.num_envs > 1
 
     print(f'Training config:')
@@ -888,7 +939,11 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
         )
 
     # ── d3rlpy algorithm ─────────────────────────────────────────────────
-    algo = build_algo(config)
+    if config.resume_from:
+        algo = d3rlpy.load_learnable(str(Path(config.resume_from) / 'd3rlpy_model'))
+        print(f'  Loaded model weights from {config.resume_from}/d3rlpy_model')
+    else:
+        algo = build_algo(config)
 
     # ── self-play opponent pool (frozen) ─────────────────────────────────
     def _algo_builder():
@@ -902,10 +957,8 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
             algo_builder=_algo_builder,
             population_size=config.population_size,
             num_survivors=config.num_survivors,
-            tournament_matches=config.tournament_matches,
             evolution_interval=config.evolution_interval,
             mutation_noise=config.mutation_noise,
-            t_window=config.t_window,
         )
     else:
         pool = FrozenOpponentPool(
@@ -952,15 +1005,16 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
         # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
         if not config.no_wandb:
             import wandb
-            run_name = config.wandb_run_name or f'{config.algo}_seed{config.seed}'
-            init_kwargs = dict(
-                project=config.wandb_project,
-                name=run_name,
-                config=dataclasses.asdict(config),
-            )
-            if config.wandb_group:
-                init_kwargs['group'] = config.wandb_group
-            wandb.init(**init_kwargs)
+            if wandb.run is None:
+                run_name = config.wandb_run_name or f'{config.algo}_seed{config.seed}'
+                init_kwargs = dict(
+                    project=config.wandb_project,
+                    name=run_name,
+                    config=dataclasses.asdict(config),
+                )
+                if config.wandb_group:
+                    init_kwargs['group'] = config.wandb_group
+                wandb.init(**init_kwargs)
 
         envs = SubprocVecEnv(
             num_envs=config.num_envs,
@@ -981,6 +1035,7 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
                 explorer=explorer,
                 callback=callback,
                 axis_tracker=axis_tracker,
+                start_step=resume_step,
             )
         finally:
             envs.close()
@@ -989,14 +1044,17 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
                 if wandb.run is not None:
                     wandb.finish()
     else:
+        remaining_steps = config.total_steps - resume_step
+        # On resume, skip random exploration (already done in the original run)
+        random_steps = 0 if resume_step > 0 else config.random_steps
         algo.fit_online(
             env=env,
             buffer=buffer,
             explorer=explorer,
-            n_steps=config.total_steps,
+            n_steps=remaining_steps,
             n_steps_per_epoch=config.n_steps_per_epoch,
             update_interval=config.update_interval,
-            random_steps=config.random_steps,
+            random_steps=random_steps,
             experiment_name=f'{config.algo}_seed{config.seed}',
             logger_adapter=logger_adapter,
             show_progress=True,
@@ -1005,6 +1063,9 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
 
     # ── save final model ─────────────────────────────────────────────────
     algo.save(str(model_dir / 'final_model'))
+    algo.save(str(model_dir / 'd3rlpy_model'))
+    with open(model_dir / 'checkpoint_meta.json', 'w') as f:
+        json.dump({'total_steps': config.total_steps + resume_step, 'done': True}, f)
     print(f'\nTraining complete. Model saved to {model_dir}')
 
     if callback.converged:
@@ -1080,8 +1141,6 @@ def main():
                         help='Evolutionary pool: number of agents in population')
     parser.add_argument('--num-survivors', type=int, default=3,
                         help='Evolutionary pool: survivors kept per generation')
-    parser.add_argument('--tournament-matches', type=int, default=100,
-                        help='Evolutionary pool: matches per pair in round-robin')
     parser.add_argument('--evolution-interval', type=int, default=50_000,
                         help='Evolutionary pool: training steps between evolutions')
     parser.add_argument('--mutation-noise', type=float, default=0.01,
@@ -1089,6 +1148,8 @@ def main():
 
     # Paths
     parser.add_argument('--model-dir', default='models/frozen_self_play')
+    parser.add_argument('--resume-from', default=None,
+                        help='Resume from a checkpoint directory (e.g. models/frozen_self_play/seed_0)')
 
     # W&B
     parser.add_argument('--no-wandb', action='store_true')
@@ -1125,12 +1186,12 @@ def main():
         pool_type=args.pool_type,
         population_size=args.population_size,
         num_survivors=args.num_survivors,
-        tournament_matches=args.tournament_matches,
         evolution_interval=args.evolution_interval,
         mutation_noise=args.mutation_noise,
         model_dir=args.model_dir,
         no_wandb=args.no_wandb,
         wandb_project=args.wandb_project,
+        resume_from=args.resume_from,
     )
 
     # Override with Optuna-tuned params if requested
