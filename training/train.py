@@ -54,6 +54,7 @@ from baseline_encoder_factory import TransformerEncoderFactory
 from gym_env import BaselineGymEnv
 from self_play import OpponentPool
 from frozen_self_play import FrozenOpponentPool, OutcomeTrackingEnv
+from evolutionary_self_play import EvolutionaryOpponentPool
 from encoder import N_TOKENS, TOKEN_FEATURES
 
 
@@ -112,6 +113,14 @@ class TrainConfig:
 
     # ── self-play (frozen opponent) ─────────────────────────────────────────
     max_snapshots: int = 5
+
+    # ── opponent pool ────────────────────────────────────────────────────────
+    pool_type: str = 'frozen'         # 'frozen' or 'evolutionary'
+    population_size: int = 10         # evolutionary pool: population size
+    num_survivors: int = 3            # evolutionary pool: survivors per generation
+    tournament_matches: int = 100     # evolutionary pool: matches per pair in tournament
+    evolution_interval: int = 50_000  # evolutionary pool: steps between evolutions
+    mutation_noise: float = 0.01      # evolutionary pool: crossover mutation std
 
     # ── reward ──────────────────────────────────────────────────────────────
     reward_type: str = 'sparse'       # 'sparse' or 'dense'
@@ -887,11 +896,23 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
         a.build_with_env(env)
         return a
 
-    pool = FrozenOpponentPool(
-        snapshot_dir=config.snapshot_dir,
-        algo_builder=_algo_builder,
-        max_snapshots=config.max_snapshots,
-    )
+    if config.pool_type == 'evolutionary':
+        pool = EvolutionaryOpponentPool(
+            snapshot_dir=config.snapshot_dir,
+            algo_builder=_algo_builder,
+            population_size=config.population_size,
+            num_survivors=config.num_survivors,
+            tournament_matches=config.tournament_matches,
+            evolution_interval=config.evolution_interval,
+            mutation_noise=config.mutation_noise,
+            t_window=config.t_window,
+        )
+    else:
+        pool = FrozenOpponentPool(
+            snapshot_dir=config.snapshot_dir,
+            algo_builder=_algo_builder,
+            max_snapshots=config.max_snapshots,
+        )
 
     # ── callback ─────────────────────────────────────────────────────────
     callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker)
@@ -1052,6 +1073,20 @@ def main():
     parser.add_argument('--updates-per-swap', type=int, default=500,
                         help='Gradient steps per training trigger (parallel path)')
 
+    # Opponent pool
+    parser.add_argument('--pool-type', default='frozen', choices=['frozen', 'evolutionary'],
+                        help='Opponent pool type: frozen (performance-gated) or evolutionary')
+    parser.add_argument('--population-size', type=int, default=10,
+                        help='Evolutionary pool: number of agents in population')
+    parser.add_argument('--num-survivors', type=int, default=3,
+                        help='Evolutionary pool: survivors kept per generation')
+    parser.add_argument('--tournament-matches', type=int, default=100,
+                        help='Evolutionary pool: matches per pair in round-robin')
+    parser.add_argument('--evolution-interval', type=int, default=50_000,
+                        help='Evolutionary pool: training steps between evolutions')
+    parser.add_argument('--mutation-noise', type=float, default=0.01,
+                        help='Evolutionary pool: std of Gaussian mutation noise')
+
     # Paths
     parser.add_argument('--model-dir', default='models/frozen_self_play')
 
@@ -1087,6 +1122,12 @@ def main():
         num_envs=args.num_envs,
         collection_buffer_size=args.collection_buffer_size,
         updates_per_swap=args.updates_per_swap,
+        pool_type=args.pool_type,
+        population_size=args.population_size,
+        num_survivors=args.num_survivors,
+        tournament_matches=args.tournament_matches,
+        evolution_interval=args.evolution_interval,
+        mutation_noise=args.mutation_noise,
         model_dir=args.model_dir,
         no_wandb=args.no_wandb,
         wandb_project=args.wandb_project,
