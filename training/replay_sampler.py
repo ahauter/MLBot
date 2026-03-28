@@ -264,9 +264,10 @@ class BallchasingClient:
     Pass it via the Authorization header as a plain token string.
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, limiter: Optional['_RateLimiter'] = None) -> None:
         self._session = requests.Session()
         self._session.headers['Authorization'] = api_key
+        self._limiter = limiter
 
     def search_replays(
         self,
@@ -293,12 +294,24 @@ class BallchasingClient:
         }
 
         while len(results) < count:
-            if next_url:
-                resp = self._session.get(next_url)
-            else:
-                resp = self._session.get(
-                    f'{BALLCHASING_API}/replays', params=params)
-            resp.raise_for_status()
+            for attempt in range(5):
+                if self._limiter:
+                    self._limiter.acquire()
+                try:
+                    if next_url:
+                        resp = self._session.get(next_url)
+                    else:
+                        resp = self._session.get(
+                            f'{BALLCHASING_API}/replays', params=params)
+                    resp.raise_for_status()
+                    break
+                except requests.HTTPError as exc:
+                    if exc.response.status_code == 429 and attempt < 4:
+                        wait = 2 ** attempt * 5  # 5, 10, 20, 40 s
+                        print(f'Search 429 — retrying in {wait}s (attempt {attempt + 1}/5)')
+                        time.sleep(wait)
+                        continue
+                    raise
             data = resp.json()
             results.extend(data.get('list', []))
             next_url = data.get('next')
@@ -375,7 +388,9 @@ def _process_one(
                 break
             except requests.HTTPError as exc:
                 if exc.response.status_code == 429 and attempt < 4:
-                    time.sleep(2 ** attempt)   # 1, 2, 4, 8 s
+                    wait = 2 ** attempt * 5  # 5, 10, 20, 40 s
+                    print(f'Download 429 — retrying in {wait}s (attempt {attempt + 1}/5)')
+                    time.sleep(wait)
                     continue
                 raise
         tokens, actions, rewards, dones = parse_replay(raw_path)
@@ -457,8 +472,8 @@ def collect(
 
     manifest = _load_manifest(manifest_path) if resume else {}
     manifest_lock = threading.Lock()
-    limiter = _RateLimiter(rate=1.5)
-    client = BallchasingClient(api_key)
+    limiter = _RateLimiter(rate=1.0)
+    client = BallchasingClient(api_key, limiter=limiter)
 
     print(f'Searching ballchasing.com for {count} replays '
           f'(rank: {min_rank}–{max_rank}, playlist: {playlist}) ...')
