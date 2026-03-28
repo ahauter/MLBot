@@ -333,10 +333,6 @@ class TrainingCallback:
         except (ImportError, Exception) as e:
             print(f'  Evaluation skipped: {e}')
 
-        # Log axis costs alongside eval metrics
-        if self.axis_tracker is not None:
-            self.axis_tracker.log(self._wandb, total_step)
-
         # Collect custom metrics from registered providers (main-thread safe)
         if self.metrics_registry is not None:
             eval_metrics.update(self.metrics_registry.collect())
@@ -617,6 +613,69 @@ class AsyncTrainer:
                     self._pending_metrics = avg
 
 
+# ── metrics providers ────────────────────────────────────────────────────────
+
+class RolloutMetricsProvider:
+    """Provides rolling episode return and goal rates from deques."""
+
+    def __init__(self, recent_returns: deque, recent_goals: deque):
+        self._returns = recent_returns
+        self._goals = recent_goals
+
+    def get_metrics(self) -> dict:
+        goals = list(self._goals)
+        return {
+            'avg_episode_return': float(np.mean(self._returns)) if self._returns else 0.0,
+            'score_rate': float(np.mean([g == 1 for g in goals])) if goals else 0.0,
+            'concede_rate': float(np.mean([g == -1 for g in goals])) if goals else 0.0,
+        }
+
+
+class CollectionMetricsProvider:
+    """Provides replay buffer and env count metrics."""
+
+    def __init__(self, buffer, buf_lock: threading.Lock, num_envs: int):
+        self._buffer = buffer
+        self._lock = buf_lock
+        self._num_envs = num_envs
+
+    def get_metrics(self) -> dict:
+        with self._lock:
+            count = self._buffer.transition_count
+        return {
+            'buffer_transition_count': count,
+            'num_envs': self._num_envs,
+        }
+
+
+class TimingMetricsProvider:
+    """Provides throughput and wall-clock metrics."""
+
+    def __init__(self, start_wall: float):
+        self._start_wall = start_wall
+        self._total_step = 0
+
+    def update_step(self, total_step: int) -> None:
+        self._total_step = total_step
+
+    def get_metrics(self) -> dict:
+        elapsed = time.time() - self._start_wall
+        return {
+            'steps_per_second': self._total_step / max(elapsed, 1e-6),
+            'wall_clock_seconds': int(elapsed),
+        }
+
+
+class AsyncTrainerMetricsProvider:
+    """Drains pending metrics from AsyncTrainer (pop-once semantics)."""
+
+    def __init__(self, trainer: AsyncTrainer):
+        self._trainer = trainer
+
+    def get_metrics(self) -> dict:
+        return self._trainer.pop_metrics()
+
+
 # ── parallel online training loop ────────────────────────────────────────────
 
 def fit_online_parallel(
@@ -679,6 +738,14 @@ def fit_online_parallel(
     buf_lock = threading.Lock()
     trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock)
     collected_since_trigger = 0
+
+    # Register metrics providers for this training loop
+    timing_provider = TimingMetricsProvider(start_wall)
+    if metrics_registry is not None:
+        metrics_registry.register('rollout', RolloutMetricsProvider(recent_returns, recent_goals).get_metrics)
+        metrics_registry.register('collect', CollectionMetricsProvider(buffer, buf_lock, num_envs).get_metrics)
+        metrics_registry.register('timing', timing_provider.get_metrics)
+        metrics_registry.register('train', AsyncTrainerMetricsProvider(trainer).get_metrics)
 
     total_step = 0
     pending_resets: set = set()  # env indices waiting for async reset
@@ -773,10 +840,6 @@ def fit_online_parallel(
             total_step > config.random_steps
             and collected_since_trigger >= config.collection_buffer_size
         ):
-            if _wandb is not None and _wandb.run is not None:
-                pending = trainer.pop_metrics()
-                if pending:
-                    _wandb.log(pending, step=total_step)
             trainer.trigger(config.updates_per_swap)
             collected_since_trigger = 0
 
@@ -793,33 +856,9 @@ def fit_online_parallel(
                 pending_resets.discard(_i)
             callback(algo, epoch, total_step)
             if _wandb is not None and _wandb.run is not None:
-                elapsed = time.time() - start_wall
-                with buf_lock:
-                    buf_count = buffer.transition_count
-                goals = list(recent_goals)
-                epoch_metrics = {
-                    # Rolling average reward and goal rates (last 100 episodes)
-                    'rollout/avg_episode_return': float(np.mean(recent_returns)) if recent_returns else 0.0,
-                    'rollout/score_rate': float(np.mean([g == 1 for g in goals])) if goals else 0.0,
-                    'rollout/concede_rate': float(np.mean([g == -1 for g in goals])) if goals else 0.0,
-                    # Axis 1 — simulation steps (key research metric)
-                    'consumed_resources/env_steps': total_step,
-                    # Axes 2-5 — zero for baseline, always logged for cross-run consistency
-                    'consumed_resources/replays_loaded': 0,
-                    'consumed_resources/labels_consumed': 0,
-                    'consumed_resources/reward_components': 1,
-                    'consumed_resources/pretrain_gpu_hours': 0.0,
-                    # Collection health
-                    'collect/buffer_transition_count': buf_count,
-                    'collect/num_envs': num_envs,
-                    # Throughput
-                    'timing/steps_per_second': total_step / max(elapsed, 1e-6),
-                    'timing/wall_clock_seconds': int(elapsed),
-                }
-                # Collect custom metrics from registered providers (main-thread safe)
+                timing_provider.update_step(total_step)
                 if metrics_registry is not None:
-                    epoch_metrics.update(metrics_registry.collect())
-                _wandb.log(epoch_metrics, step=total_step)
+                    _wandb.log(metrics_registry.collect(), step=total_step)
 
     pbar.close()
 
@@ -907,6 +946,8 @@ def train(config: TrainConfig, axis_tracker=None) -> None:
     # ── metrics registry ─────────────────────────────────────────────────
     metrics_registry = MetricsRegistry()
     metrics_registry.register('frozen_self_play', pool.get_metrics)
+    if axis_tracker is not None:
+        metrics_registry.register('consumed_resources', axis_tracker.get_metrics)
 
     # ── callback ─────────────────────────────────────────────────────────
     callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker,
