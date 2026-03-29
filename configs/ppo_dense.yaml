@@ -1,0 +1,22 @@
+algorithm:
+  class: training.algorithms.ppo.PPOAlgorithm
+
+opponent_pool:
+  class: training.opponents.pool.HistoricalOpponentPool
+
+reward:
+  class: training.rewards.dense.DenseRewardFunction
+
+seed: 0
+total_steps: 5e7
+num_envs: 8
+eval_interval: 1e4
+t_window: 8
+
+population:
+  agents: 4
+  generation_steps: 1e4
+
+wandb:
+  project: ppo-tuning-0
+  enabled: true

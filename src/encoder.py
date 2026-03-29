@@ -352,13 +352,13 @@ class SharedTransformerEncoder(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path: str) -> None:
-        self.load_state_dict(torch.load(path, map_location='cpu'))
+        self.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))
 
     @classmethod
     def load_from(cls, path: str) -> 'SharedTransformerEncoder':
         """Load a saved encoder from a .pt checkpoint."""
         model = cls()
-        state = torch.load(path, map_location='cpu')
+        state = torch.load(path, map_location='cpu', weights_only=True)
         # Migration: old checkpoints have pos_embedding — drop it silently.
         state.pop('pos_embedding', None)
         model.load_state_dict(state, strict=False)
