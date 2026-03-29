@@ -379,7 +379,9 @@ class AsyncUpdater:
             agent_id, agent = item
             self._busy.set()
             try:
+                _t0 = time.perf_counter()
                 metrics = agent.update()
+                metrics['update_wall_time'] = time.perf_counter() - _t0
                 agent.buffer.reset()
                 agent._buffer_ready.set()
                 with self._lock:
@@ -440,6 +442,57 @@ class TimingMetricsProvider:
         }
 
 
+# ── collection profiler ─────────────────────────────────────────────────────
+
+class CollectionProfiler:
+    """Per-collection-round wall-clock breakdown and transition counters.
+
+    Follows the MetricsRegistry provider contract: get_metrics() -> dict.
+    Uses time.perf_counter() for sub-microsecond monotonic timing.
+    """
+
+    def __init__(self):
+        self._timers: Dict[str, float] = {}
+        self._counters: Dict[str, int] = {}
+        self._history: deque = deque(maxlen=100)
+        self._round_start: float = 0.0
+
+    def start_round(self):
+        """Call at the beginning of each collection round."""
+        self._timers.clear()
+        self._counters.clear()
+        self._round_start = time.perf_counter()
+
+    def add_time(self, name: str, elapsed: float):
+        """Accumulate wall-clock seconds for a named category."""
+        self._timers[name] = self._timers.get(name, 0.0) + elapsed
+
+    def incr(self, name: str, n: int = 1):
+        """Increment a named counter."""
+        self._counters[name] = self._counters.get(name, 0) + n
+
+    def end_round(self):
+        """Call at the end of each collection round. Snapshots current data."""
+        total = time.perf_counter() - self._round_start
+        snapshot = {**self._timers, 'round_total_time': total, **self._counters}
+        self._history.append(snapshot)
+
+    def get_metrics(self) -> dict:
+        """Return latest round's breakdown with absolute times and percentages."""
+        if not self._history:
+            return {}
+        latest = self._history[-1]
+        total = latest.get('round_total_time', 1e-9)
+        metrics: Dict[str, Any] = {}
+        for k, v in latest.items():
+            if k.endswith('_time'):
+                metrics[k] = v
+                metrics[k + '_pct'] = 100.0 * v / total
+            else:
+                metrics[k] = v
+        return metrics
+
+
 # ── collect and train ───────────────────────────────────────────────────────
 
 def collect_and_train(
@@ -449,6 +502,7 @@ def collect_and_train(
     rollout_metrics: RolloutMetricsProvider,
     config: dict,
     executor: concurrent.futures.ThreadPoolExecutor,
+    profiler: Optional[CollectionProfiler] = None,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
 
@@ -469,10 +523,17 @@ def collect_and_train(
         'params', {}).get('rollout_steps', 2048)
 
     # If all agents are mid-update, yield briefly rather than hot-spinning
+    _t0 = time.perf_counter()
     while not any(agents[ai]._buffer_ready.is_set() for ai in range(len(agents))):
         time.sleep(0.005)
+    if profiler:
+        profiler.add_time('idle_time', time.perf_counter() - _t0)
 
+    _t0 = time.perf_counter()
     obs = envs.reset_all()  # (num_envs, obs_dim)
+    if profiler:
+        profiler.add_time('env_reset_time', time.perf_counter() - _t0)
+
     episode_returns = np.zeros(num_envs, dtype=np.float32)
     episode_lengths = np.zeros(num_envs, dtype=np.int64)
 
@@ -485,6 +546,7 @@ def collect_and_train(
         actions = np.zeros((num_envs, 8), dtype=np.float32)
         action_results = [None] * num_envs
 
+        _t0 = time.perf_counter()
         futures = {executor.submit(_select, item): item
                    for item in agent_workers.items()}
         for fut in concurrent.futures.as_completed(futures):
@@ -495,14 +557,22 @@ def collect_and_train(
                     action=result.action[local_i:local_i+1],
                     aux={k: v[local_i:local_i+1] for k, v in result.aux.items()},
                 )
+        if profiler:
+            profiler.add_time('action_select_time', time.perf_counter() - _t0)
 
         # Step all envs
+        _t0 = time.perf_counter()
         next_obs, rewards, dones, infos = envs.step(actions)
+        if profiler:
+            profiler.add_time('env_step_time', time.perf_counter() - _t0)
 
         # Store transitions — skip agents whose buffer is being updated
+        _t0 = time.perf_counter()
         for agent_idx, worker_ids in agent_workers.items():
             agent = agents[agent_idx]
             if not agent._buffer_ready.is_set():
+                if profiler:
+                    profiler.incr('transitions_discarded', len(worker_ids))
                 continue  # update in flight; discard these transitions
             w_obs = obs[worker_ids]
             w_rewards = rewards[worker_ids]
@@ -518,6 +588,10 @@ def collect_and_train(
             )
             agent.store_transition(
                 w_obs, combined_result, w_rewards, next_obs[worker_ids], w_dones, {})
+            if profiler:
+                profiler.incr('transitions_collected', len(worker_ids))
+        if profiler:
+            profiler.add_time('store_transition_time', time.perf_counter() - _t0)
 
         # Track episodes
         for wi in range(num_envs):
@@ -530,6 +604,8 @@ def collect_and_train(
                 population.add_score(worker_map[wi], float(goal))
                 episode_returns[wi] = 0.0
                 episode_lengths[wi] = 0
+                if profiler:
+                    profiler.incr('episodes_completed')
 
         obs = next_obs
 
@@ -618,8 +694,10 @@ def train(config: dict):
     # ── register metrics providers ──────────────────────────────────────
     rollout_metrics = RolloutMetricsProvider()
     timing_metrics = TimingMetricsProvider()
+    profiler = CollectionProfiler()
     registry.register('rollout', rollout_metrics.get_metrics)
     registry.register('timing', timing_metrics.get_metrics)
+    registry.register('perf', profiler.get_metrics)
     if pool:
         registry.register('opponent_pool', pool.get_metrics)
     registry.register('population', population.get_metrics)
@@ -640,16 +718,22 @@ def train(config: dict):
     pbar = tqdm(total=total_steps, unit='step', dynamic_ncols=True)
     try:
         while total_collected < total_steps:
+            profiler.start_round()
+
             # Set opponents from pool
             if pool and pool.num_snapshots() > 0:
                 snap_path = pool.sample_opponent()
                 if snap_path:
+                    _t0 = time.perf_counter()
                     envs.set_opponent_snapshot(snap_path)
+                    profiler.add_time('opponent_load_time', time.perf_counter() - _t0)
 
             # Collect rollouts and trigger updates (non-blocking; per-agent
             # _buffer_ready gates writes while updates are in flight)
             steps = collect_and_train(
-                population, envs, updater, rollout_metrics, config, executor)
+                population, envs, updater, rollout_metrics, config, executor,
+                profiler=profiler)
+            profiler.end_round()
             total_collected += steps
             timing_metrics.add_steps(steps)
             collection_round += 1
