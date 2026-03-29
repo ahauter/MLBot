@@ -230,6 +230,11 @@ class PPOAlgorithm(Algorithm):
         self.encoder.to(self.device)
         self.policy.to(self.device)
 
+        # Compile for reduced kernel launch overhead (fixed-shape inputs)
+        if self.device.type == 'cuda':
+            self.encoder = torch.compile(self.encoder, mode='reduce-overhead')
+            self.policy = torch.compile(self.policy, mode='reduce-overhead')
+
         # Optimizer over both encoder and policy
         self.optimizer = torch.optim.Adam(
             list(self.encoder.parameters()) + list(self.policy.parameters()),
