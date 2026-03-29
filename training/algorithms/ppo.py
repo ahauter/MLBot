@@ -230,32 +230,6 @@ class PPOAlgorithm(Algorithm):
         self.encoder.to(self.device)
         self.policy.to(self.device)
 
-        # Compile for reduced kernel launch overhead (fixed-shape inputs).
-        # Tries inductor (best), falls back to cudagraphs (no Triton needed
-        # on Windows), and skips compile entirely if neither works.
-        if self.device.type == 'cuda':
-            for backend, mode in [('inductor', 'reduce-overhead'),
-                                  ('cudagraphs', None)]:
-                try:
-                    kwargs = {'backend': backend}
-                    if mode:
-                        kwargs['mode'] = mode
-                    test_enc = torch.compile(self.encoder, **kwargs)
-                    # Trigger compilation with a dummy forward pass
-                    _dummy = torch.zeros(1, self.t_window, N_TOKENS,
-                                         TOKEN_FEATURES, device=self.device)
-                    _eids = self._entity_ids
-                    with torch.no_grad():
-                        test_enc(_dummy, _eids)
-                    # Compilation succeeded — apply to both networks
-                    self.encoder = test_enc
-                    self.policy = torch.compile(self.policy, **kwargs)
-                    print(f'[ppo] torch.compile backend={backend} active')
-                    break
-                except Exception as e:
-                    print(f'[ppo] torch.compile backend={backend} failed: {e}')
-                    continue
-
         # Optimizer over both encoder and policy
         self.optimizer = torch.optim.Adam(
             list(self.encoder.parameters()) + list(self.policy.parameters()),
@@ -277,6 +251,29 @@ class PPOAlgorithm(Algorithm):
         # Start in eval mode for inference; update() switches to train mode
         self.encoder.eval()
         self.policy.eval()
+
+        # Compile for reduced kernel launch overhead (fixed-shape inputs).
+        # Tries inductor (best), falls back to cudagraphs (no Triton needed
+        # on Windows), and skips compile entirely if neither works.
+        if self.device.type == 'cuda':
+            for backend, mode in [('inductor', 'reduce-overhead'),
+                                  ('cudagraphs', None)]:
+                try:
+                    kwargs = {'backend': backend}
+                    if mode:
+                        kwargs['mode'] = mode
+                    test_enc = torch.compile(self.encoder, **kwargs)
+                    _dummy = torch.zeros(1, self.t_window, N_TOKENS,
+                                         TOKEN_FEATURES, device=self.device)
+                    with torch.no_grad():
+                        test_enc(_dummy, self._entity_ids)
+                    self.encoder = test_enc
+                    self.policy = torch.compile(self.policy, **kwargs)
+                    print(f'[ppo] torch.compile backend={backend} active')
+                    break
+                except Exception as e:
+                    print(f'[ppo] torch.compile backend={backend} failed: {e}')
+                    continue
 
         # Signals when the rollout buffer is free for new collection.
         # Cleared when an update is triggered; set again after buffer.reset().
