@@ -1,7 +1,7 @@
 """
 Gymnasium Environment Wrapper for Baseline Experiments
 ======================================================
-Wraps rlgym-sim as a standard gymnasium.Env for use with d3rlpy.
+Wraps rlgym-sim as a standard gymnasium.Env for the training framework.
 
 Features:
 - Frame-stacked observations (T consecutive frames → flat vector)
@@ -85,8 +85,9 @@ class BaselineGymEnv(gym.Env):
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
         )
 
-        # d3rlpy algo used as opponent (or None for random)
-        self._opponent_algo = None
+        # Opponent model (PPO encoder+policy or None for random)
+        self._opponent_encoder = None
+        self._opponent_policy = None
 
         self._env = None
         self._blue_buf: deque = deque(maxlen=t_window)
@@ -96,18 +97,27 @@ class BaselineGymEnv(gym.Env):
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def set_opponent(self, algo) -> None:
-        """
-        Hot-swap the opponent model.
+    def load_ppo_opponent(self, snap_path: str) -> None:
+        """Load a PPO opponent from a snapshot directory.
 
         Parameters
         ----------
-        algo : d3rlpy algo instance or None
-            A d3rlpy learnable with .predict() method, or None for random.
+        snap_path : str or Path
+            Path to snapshot directory containing encoder.pt and policy.pt.
         """
-        if self._opponent_algo is not None and self._opponent_algo is not algo:
-            del self._opponent_algo
-        self._opponent_algo = algo
+        import torch
+        from encoder import SharedTransformerEncoder, D_MODEL
+        from policy_head import PolicyHead
+        from training.opponents.pool import load_opponent_from_snapshot
+
+        weights = load_opponent_from_snapshot(snap_path, device='cpu')
+        if self._opponent_encoder is None:
+            self._opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL)
+            self._opponent_policy = PolicyHead(d_model=D_MODEL)
+        self._opponent_encoder.load_state_dict(weights['encoder'])
+        self._opponent_policy.load_state_dict(weights['policy'])
+        self._opponent_encoder.eval()
+        self._opponent_policy.eval()
 
     def reset(
         self,
@@ -307,32 +317,21 @@ class BaselineGymEnv(gym.Env):
         stacked = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
         return stacked.ravel().astype(np.float32)
 
-    def load_opponent_from_path(self, path: str, algo_builder=None) -> None:
-        """Load opponent model from a saved snapshot path.
-
-        Used by SubprocVecEnv workers where d3rlpy algo objects can't be
-        pickled across process boundaries. Reuses the existing algo instance
-        on subsequent calls to avoid rebuilding the full model architecture.
-        """
-        if algo_builder is None:
-            raise ValueError("algo_builder required to load opponent from path")
-        if self._opponent_algo is None:
-            algo = algo_builder()
-            algo.build_with_env(self)
-            algo.load_model(path)
-            self._opponent_algo = algo
-        else:
-            self._opponent_algo.load_model(path)
-
     def _get_opponent_action(self) -> np.ndarray:
-        """Get opponent action from frozen d3rlpy model or random."""
-        if self._opponent_algo is None:
+        """Get opponent action from frozen PPO model or random."""
+        if self._opponent_encoder is None:
             return np.random.uniform(-1, 1, size=8).astype(np.float32)
 
-        # Build opponent's stacked window as flat obs (same format as agent's)
+        import torch
+        from encoder import ENTITY_TYPE_IDS_1V1
+
         stacked = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
         flat_obs = stacked.ravel().astype(np.float32)       # (T*N*F,)
 
-        # d3rlpy's predict() expects (batch, obs_dim)
-        action = self._opponent_algo.predict(flat_obs[np.newaxis])  # (1, 8)
-        return action[0].astype(np.float32)
+        with torch.no_grad():
+            x = torch.tensor(flat_obs[np.newaxis], dtype=torch.float32)
+            tokens = x.view(1, self.t_window, N_TOKENS, TOKEN_FEATURES)
+            eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+            emb = self._opponent_encoder(tokens, eids)
+            action = self._opponent_policy(emb)
+        return action[0].cpu().numpy().astype(np.float32)

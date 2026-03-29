@@ -44,9 +44,9 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent
 sys.path.insert(0, str(_REPO / 'src'))
-sys.path.insert(0, str(_REPO / 'training'))
+sys.path.insert(0, str(_REPO))
 
 
 # ── utility functions ────────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
     and reports intermediate values for Optuna pruning.
     """
     import optuna
-    from gym_env import BaselineGymEnv
+    from training.environments.baseline_env import BaselineGymEnv
 
     config = copy.deepcopy(stub_config)
 
@@ -303,7 +303,7 @@ def launch_seeds(output_yaml: str, n_seeds: int) -> None:
     print(f'\n=== Launching {n_seeds} seeds with config: {output_yaml} ===')
     for seed in range(n_seeds):
         cmd = [
-            sys.executable, 'training/train.py',
+            sys.executable, 'train.py',
             '--config', output_yaml,
             '--seed', str(seed),
         ]

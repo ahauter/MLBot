@@ -1,157 +1,71 @@
 #!/usr/bin/env python3
 """
-Unified Training Script (d3rlpy)
-================================
-Single entry point for all RL training. Uses d3rlpy for algorithm
-implementations (AWAC, SAC, TD3, CQL, etc.) with our custom transformer
-encoder and self-play opponent management.
+YAML-Configured Training Loop
+==============================
+Algorithm-agnostic training loop driven by YAML config + importlib.
+
+The training loop knows NOTHING about PPO, SAC, or any specific algorithm.
+It only calls Algorithm ABC methods: select_action, store_transition,
+should_update, update. Everything is resolved from YAML at runtime.
 
 Usage
 -----
-    # Baseline training (AWAC, sparse reward, self-play):
-    python training/train.py
+    # Default config:
+    python train.py --config configs/ppo_sparse.yaml
 
-    # Specific seed:
-    python training/train.py --seed 3
+    # Override params:
+    python train.py --config configs/ppo_sparse.yaml --seed 3 --total-steps 10000
 
-    # Swap algorithm:
-    python training/train.py --algo SAC
-
-    # Use Optuna-tuned hyperparameters:
-    python training/train.py --params-from optuna_baseline.db
-
-    # Short test run:
-    python training/train.py --total-steps 10000 --eval-interval 5000
-
-    # Resume a checkpointed run:
-    python training/train.py --resume-from models/frozen_self_play/seed_0
+    # Minimal run (no YAML, uses defaults):
+    python train.py --total-steps 10000 --num-envs 2
 """
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import json
+import importlib
 import multiprocessing
-from collections import deque
 import multiprocessing.connection
 import random
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import deque
 from pathlib import Path
-from typing import List, Optional
+from queue import Queue, Empty
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import yaml
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent
 sys.path.insert(0, str(_REPO / 'src'))
-sys.path.insert(0, str(_REPO / 'training'))
+sys.path.insert(0, str(_REPO))
 
-import d3rlpy
-from d3rlpy.algos.qlearning.explorers import NormalNoise
-from d3rlpy.logging import WanDBAdapterFactory, FileAdapterFactory
-
-from baseline_encoder_factory import TransformerEncoderFactory
-from gym_env import BaselineGymEnv
-from logger import MetricsRegistry
-from self_play import OpponentPool
-from frozen_self_play import FrozenOpponentPool, OutcomeTrackingEnv
-from evolutionary_self_play import EvolutionaryOpponentPool
 from encoder import N_TOKENS, TOKEN_FEATURES
 
 
-# ── configuration ────────────────────────────────────────────────────────────
+# ── universal defaults ──────────────────────────────────────────────────────
 
-ALGO_MAP = {
-    'AWAC': d3rlpy.algos.AWACConfig,
-    'SAC': d3rlpy.algos.SACConfig,
-    'TD3': d3rlpy.algos.TD3Config,
-    'CQL': d3rlpy.algos.CQLConfig,
-    'IQL': d3rlpy.algos.IQLConfig,
-    'TD3PlusBC': d3rlpy.algos.TD3PlusBCConfig,
+UNIVERSAL_DEFAULTS = {
+    'seed': 0,
+    'total_steps': 50_000_000,
+    'eval_interval': 200_000,
+    't_window': 8,
+    'num_envs': 8,
+    'reward_type': 'sparse',
+    'model_dir': 'models/baseline',
+    'log_interval': 10,
+    'snapshot_dir': 'models/snapshots',
+    'population': {
+        'agents': 1,
+        'generation_steps': 1_000_000,
+        'generation_noise_scale': 0.01,
+    },
 }
 
 
-@dataclass
-class TrainConfig:
-    """All training hyperparameters in one place."""
-
-    # ── seed & identity ──────────────────────────────────────────────────────
-    seed: int = 0
-    algo: str = 'AWAC'
-
-    # ── budget ───────────────────────────────────────────────────────────────
-    total_steps: int = 50_000_000
-    eval_interval: int = 200_000       # env steps between Psyonix evaluations
-
-    # ── architecture ─────────────────────────────────────────────────────────
-    t_window: int = 8
-    obs_dim: int = 8 * N_TOKENS * TOKEN_FEATURES  # 800
-
-    # ── AWAC / algorithm hyperparameters ─────────────────────────────────────
-    batch_size: int = 256
-    gamma: float = 0.99
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
-    tau: float = 0.005
-    awac_lambda: float = 1.0          # AWAC advantage temperature
-    n_critics: int = 2
-    explore_noise: float = 0.1        # Gaussian exploration std
-
-    # ── replay buffer ────────────────────────────────────────────────────────
-    buffer_capacity: int = 1_000_000
-    random_steps: int = 10_000        # random actions before training starts
-
-    # ── d3rlpy fit_online settings ───────────────────────────────────────────
-    update_interval: int = 1          # gradient updates per env step (sequential path only)
-    n_steps_per_epoch: int = 10_000   # steps per d3rlpy epoch (logging granularity)
-
-    # ── async training (parallel path) ───────────────────────────────────────
-    collection_buffer_size: int = 50_000  # transitions to collect before triggering training
-    updates_per_swap: int = 500           # gradient steps per training trigger
-
-    # ── parallel environments ─────────────────────────────────────────────
-    num_envs: int = 1                 # parallel RLGym-sim envs (1 = sequential)
-
-    # ── self-play (frozen opponent) ─────────────────────────────────────────
-    max_snapshots: int = 5
-
-    # ── opponent pool ────────────────────────────────────────────────────────
-    pool_type: str = 'frozen'         # 'frozen' or 'evolutionary'
-    population_size: int = 10         # evolutionary pool: population size
-    num_survivors: int = 3            # evolutionary pool: survivors per generation
-    evolution_interval: int = 50_000  # evolutionary pool: steps between evolutions
-    mutation_noise: float = 0.01      # evolutionary pool: mutation noise std
-
-    # ── reward ──────────────────────────────────────────────────────────────
-    reward_type: str = 'sparse'       # 'sparse' or 'dense'
-    dense_reward_weights: Optional[dict] = None  # component weight subset for sweep
-
-    # ── convergence ──────────────────────────────────────────────────────────
-    rookie_target_wr: float = 0.60    # win rate target vs Psyonix Rookie
-    consecutive_evals_required: int = 2
-
-    # ── paths ────────────────────────────────────────────────────────────────
-    model_dir: str = 'models/frozen_self_play'
-    snapshot_dir: str = 'models/frozen_self_play/snapshots'
-
-    # ── experiment infrastructure ────────────────────────────────────────────
-    intervention: str = 'frozen_self_play'        # intervention name for metadata
-    replay_seed_dir: Optional[str] = None         # pre-load replay data into buffer
-    pretrained_encoder_path: Optional[str] = None  # load pre-trained encoder weights
-    resume_from: Optional[str] = None             # path to checkpoint dir to resume from
-
-    # ── W&B ──────────────────────────────────────────────────────────────────
-    wandb_project: str = 'rlbot-baseline'
-    wandb_tags: list = field(default_factory=lambda: ['self-play', 'frozen-opponent', 'axis1'])
-    wandb_run_name: Optional[str] = None
-    wandb_group: Optional[str] = None
-    no_wandb: bool = False
-
-
-# ── seed setup ───────────────────────────────────────────────────────────────
+# ── utility ─────────────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -159,1116 +73,654 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
-# ── d3rlpy algorithm builder ────────────────────────────────────────────────
+def load_class(dotted_path: str):
+    """Import a class from a dotted module path."""
+    module_path, class_name = dotted_path.rsplit('.', 1)
+    return getattr(importlib.import_module(module_path), class_name)
 
-def build_algo(config: TrainConfig) -> d3rlpy.algos.QLearningAlgoBase:
-    """Build a d3rlpy algorithm from config."""
-    encoder_factory = TransformerEncoderFactory(
-        t_window=config.t_window,
-        pretrained_weights_path=config.pretrained_encoder_path,
+
+def resolve_or_default(config: dict, section: str, default_class):
+    """Resolve a class from config section, or use default."""
+    section_cfg = config.get(section, {})
+    if isinstance(section_cfg, dict) and 'class' in section_cfg:
+        cls = load_class(section_cfg['class'])
+    else:
+        cls = default_class
+    return cls
+
+
+def load_config(yaml_path: str, cli_overrides: Optional[dict] = None) -> dict:
+    """Load YAML, resolve classes via importlib, merge defaults, apply CLI overrides."""
+    with open(yaml_path) as f:
+        config = yaml.safe_load(f) or {}
+
+    # Start with universal defaults, overlay YAML
+    merged = _deep_merge(dict(UNIVERSAL_DEFAULTS), config)
+
+    # Resolve algorithm class
+    algo_path = merged.get('algorithm', {}).get('class')
+    if algo_path:
+        AlgoCls = load_class(algo_path)
+        merged.setdefault('algorithm', {})['cls'] = AlgoCls
+        # Merge class defaults with YAML overrides
+        class_defaults = AlgoCls.default_params() if hasattr(AlgoCls, 'default_params') else {}
+        yaml_params = merged.get('algorithm', {}).get('params', {})
+        merged['algorithm']['params'] = {**class_defaults, **yaml_params}
+
+    # Resolve opponent pool class
+    pool_path = merged.get('opponent_pool', {}).get('class')
+    if pool_path:
+        PoolCls = load_class(pool_path)
+        merged.setdefault('opponent_pool', {})['cls'] = PoolCls
+        class_defaults = PoolCls.default_params() if hasattr(PoolCls, 'default_params') else {}
+        yaml_params = merged.get('opponent_pool', {}).get('params', {})
+        merged['opponent_pool']['params'] = {**class_defaults, **yaml_params}
+
+    # Apply CLI overrides (highest priority)
+    if cli_overrides:
+        for k, v in cli_overrides.items():
+            if v is not None:
+                merged[k] = v
+
+    return merged
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base. Override wins on conflicts."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+# ── null ABC defaults ───────────────────────────────────────────────────────
+
+class NullReplayProvider:
+    """No expert data. Axis 2 cost = 0."""
+    def load_demonstrations(self):
+        return None
+    def seed_algorithm(self, algo, demos):
+        pass
+    def get_metrics(self):
+        return {}
+
+
+class NullFeedbackProvider:
+    """No human feedback. Axis 3 cost = 0."""
+    def get_feedback_reward(self, *args):
+        return None
+    def should_query(self, step):
+        return False
+    def get_metrics(self):
+        return {}
+
+
+# ── SubprocVecEnv ───────────────────────────────────────────────────────────
+
+def _env_worker(conn: multiprocessing.connection.Connection,
+                t_window: int, reward_type: str,
+                dense_reward_weights: Optional[dict] = None):
+    """Child process: owns one BaselineGymEnv, responds to commands."""
+    from training.environments.baseline_env import BaselineGymEnv
+    env = BaselineGymEnv(
+        t_window=t_window,
+        reward_type=reward_type,
+        dense_reward_weights=dense_reward_weights,
     )
+    # Opponent state for PPO snapshots
+    _opponent_encoder = None
+    _opponent_policy = None
 
-    algo_cls = ALGO_MAP.get(config.algo)
-    if algo_cls is None:
-        raise ValueError(
-            f'Unknown algorithm: {config.algo}. '
-            f'Available: {list(ALGO_MAP.keys())}'
-        )
-
-    # Build kwargs common to all algorithms
-    common = dict(
-        batch_size=config.batch_size,
-        gamma=config.gamma,
-        actor_learning_rate=config.actor_lr,
-        critic_learning_rate=config.critic_lr,
-        actor_encoder_factory=encoder_factory,
-        critic_encoder_factory=encoder_factory,
-        tau=config.tau,
-    )
-
-    # Algorithm-specific params
-    if config.algo == 'AWAC':
-        common['lam'] = config.awac_lambda
-        common['n_action_samples'] = 1
-    if hasattr(algo_cls, '__dataclass_fields__') and 'n_critics' in algo_cls.__dataclass_fields__:
-        common['n_critics'] = config.n_critics
-
-    # Filter to only params the config class accepts
-    valid_fields = {f.name for f in dataclasses.fields(algo_cls)}
-    filtered = {k: v for k, v in common.items() if k in valid_fields}
-
-    algo_config = algo_cls(**filtered)
-    return algo_config.create(device=('cuda:0' if torch.cuda.is_available() else 'cpu'))
-
-
-# ── callback ─────────────────────────────────────────────────────────────────
-
-class TrainingCallback:
-    """
-    Callback for d3rlpy's fit_online. Handles self-play opponent swaps,
-    evaluation, convergence detection, and W&B eval logging.
-
-    Swap timing is delegated to the OpponentPool: the callback calls
-    pool.should_swap() and pool.on_episode_end() and acts on the result.
-    """
-
-    def __init__(self, config: TrainConfig, env, pool: OpponentPool,
-                 axis_tracker=None, metrics_registry: Optional[MetricsRegistry] = None):
-        self.config = config
-        self.env = env
-        self.pool = pool
-        self.axis_tracker = axis_tracker
-        self.metrics_registry = metrics_registry
-        self.parallel_envs: Optional[SubprocVecEnv] = None  # set when num_envs > 1
-        self.start_time = time.time()
-        self.consecutive_wins = 0
-        self.converged = False
-        self._last_eval_step = 0
-        self._wandb = None
-
-        # Initialize W&B for eval/metadata logging (separate from d3rlpy's logger)
-        if not config.no_wandb:
-            try:
-                import wandb
-                self._wandb = wandb
-            except ImportError:
-                pass
-
-    def log_metadata(self):
-        """Log run metadata to W&B."""
-        if self._wandb is None or self._wandb.run is None:
-            return
-        rc = self.axis_tracker.reward_components if self.axis_tracker else 0
-        self._wandb.run.config.update({
-            'meta/algorithm': self.config.algo,
-            'meta/seed': self.config.seed,
-            'meta/reward_components': rc if rc else (1 if self.config.reward_type == 'sparse' else 7),
-            'meta/intervention': self.config.intervention,
-            'meta/reference_bot_primary': 'Psyonix_Rookie',
-            'meta/observation_dim': self.config.obs_dim,
-            'meta/step_budget': self.config.total_steps,
-            'meta/t_window': self.config.t_window,
-            'meta/d3rlpy_version': d3rlpy.__version__,
-        })
-
-    def __call__(self, algo, epoch: int, total_step: int) -> None:
-        # ── frozen self-play: drain sequential env outcomes ──────────────
-        if hasattr(self.env, 'episode_outcomes'):
-            while self.env.episode_outcomes:
-                goal = self.env.episode_outcomes.popleft()
-                self.pool.on_episode_end(goal)
-                if self.pool.should_swap(total_step):
-                    self._do_swap(algo, total_step)
-
-        # ── evaluation ───────────────────────────────────────────────────
-        if total_step - self._last_eval_step >= self.config.eval_interval:
-            self._run_eval(algo, total_step)
-            self._last_eval_step = total_step
-
-    def on_episode_end(self, algo, total_step: int, goal: int) -> None:
-        """Post-episode hook for parallel training path.
-
-        Notifies the pool of the outcome and triggers a swap if conditions are met.
-        """
-        self.pool.on_episode_end(goal)
-        if self.pool.should_swap(total_step):
-            self._do_swap(algo, total_step)
-
-    def _do_swap(self, algo, total_step: int) -> None:
-        """Save snapshot, sample new opponent, update envs."""
-        self.pool.save_snapshot(algo, total_step)
-
-        # Log swap event if pool supports it
-        if hasattr(self.pool, 'log_swap_event'):
-            self.pool.log_swap_event(total_step)
-
-        if self.pool.num_snapshots() > 0:
-            # Update single env's opponent (used in sequential mode)
-            opponent_algo = self.pool.sample_opponent()
-            self.env.set_opponent(opponent_algo)
-
-            # Update all subprocess env opponents (used in parallel mode)
-            if self.parallel_envs is not None:
-                snap_dirs = sorted(self.pool.snapshot_dir.iterdir())
-                if snap_dirs:
-                    chosen = random.choice(snap_dirs)
-                    model_path = str(chosen / 'model.pt')
-                    self.parallel_envs.set_opponent_path(model_path)
-
-    def _run_eval(self, algo, total_step: int) -> None:
-        """Run evaluation against Psyonix tiers."""
-        wall_clock = time.time() - self.start_time
-
-        # For now, log placeholder — real Psyonix eval requires live RLBot
-        # TODO: integrate training/evaluate.py when RLBot is available
-        print(f'\n[step {total_step:,}] Evaluation checkpoint '
-              f'(wall clock: {wall_clock/3600:.1f}h)')
-
-        eval_metrics = {
-            'eval/steps': total_step,
-            'eval/wall_clock_seconds': int(wall_clock),
-        }
-
-        # Try to run evaluation if evaluate module is available
+    while True:
         try:
-            from evaluate import run_evaluation
-            model_dir = Path(self.config.model_dir) / f'seed_{self.config.seed}'
-            model_dir.mkdir(parents=True, exist_ok=True)
-            algo.save(str(model_dir / 'd3rlpy_model'))
-            _wandb_run_id = None
-            if self._wandb is not None and self._wandb.run is not None:
-                _wandb_run_id = self._wandb.run.id
-            with open(model_dir / 'checkpoint_meta.json', 'w') as _f:
-                json.dump({
-                    'total_steps': total_step,
-                    'consecutive_wins': self.consecutive_wins,
-                    'wandb_run_id': _wandb_run_id,
-                }, _f)
+            cmd, data = conn.recv()
+        except (EOFError, BrokenPipeError):
+            break
 
-            win_rates = run_evaluation(str(model_dir))
-            eval_metrics.update({
-                'eval/win_rate_beginner': win_rates.get('Beginner', 0.0),
-                'eval/win_rate_rookie': win_rates.get('Rookie', 0.0),
-                'eval/win_rate_pro': win_rates.get('Pro', 0.0),
-                'eval/win_rate_allstar': win_rates.get('Allstar', 0.0),
-            })
+        if cmd == 'reset':
+            obs, info = env.reset()
+            conn.send(('obs', obs, info))
 
-            rookie_wr = win_rates.get('Rookie', 0.0)
-            print(f'  Rookie win rate: {rookie_wr:.1%}')
+        elif cmd == 'step':
+            obs, reward, done, truncated, info = env.step(data)
+            conn.send(('step', obs, reward, done, truncated, info))
 
-            # Convergence check
-            if rookie_wr >= self.config.rookie_target_wr:
-                self.consecutive_wins += 1
-                print(f'  Target met ({self.consecutive_wins}/'
-                      f'{self.config.consecutive_evals_required} consecutive)')
-                if self.consecutive_wins >= self.config.consecutive_evals_required:
-                    self.converged = True
-                    print('  CONVERGED — stopping training.')
-            else:
-                self.consecutive_wins = 0
+        elif cmd == 'set_opponent_snapshot':
+            # Load opponent from snapshot path for PPO self-play
+            snap_path = data
+            if snap_path is not None:
+                from training.opponents.pool import load_opponent_from_snapshot
+                weights = load_opponent_from_snapshot(snap_path, device='cpu')
+                from encoder import SharedTransformerEncoder, D_MODEL
+                from policy_head import PolicyHead
+                if _opponent_encoder is None:
+                    _opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL)
+                    _opponent_policy = PolicyHead(d_model=D_MODEL)
+                _opponent_encoder.load_state_dict(weights['encoder'])
+                _opponent_policy.load_state_dict(weights['policy'])
+                _opponent_encoder.eval()
+                _opponent_policy.eval()
 
-        except (ImportError, Exception) as e:
-            print(f'  Evaluation skipped: {e}')
+                # Monkey-patch the env's opponent action method
+                import torch as _torch
+                from encoder import ENTITY_TYPE_IDS_1V1 as _EIDS
 
-        # Collect custom metrics from registered providers (main-thread safe)
-        if self.metrics_registry is not None:
-            eval_metrics.update(self.metrics_registry.collect())
+                def _ppo_opponent_action(self_env):
+                    stacked = np.stack(list(self_env._orange_buf), axis=0)
+                    flat_obs = stacked.ravel().astype(np.float32)
+                    with _torch.no_grad():
+                        x = _torch.tensor(flat_obs[np.newaxis], dtype=_torch.float32)
+                        tokens = x.view(1, self_env.t_window, -1, TOKEN_FEATURES)
+                        eids = _torch.tensor(_EIDS, dtype=_torch.long)
+                        emb = _opponent_encoder(tokens, eids)
+                        action = _opponent_policy(emb)
+                    return action[0].cpu().numpy().astype(np.float32)
 
-        # Log to W&B
-        if self._wandb is not None and self._wandb.run is not None:
-            self._wandb.log(eval_metrics, step=total_step)
+                import types
+                env._get_opponent_action = types.MethodType(_ppo_opponent_action, env)
+            conn.send(('ok',))
 
+        elif cmd == 'close':
+            env.close()
+            conn.send(('closed',))
+            break
 
-# ── subprocess vector environment ────────────────────────────────────────────
-
-def _env_worker(
-    pipe: multiprocessing.connection.Connection,
-    t_window: int,
-    tick_skip: int,
-    max_steps: int,
-    reward_type: str = 'sparse',
-) -> None:
-    """Persistent subprocess that owns a BaselineGymEnv."""
-    env = BaselineGymEnv(t_window=t_window, tick_skip=tick_skip, max_steps=max_steps,
-                         reward_type=reward_type)
-    algo_builder = None
-    try:
-        while True:
-            cmd, data = pipe.recv()
-            if cmd == 'step':
-                result = env.step(data)
-                pipe.send(result)
-            elif cmd == 'reset':
-                result = env.reset()
-                pipe.send(result)
-            elif cmd == 'set_opponent_path':
-                path, = data
-                if algo_builder is not None:
-                    env.load_opponent_from_path(path, algo_builder=algo_builder)
-                pipe.send(None)
-            elif cmd == 'set_algo_builder_args':
-                # Receive args to reconstruct algo_builder in this process
-                config_dict, = data
-                import d3rlpy as _d3
-                from baseline_encoder_factory import TransformerEncoderFactory as _TEF
-
-                def _make_builder(cfg_d):
-                    def _build():
-                        # Minimal rebuild: only need predict(), so architecture must match
-                        _cfg = TrainConfig(**cfg_d)
-                        enc = _TEF(t_window=_cfg.t_window)
-                        algo_cls = ALGO_MAP.get(_cfg.algo)
-                        common = dict(
-                            batch_size=_cfg.batch_size, gamma=_cfg.gamma,
-                            actor_learning_rate=_cfg.actor_lr,
-                            critic_learning_rate=_cfg.critic_lr,
-                            actor_encoder_factory=enc, critic_encoder_factory=enc,
-                            tau=_cfg.tau,
-                        )
-                        if _cfg.algo == 'AWAC':
-                            common['lam'] = _cfg.awac_lambda
-                            common['n_action_samples'] = 1
-                        if hasattr(algo_cls, '__dataclass_fields__') and 'n_critics' in algo_cls.__dataclass_fields__:
-                            common['n_critics'] = _cfg.n_critics
-                        valid = {f.name for f in dataclasses.fields(algo_cls)}
-                        filt = {k: v for k, v in common.items() if k in valid}
-                        a = algo_cls(**filt).create(device='cpu')
-                        a.build_with_env(env)
-                        return a
-                    return _build
-
-                algo_builder = _make_builder(config_dict)
-                pipe.send(None)
-            elif cmd == 'close':
-                break
-    finally:
-        env.close()
-        pipe.close()
+        else:
+            conn.send(('error', f'Unknown command: {cmd}'))
 
 
 class SubprocVecEnv:
-    """Manages N BaselineGymEnv instances in separate processes."""
+    """Vectorized environment using subprocesses."""
 
-    def __init__(self, num_envs: int, t_window: int = 8, tick_skip: int = 8,
-                 max_steps: int = 4500, reward_type: str = 'sparse'):
+    def __init__(self, num_envs: int, t_window: int = 8,
+                 reward_type: str = 'sparse',
+                 dense_reward_weights: Optional[dict] = None):
         self.num_envs = num_envs
-        self._t_window = t_window
-        self._tick_skip = tick_skip
-        self._max_steps = max_steps
-        self._parents: List[multiprocessing.connection.Connection] = []
-        self._procs: List[multiprocessing.Process] = []
+        self.parents: List[multiprocessing.connection.Connection] = []
+        self.procs: List[multiprocessing.Process] = []
 
-        # Use 'spawn' context for Windows/macOS compatibility and CUDA safety
-        ctx = multiprocessing.get_context('spawn')
-
-        for _ in range(num_envs):
-            parent_conn, child_conn = ctx.Pipe()
-            proc = ctx.Process(
+        for i in range(num_envs):
+            parent_conn, child_conn = multiprocessing.Pipe()
+            proc = multiprocessing.Process(
                 target=_env_worker,
-                args=(child_conn, t_window, tick_skip, max_steps, reward_type),
+                args=(child_conn, t_window, reward_type, dense_reward_weights),
                 daemon=True,
             )
             proc.start()
             child_conn.close()
-            self._parents.append(parent_conn)
-            self._procs.append(proc)
+            self.parents.append(parent_conn)
+            self.procs.append(proc)
 
-    def reset(self) -> List:
-        """Reset all envs, return list of (obs, info)."""
-        for p in self._parents:
-            p.send(('reset', None))
-        return [p.recv() for p in self._parents]
+    def reset_all(self) -> np.ndarray:
+        """Reset all envs, return stacked observations (num_envs, obs_dim)."""
+        for conn in self.parents:
+            conn.send(('reset', None))
+        obs_list = []
+        for conn in self.parents:
+            tag, obs, info = conn.recv()
+            obs_list.append(obs)
+        return np.stack(obs_list, axis=0)
 
-    def reset_one(self, idx: int):
-        """Reset a single env by index, return (obs, info)."""
-        self._parents[idx].send(('reset', None))
-        return self._parents[idx].recv()
+    def step(self, actions: np.ndarray):
+        """Step all envs. Returns (obs, rewards, dones, infos)."""
+        for i, conn in enumerate(self.parents):
+            conn.send(('step', actions[i]))
+        obs_list, rewards, dones, infos = [], [], [], []
+        for conn in self.parents:
+            tag, obs, reward, done, truncated, info = conn.recv()
+            obs_list.append(obs)
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
+        return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.float32), infos)
 
-    def send_reset(self, idx: int) -> None:
-        """Send reset command without waiting for result (non-blocking)."""
-        self._parents[idx].send(('reset', None))
+    def set_opponent_snapshot(self, snap_path: Optional[str], worker_indices=None):
+        """Set opponent snapshot for specified workers (or all)."""
+        indices = worker_indices if worker_indices is not None else range(self.num_envs)
+        for i in indices:
+            self.parents[i].send(('set_opponent_snapshot', snap_path))
+        for i in indices:
+            self.parents[i].recv()
 
-    def recv_reset(self, idx: int):
-        """Receive reset result from a previously sent reset command."""
-        return self._parents[idx].recv()
-
-    def step(self, actions: np.ndarray) -> List:
-        """Step all envs in parallel with actions (num_envs, action_dim)."""
-        for p, a in zip(self._parents, actions):
-            p.send(('step', a))
-        return [p.recv() for p in self._parents]
-
-    def step_active(self, actions: np.ndarray, active: List[int]) -> dict:
-        """Step only the given env indices. Returns {idx: result}."""
-        for idx, a in zip(active, actions):
-            self._parents[idx].send(('step', a))
-        return {idx: self._parents[idx].recv() for idx in active}
-
-    def set_algo_builder_args(self, config_dict: dict) -> None:
-        """Send config dict so workers can build algo for opponent loading."""
-        for p in self._parents:
-            p.send(('set_algo_builder_args', (config_dict,)))
-        for p in self._parents:
-            p.recv()
-
-    def set_opponent_path(self, path: str) -> None:
-        """Tell all workers to load opponent from a snapshot path."""
-        for p in self._parents:
-            p.send(('set_opponent_path', (path,)))
-        for p in self._parents:
-            p.recv()
-
-    def close(self) -> None:
-        # Signal all workers to exit
-        for p in self._parents:
+    def close(self):
+        for conn in self.parents:
             try:
-                p.send(('close', None))
-            except (BrokenPipeError, OSError):
+                conn.send(('close', None))
+                conn.recv()
+            except (EOFError, BrokenPipeError):
                 pass
-        # Join processes — give workers time to exit cleanly
-        for proc in self._procs:
-            proc.join(timeout=10)
+        for proc in self.procs:
+            proc.join(timeout=5)
             if proc.is_alive():
-                proc.terminate()  # SIGTERM first — lets finally blocks run
-                proc.join(timeout=5)
-                if proc.is_alive():
-                    proc.kill()
-        # Close parent pipe ends after workers have exited
-        for p in self._parents:
-            try:
-                p.close()
-            except OSError:
-                pass
-
-    def respawn_dead(self) -> int:
-        """Respawn any dead worker processes. Returns number respawned."""
-        ctx = multiprocessing.get_context('spawn')
-        respawned = 0
-        for i, proc in enumerate(self._procs):
-            if not proc.is_alive():
-                try:
-                    self._parents[i].close()
-                except OSError:
-                    pass
-                parent_conn, child_conn = ctx.Pipe()
-                new_proc = ctx.Process(
-                    target=_env_worker,
-                    args=(child_conn, self._t_window, self._tick_skip, self._max_steps),
-                    daemon=True,
-                )
-                new_proc.start()
-                child_conn.close()
-                self._parents[i] = parent_conn
-                self._procs[i] = new_proc
-                respawned += 1
-        return respawned
-
-    def assert_workers_alive(self) -> None:
-        """Assert all worker processes are still alive. Call at start of each trial."""
-        dead = [p.pid for p in self._procs if not p.is_alive()]
-        assert not dead, f"SubprocVecEnv: workers died unexpectedly: pids={dead}"
-
-    def assert_workers_dead(self) -> None:
-        """Assert all worker processes have exited. Call after close()."""
-        still_alive = [p.pid for p in self._procs if p.is_alive()]
-        assert not still_alive, (
-            f"SubprocVecEnv: workers failed to exit after close(): pids={still_alive}. "
-            "Kill them manually (taskkill /F /PID <pid>) before restarting."
-        )
+                proc.kill()
 
 
-# ── async gradient trainer ───────────────────────────────────────────────────
+# ── AsyncUpdater ────────────────────────────────────────────────────────────
 
-class AsyncTrainer:
-    """
-    Runs gradient updates in a background thread, decoupled from env collection.
+class AsyncUpdater:
+    """Background GPU thread for sequential gradient updates.
 
-    The main collection loop calls trigger() when enough transitions have been
-    gathered. The training thread wakes up, does N gradient steps, then sleeps
-    until the next trigger. Collection never blocks on GPU.
+    Main thread calls trigger(agent) when buffer is full.
+    GPU thread runs agent.update() in the background.
+    Multiple agents queue up — processed FIFO, one at a time.
     """
 
-    def __init__(self, algo, buffer, batch_size: int, lock: threading.Lock):
-        self.algo = algo
-        self.buffer = buffer
-        self.batch_size = batch_size
-        self.lock = lock
-        self.last_loss: dict = {}
-
-        self._total_updates = 0   # running count of gradient steps across all triggers
-        self._pending_metrics: dict = {}
-        self._metrics_lock = threading.Lock()
-
-        self._trigger = threading.Event()
+    def __init__(self):
+        self._queue: Queue = Queue()
         self._stop = threading.Event()
-        self._n_updates = 0
+        self._busy = threading.Event()
+        self._results: List = []
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def trigger(self, n_updates: int) -> None:
-        """Called from main thread: kick off n_updates gradient steps."""
-        self._n_updates = n_updates
-        self._trigger.set()
+    def trigger(self, agent, agent_id: int = 0):
+        """Queue an agent for GPU update."""
+        self._queue.put((agent_id, agent))
 
-    def pop_metrics(self) -> dict:
-        """Drain pending training metrics. Thread-safe. Call from main thread."""
-        with self._metrics_lock:
-            m = self._pending_metrics
-            self._pending_metrics = {}
-            return m
+    def is_busy(self) -> bool:
+        return self._busy.is_set()
 
-    def stop(self) -> None:
+    def pop_metrics(self) -> List[tuple]:
+        """Drain completed (agent_id, metrics) pairs."""
+        with self._lock:
+            results = list(self._results)
+            self._results.clear()
+        return results
+
+    def stop(self):
         self._stop.set()
-        self._trigger.set()  # unblock if waiting
-        self._thread.join()
+        self._queue.put(None)  # unblock
+        self._thread.join(timeout=10)
 
-    def _loop(self) -> None:
+    def _loop(self):
         while not self._stop.is_set():
-            self._trigger.wait()
-            self._trigger.clear()
-            if self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if item is None:
                 break
-            losses, update_ms_list = [], []
-            for _ in range(self._n_updates):
-                with self.lock:
-                    if self.buffer.transition_count < self.batch_size:
-                        break
-                    batch = self.buffer.sample_transition_batch(self.batch_size)
-                update_start = time.time()
-                self.last_loss = self.algo.update(batch)
-                update_ms_list.append((time.time() - update_start) * 1000)
-                self._total_updates += 1
-                losses.append(self.last_loss)
-            if losses:
-                avg = {f'train/{k}': float(np.mean([l[k] for l in losses]))
-                       for k in losses[0]}
-                avg['train/total_gradient_updates'] = self._total_updates
-                avg['train/update_ms'] = float(np.mean(update_ms_list))
-                with self.lock:
-                    avg['buffer/transition_count'] = self.buffer.transition_count
-                with self._metrics_lock:
-                    self._pending_metrics = avg
+            agent_id, agent = item
+            self._busy.set()
+            try:
+                metrics = agent.update()
+                with self._lock:
+                    self._results.append((agent_id, metrics))
+            except Exception as e:
+                print(f'[updater] Agent {agent_id} update failed: {e}',
+                      file=sys.stderr)
+            finally:
+                self._busy.clear()
 
 
-# ── metrics providers ────────────────────────────────────────────────────────
+# ── metrics providers ───────────────────────────────────────────────────────
 
 class RolloutMetricsProvider:
-    """Provides rolling episode return and goal rates from deques."""
+    """Tracks episode returns and lengths."""
 
-    def __init__(self, recent_returns: deque, recent_goals: deque):
-        self._returns = recent_returns
-        self._goals = recent_goals
+    def __init__(self):
+        self.episode_returns: deque = deque(maxlen=200)
+        self.episode_lengths: deque = deque(maxlen=200)
+        self.goals_scored: int = 0
+        self.goals_conceded: int = 0
 
-    def get_metrics(self) -> dict:
-        goals = list(self._goals)
-        return {
-            'avg_episode_return': float(np.mean(self._returns)) if self._returns else 0.0,
-            'score_rate': float(np.mean([g == 1 for g in goals])) if goals else 0.0,
-            'concede_rate': float(np.mean([g == -1 for g in goals])) if goals else 0.0,
-        }
-
-
-class CollectionMetricsProvider:
-    """Provides replay buffer and env count metrics."""
-
-    def __init__(self, buffer, buf_lock: threading.Lock, num_envs: int):
-        self._buffer = buffer
-        self._lock = buf_lock
-        self._num_envs = num_envs
+    def on_episode_end(self, episode_return: float, episode_length: int, goal: int):
+        self.episode_returns.append(episode_return)
+        self.episode_lengths.append(episode_length)
+        if goal > 0:
+            self.goals_scored += 1
+        elif goal < 0:
+            self.goals_conceded += 1
 
     def get_metrics(self) -> dict:
-        with self._lock:
-            count = self._buffer.transition_count
+        if not self.episode_returns:
+            return {}
         return {
-            'buffer_transition_count': count,
-            'num_envs': self._num_envs,
+            'mean_return': float(np.mean(self.episode_returns)),
+            'mean_length': float(np.mean(self.episode_lengths)),
+            'goals_scored': self.goals_scored,
+            'goals_conceded': self.goals_conceded,
         }
 
 
 class TimingMetricsProvider:
-    """Provides throughput and wall-clock metrics."""
+    """Tracks training speed."""
 
-    def __init__(self, start_wall: float):
-        self._start_wall = start_wall
-        self._total_step = 0
+    def __init__(self):
+        self._start = time.time()
+        self._steps = 0
 
-    def update_step(self, total_step: int) -> None:
-        self._total_step = total_step
+    def add_steps(self, n: int):
+        self._steps += n
 
     def get_metrics(self) -> dict:
-        elapsed = time.time() - self._start_wall
+        elapsed = time.time() - self._start
         return {
-            'steps_per_second': self._total_step / max(elapsed, 1e-6),
-            'wall_clock_seconds': int(elapsed),
+            'steps_per_sec': self._steps / max(elapsed, 1e-6),
+            'wall_time_hours': elapsed / 3600,
         }
 
 
-class AsyncTrainerMetricsProvider:
-    """Drains pending metrics from AsyncTrainer (pop-once semantics)."""
+# ── collect and train ───────────────────────────────────────────────────────
 
-    def __init__(self, trainer: AsyncTrainer):
-        self._trainer = trainer
-
-    def get_metrics(self) -> dict:
-        return self._trainer.pop_metrics()
-
-
-# ── parallel online training loop ────────────────────────────────────────────
-
-def fit_online_parallel(
-    algo,
-    config: TrainConfig,
+def collect_and_train(
+    population,
     envs: SubprocVecEnv,
-    buffer,
-    explorer,
-    callback,
-    on_episode_complete=None,
-    axis_tracker=None,
-    metrics_registry: Optional[MetricsRegistry] = None,
-    start_step: int = 0,
-) -> None:
+    updater: AsyncUpdater,
+    rollout_metrics: RolloutMetricsProvider,
+    config: dict,
+) -> int:
+    """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
+
+    Returns total environment steps collected.
     """
-    Parallel replacement for d3rlpy's fit_online().
+    num_envs = envs.num_envs
+    obs = envs.reset_all()  # (num_envs, obs_dim)
 
-    Parameters
-    ----------
-    on_episode_complete : callable or None
-        Called with (episode_return: float) when a blue episode finishes.
-        Useful for reward tracking in tuning.
+    agents = population.agents
+    worker_map = population.worker_assignment  # [agent_idx per worker]
 
-    Steps N environments simultaneously in subprocesses. Accumulates each
-    env's episode locally and flushes completed episodes to d3rlpy's buffer
-    (which only supports one active episode at a time). Both blue and orange
-    perspectives are stored for self-play training signal.
-    """
-    from tqdm import trange
-    num_envs = config.num_envs
+    # Group workers by agent
+    agent_workers: Dict[int, List[int]] = {}
+    for wi, ai in enumerate(worker_map):
+        agent_workers.setdefault(ai, []).append(wi)
 
+    rollout_steps = config.get('algorithm', {}).get('params', {}).get('rollout_steps', 2048)
+    episode_returns = np.zeros(num_envs, dtype=np.float32)
+    episode_lengths = np.zeros(num_envs, dtype=np.int64)
 
-    # W&B logging (active if wandb.run was initialized by caller)
-    try:
-        import wandb as _wandb_mod
-        _wandb = _wandb_mod if _wandb_mod.run is not None else None
-    except ImportError:
-        _wandb = None
+    for step in range(rollout_steps):
+        # Collect actions from each agent for its workers
+        actions = np.zeros((num_envs, 8), dtype=np.float32)
+        action_results = [None] * num_envs
 
-    start_wall = time.time()
+        for agent_idx, worker_ids in agent_workers.items():
+            agent = agents[agent_idx]
+            agent_obs = obs[worker_ids]  # (n_workers, obs_dim)
+            result = agent.select_action(agent_obs)
 
-    # Build algo if needed
-    if algo.impl is None:
-        # Need a dummy env to build with
-        dummy = BaselineGymEnv(t_window=config.t_window, reward_type=config.reward_type)
-        algo.build_with_env(dummy)
-        dummy.close()
-
-    # Reset all envs
-    reset_results = envs.reset()
-    observations = np.stack([r[0] for r in reset_results])  # (N, obs_dim)
-
-    # Local episode accumulators per env
-    local_blue = [[] for _ in range(num_envs)]
-    local_orange = [[] for _ in range(num_envs)]
-    rollout_returns = np.zeros(num_envs)
-    recent_returns: deque = deque(maxlen=100)  # rolling window for avg reward logging
-    recent_goals: deque = deque(maxlen=100)    # 1=blue scored, -1=orange scored, 0=timeout
-
-    # Async trainer: GPU updates run in background, never blocking collection
-    buf_lock = threading.Lock()
-    trainer = AsyncTrainer(algo, buffer, config.batch_size, buf_lock)
-    collected_since_trigger = 0
-
-    # Register metrics providers for this training loop
-    timing_provider = TimingMetricsProvider(start_wall)
-    if metrics_registry is not None:
-        metrics_registry.register('rollout', RolloutMetricsProvider(recent_returns, recent_goals).get_metrics)
-        metrics_registry.register('collect', CollectionMetricsProvider(buffer, buf_lock, num_envs).get_metrics)
-        metrics_registry.register('timing', timing_provider.get_metrics)
-        metrics_registry.register('train', AsyncTrainerMetricsProvider(trainer).get_metrics)
-
-    total_step = start_step
-    pending_resets: set = set()  # env indices waiting for async reset
-    pbar = trange(start_step + 1, config.total_steps + 1, initial=start_step,
-                  total=config.total_steps, desc='Training')
-
-    while total_step < config.total_steps:
-        # ── collect any pending resets from previous iteration ─────────────
-        for i in list(pending_resets):
-            reset_obs, _ = envs.recv_reset(i)
-            observations[i] = reset_obs
-            pending_resets.discard(i)
-
-        # ── action selection (batched for active envs) ────────────────────
-        active = [i for i in range(num_envs) if i not in pending_resets]
-        n_active = len(active)
-        if n_active == 0:
-            continue
-
-        active_obs = observations[active]
-        if total_step < config.random_steps:
-            active_actions = np.random.uniform(-1, 1, size=(n_active, 8)).astype(np.float32)
-        elif explorer:
-            active_actions = explorer.sample(algo, active_obs, total_step)
-        else:
-            active_actions = algo.predict(active_obs)
-
-        # ── step active envs in parallel ──────────────────────────────────
-        step_results = envs.step_active(active_actions, active)
-
-        for ai, i in enumerate(active):
-            next_obs, reward, done, truncated, info = step_results[i]
-
-            # Accumulate blue transition
-            local_blue[i].append((observations[i].copy(), active_actions[ai].copy(), float(reward)))
-
-            # Accumulate orange transition
-            if 'orange_obs' in info and 'orange_action' in info:
-                local_orange[i].append((
-                    info['orange_obs'].copy(),
-                    info['orange_action'].copy(),
-                    info['orange_reward'],
-                ))
-
-            rollout_returns[i] += float(reward)
-
-            if done:
-                # Flush blue and orange episodes to buffer (locked for trainer thread safety)
-                with buf_lock:
-                    for obs, act, rew in local_blue[i]:
-                        buffer.append(obs, act, rew)
-                    buffer.clip_episode(bool(not truncated))
-
-                    for obs, act, rew in local_orange[i]:
-                        buffer.append(obs, act, rew)
-                    buffer.clip_episode(bool(not truncated))
-
-                if on_episode_complete is not None:
-                    on_episode_complete(rollout_returns[i])
-
-                recent_returns.append(rollout_returns[i])
-                recent_goals.append(info.get('goal', 0))
-
-                # Notify pool of episode outcome for swap condition check
-                if hasattr(callback, 'on_episode_end'):
-                    callback.on_episode_end(algo, total_step, info.get('goal', 0))
-
-                if _wandb:
-                    episode_metrics = {
-                        'rollout/episode_return': rollout_returns[i],
-                        'rollout/episode_length': len(local_blue[i]),
-                        'rollout/goal': info.get('goal', 0),
-                    }
-                    pool = getattr(callback, 'pool', None)
-                    tracker = getattr(pool, 'tracker', None)
-                    if tracker is not None and tracker.episode_count >= tracker.window_size:
-                        episode_metrics['frozen_self_play/score'] = tracker.score()
-                    _wandb.log(episode_metrics, step=total_step)
-
-                local_blue[i] = []
-                local_orange[i] = []
-                rollout_returns[i] = 0.0
-
-                # Async reset — send now, recv at start of next iteration
-                envs.send_reset(i)
-                pending_resets.add(i)
-            else:
-                observations[i] = next_obs
-
-        total_step += n_active
-        if axis_tracker is not None:
-            axis_tracker.record_sim_steps(n_active)
-        collected_since_trigger += n_active
-        pbar.update(n_active)
-
-        # ── trigger async training ────────────────────────────────────────
-        if (
-            total_step > config.random_steps
-            and collected_since_trigger >= config.collection_buffer_size
-        ):
-            trainer.trigger(config.updates_per_swap)
-            collected_since_trigger = 0
-
-        # ── callback + axis logging (epoch boundaries) ────────────────────
-        epoch = total_step // config.n_steps_per_epoch
-        if callback and total_step % config.n_steps_per_epoch < num_envs:
-            # Drain pending resets before callback fires set_opponent_path.
-            # set_opponent_path does p.recv() on every pipe to get its None ack,
-            # but if a worker already has a queued reset result it would read that
-            # instead, leaving None in the pipe for the next recv_reset() call.
-            for _i in list(pending_resets):
-                _reset_obs, _ = envs.recv_reset(_i)
-                observations[_i] = _reset_obs
-                pending_resets.discard(_i)
-            callback(algo, epoch, total_step)
-            if _wandb is not None and _wandb.run is not None:
-                timing_provider.update_step(total_step)
-                if metrics_registry is not None:
-                    _wandb.log(metrics_registry.collect(), step=total_step)
-
-    pbar.close()
-
-    # Stop async trainer thread
-    trainer.stop()
-
-    # Drain any pending async resets so pipes are clean for the next trial
-    for i in list(pending_resets):
-        envs.recv_reset(i)
-    pending_resets.clear()
-
-    # Clip any in-progress episodes
-    for i in range(num_envs):
-        if local_blue[i]:
-            for obs, act, rew in local_blue[i]:
-                buffer.append(obs, act, rew)
-            buffer.clip_episode(False)
-        if local_orange[i]:
-            for obs, act, rew in local_orange[i]:
-                buffer.append(obs, act, rew)
-            buffer.clip_episode(False)
-
-
-# ── main training function ───────────────────────────────────────────────────
-
-def train(config: TrainConfig, axis_tracker=None) -> None:
-    """Run training with the given configuration."""
-    assert config.eval_interval > 0, "eval_interval must be positive"
-    assert config.total_steps > 0, "total_steps must be positive"
-    assert config.batch_size > 0, "batch_size must be positive"
-    assert config.algo in ALGO_MAP, f"Unknown algo: {config.algo}"
-
-    set_seed(config.seed)
-
-    model_dir = Path(config.model_dir) / f'seed_{config.seed}'
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config for reproducibility
-    with open(model_dir / 'config.json', 'w') as f:
-        json.dump(dataclasses.asdict(config), f, indent=2)
-
-    # ── resume from checkpoint ────────────────────────────────────────────
-    resume_step = 0
-    wandb_resume_id = None
-    if config.resume_from:
-        resume_path = Path(config.resume_from)
-        meta_path = resume_path / 'checkpoint_meta.json'
-        if not resume_path.exists():
-            raise FileNotFoundError(f'Resume path not found: {resume_path}')
-        if meta_path.exists():
-            with open(meta_path) as f:
-                meta = json.load(f)
-            resume_step = meta.get('total_steps', 0)
-            wandb_resume_id = meta.get('wandb_run_id')
-            print(f'Resuming from checkpoint: {resume_path}')
-            print(f'  Restoring from step {resume_step:,}')
-            if wandb_resume_id:
-                print(f'  Linking to W&B run: {wandb_resume_id}')
-        else:
-            print(f'Resuming from checkpoint: {resume_path} (no meta, starting step count from 0)')
-
-    # ── pre-init W&B for resume (must happen before d3rlpy or parallel path) ──
-    if wandb_resume_id and not config.no_wandb:
-        try:
-            import wandb as _wandb_pre
-            _wandb_pre.init(
-                id=wandb_resume_id,
-                resume='must',
-                project=config.wandb_project,
-            )
-        except Exception as e:
-            print(f'  W&B resume init failed ({e}), will start a new run.')
-
-    parallel = config.num_envs > 1
-
-    print(f'Training config:')
-    print(f'  Algorithm:  {config.algo}')
-    print(f'  Reward:     {config.reward_type}')
-    print(f'  Seed:       {config.seed}')
-    print(f'  Steps:      {config.total_steps:,}')
-    print(f'  Device:     {"cuda" if torch.cuda.is_available() else "cpu"}')
-    print(f'  Eval every: {config.eval_interval:,} steps')
-    print(f'  Num envs:   {config.num_envs}')
-    print(f'  Model dir:  {model_dir}')
-
-    # ── environment ──────────────────────────────────────────────────────
-    # Sequential path uses OutcomeTrackingEnv so callback can drain episode
-    # outcomes; parallel path uses plain BaselineGymEnv (outcomes come via hook).
-    if parallel:
-        env = BaselineGymEnv(
-            t_window=config.t_window,
-            reward_type=config.reward_type,
-            dense_reward_weights=config.dense_reward_weights,
-        )
-    else:
-        env = OutcomeTrackingEnv(
-            t_window=config.t_window,
-            reward_type=config.reward_type,
-            dense_reward_weights=config.dense_reward_weights,
-        )
-
-    # ── d3rlpy algorithm ─────────────────────────────────────────────────
-    if config.resume_from:
-        algo = d3rlpy.load_learnable(str(Path(config.resume_from) / 'd3rlpy_model'))
-        print(f'  Loaded model weights from {config.resume_from}/d3rlpy_model')
-    else:
-        algo = build_algo(config)
-
-    # ── self-play opponent pool (frozen) ─────────────────────────────────
-    def _algo_builder():
-        a = build_algo(config)
-        a.build_with_env(env)
-        return a
-
-    if config.pool_type == 'evolutionary':
-        pool = EvolutionaryOpponentPool(
-            snapshot_dir=config.snapshot_dir,
-            algo_builder=_algo_builder,
-            population_size=config.population_size,
-            num_survivors=config.num_survivors,
-            evolution_interval=config.evolution_interval,
-            mutation_noise=config.mutation_noise,
-        )
-    else:
-        pool = FrozenOpponentPool(
-            snapshot_dir=config.snapshot_dir,
-            algo_builder=_algo_builder,
-            max_snapshots=config.max_snapshots,
-        )
-
-    # ── metrics registry ─────────────────────────────────────────────────
-    metrics_registry = MetricsRegistry()
-    if hasattr(pool, 'get_metrics'):
-        pool_namespace = 'evolutionary_pool' if config.pool_type == 'evolutionary' else 'frozen_self_play'
-        metrics_registry.register(pool_namespace, pool.get_metrics)
-    if axis_tracker is not None:
-        metrics_registry.register('consumed_resources', axis_tracker.get_metrics)
-
-    # ── callback ─────────────────────────────────────────────────────────
-    callback = TrainingCallback(config, env, pool, axis_tracker=axis_tracker,
-                                metrics_registry=metrics_registry)
-
-    # ── W&B logging ──────────────────────────────────────────────────────
-    if config.no_wandb:
-        logger_adapter = FileAdapterFactory(root_dir=str(model_dir / 'logs'))
-    else:
-        logger_adapter = WanDBAdapterFactory(project=config.wandb_project)
-
-    # ── exploration ──────────────────────────────────────────────────────
-    explorer = NormalNoise(mean=0.0, std=config.explore_noise)
-
-    # ── replay buffer ────────────────────────────────────────────────────
-    buffer = d3rlpy.dataset.create_fifo_replay_buffer(
-        limit=config.buffer_capacity,
-        env=env,
-    )
-
-    # ── pre-load replay data into buffer (Axis 2) ──────────────────────
-    if config.replay_seed_dir:
-        from replay_dataset import load_replays_into_buffer
-        n_eps = load_replays_into_buffer(config.replay_seed_dir, buffer)
-        if axis_tracker is not None:
-            # Count .npz files as replays loaded
-            from pathlib import Path as _P
-            n_files = len(list(_P(config.replay_seed_dir).glob('*.npz')))
-            axis_tracker.record_replays(n_files)
-
-    # ── run metadata ─────────────────────────────────────────────────────
-    callback.log_metadata()
-
-    # ── train ────────────────────────────────────────────────────────────
-    print(f'\nStarting training...\n')
-
-    if parallel:
-        # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
-        if not config.no_wandb:
-            import wandb
-            if wandb.run is None:
-                run_name = config.wandb_run_name or f'{config.algo}_seed{config.seed}'
-                init_kwargs = dict(
-                    project=config.wandb_project,
-                    name=run_name,
-                    config=dataclasses.asdict(config),
+            for local_i, wi in enumerate(worker_ids):
+                actions[wi] = result.action[local_i]
+                # Create per-worker ActionResult slice
+                from training.abstractions import ActionResult
+                action_results[wi] = ActionResult(
+                    action=result.action[local_i:local_i+1],
+                    aux={k: v[local_i:local_i+1] for k, v in result.aux.items()},
                 )
-                if config.wandb_group:
-                    init_kwargs['group'] = config.wandb_group
-                wandb.init(**init_kwargs)
 
-        envs = SubprocVecEnv(
-            num_envs=config.num_envs,
-            t_window=config.t_window,
-            reward_type=config.reward_type,
-        )
-        # Send config to workers so they can build algo for opponent loading
-        envs.set_algo_builder_args(dataclasses.asdict(config))
-        # Wire callback to update opponents in all subprocess envs
-        callback.parallel_envs = envs
+        # Step all envs
+        next_obs, rewards, dones, infos = envs.step(actions)
 
-        try:
-            fit_online_parallel(
-                algo=algo,
-                config=config,
-                envs=envs,
-                buffer=buffer,
-                explorer=explorer,
-                callback=callback,
-                axis_tracker=axis_tracker,
-                metrics_registry=metrics_registry,
-                start_step=resume_step,
+        # Store transitions per agent (vectorized)
+        for agent_idx, worker_ids in agent_workers.items():
+            agent = agents[agent_idx]
+            w_obs = obs[worker_ids]
+            w_rewards = rewards[worker_ids]
+            w_dones = dones[worker_ids]
+
+            # Build a combined ActionResult for this agent's workers
+            w_actions = actions[worker_ids]
+            w_log_probs = np.array([action_results[wi].aux['log_prob'][0] for wi in worker_ids])
+            w_values = np.array([action_results[wi].aux['value'][0] for wi in worker_ids])
+
+            from training.abstractions import ActionResult
+            combined_result = ActionResult(
+                action=w_actions,
+                aux={'log_prob': w_log_probs, 'value': w_values},
             )
-        finally:
-            envs.close()
-            if not config.no_wandb:
-                import wandb
-                if wandb.run is not None:
-                    wandb.finish()
+            agent.store_transition(w_obs, combined_result, w_rewards, next_obs[worker_ids], w_dones, {})
+
+        # Track episodes
+        for wi in range(num_envs):
+            episode_returns[wi] += rewards[wi]
+            episode_lengths[wi] += 1
+            if dones[wi]:
+                goal = infos[wi].get('goal', 0)
+                rollout_metrics.on_episode_end(
+                    episode_returns[wi], int(episode_lengths[wi]), goal)
+                population.add_score(worker_map[wi], float(goal))
+                episode_returns[wi] = 0.0
+                episode_lengths[wi] = 0
+
+        obs = next_obs
+
+        # Check if any agent needs an update
+        for agent_idx, agent in enumerate(agents):
+            if agent.should_update():
+                updater.trigger(agent, agent_idx)
+
+    return rollout_steps * num_envs
+
+
+# ── main training loop ──────────────────────────────────────────────────────
+
+def train(config: dict):
+    """Main training entry point. Fully algorithm-agnostic."""
+    seed = config.get('seed', 0)
+    set_seed(seed)
+
+    total_steps = config['total_steps']
+    num_envs = config['num_envs']
+    t_window = config.get('t_window', 8)
+    reward_type = config.get('reward_type', 'sparse')
+    model_dir = Path(config.get('model_dir', 'models/baseline')) / f'seed_{seed}'
+    model_dir.mkdir(parents=True, exist_ok=True)
+    log_interval = config.get('log_interval', 10)
+
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    print(f'[train] seed={seed} device={device} total_steps={total_steps:,}')
+
+    # ── resolve logger ──────────────────────────────────────────────────
+    LoggerCls = resolve_or_default(config, 'logger', None)
+    if LoggerCls is None:
+        from training.loggers.wandb import WandbLogger
+        LoggerCls = WandbLogger
+    logger = LoggerCls()
+    logger.init(config)
+
+    from training.loggers.registry import MetricsRegistry
+    registry = MetricsRegistry()
+
+    # ── resolve reward function ─────────────────────────────────────────
+    RewardCls = resolve_or_default(config, 'reward', None)
+    if RewardCls is not None:
+        reward_fn = RewardCls()
     else:
-        remaining_steps = config.total_steps - resume_step
-        # On resume, skip random exploration (already done in the original run)
-        random_steps = 0 if resume_step > 0 else config.random_steps
-        algo.fit_online(
-            env=env,
-            buffer=buffer,
-            explorer=explorer,
-            n_steps=remaining_steps,
-            n_steps_per_epoch=config.n_steps_per_epoch,
-            update_interval=config.update_interval,
-            random_steps=random_steps,
-            experiment_name=f'{config.algo}_seed{config.seed}',
-            logger_adapter=logger_adapter,
-            show_progress=True,
-            callback=callback,
-        )
+        reward_fn = None  # env handles reward internally
 
-    # ── save final model ─────────────────────────────────────────────────
-    algo.save(str(model_dir / 'final_model'))
-    algo.save(str(model_dir / 'd3rlpy_model'))
-    with open(model_dir / 'checkpoint_meta.json', 'w') as f:
-        json.dump({'total_steps': config.total_steps + resume_step, 'done': True}, f)
-    print(f'\nTraining complete. Model saved to {model_dir}')
+    # ── resolve replay / feedback providers ─────────────────────────────
+    ReplayCls = resolve_or_default(config, 'replay', NullReplayProvider)
+    replay_provider = ReplayCls()
+    FeedbackCls = resolve_or_default(config, 'feedback', NullFeedbackProvider)
+    feedback_provider = FeedbackCls()
 
-    if callback.converged:
-        print(f'Converged at Rookie win rate >= {config.rookie_target_wr:.0%}')
-    else:
-        print(f'Did not converge within {config.total_steps:,} steps.')
+    # ── create population ───────────────────────────────────────────────
+    from training.algorithms.ppo import Population
+    pop_config = config.get('population', {})
+    num_agents = pop_config.get('agents', 1)
+    population = Population(num_agents=num_agents, num_workers=num_envs, config=config)
 
-    env.close()
+    # Move agents to device
+    for agent in population.agents:
+        agent.device = torch.device(device)
+        agent.encoder.to(device)
+        agent.policy.to(device)
 
+    # ── create opponent pool ────────────────────────────────────────────
+    PoolCls = resolve_or_default(config, 'opponent_pool', None)
+    pool = None
+    if PoolCls is not None:
+        pool_params = config.get('opponent_pool', {}).get('params', {})
+        snapshot_dir = config.get('snapshot_dir', 'models/snapshots')
+        pool = PoolCls(snapshot_dir=snapshot_dir, **pool_params)
 
-# ── Optuna parameter loading ────────────────────────────────────────────────
-
-def load_params_from_optuna(db_path: str, study_name: str = 'baseline-hparam-search') -> dict:
-    """Load best hyperparameters from an Optuna study database."""
-    try:
-        import optuna
-    except ImportError:
-        raise ImportError('optuna required: pip install optuna')
-
-    study = optuna.load_study(
-        study_name=study_name,
-        storage=f'sqlite:///{db_path}',
+    # ── create vectorized envs ──────────────────────────────────────────
+    dense_weights = config.get('dense_reward_weights', None)
+    envs = SubprocVecEnv(
+        num_envs=num_envs,
+        t_window=t_window,
+        reward_type=reward_type,
+        dense_reward_weights=dense_weights,
     )
-    if not study.best_trial:
-        raise RuntimeError(f'No completed trials in {db_path}')
 
-    print(f'Loaded best params from Optuna (trial #{study.best_trial.number}):')
-    for k, v in study.best_params.items():
-        print(f'  {k}: {v}')
-    return study.best_params
+    # ── seed from replay data ───────────────────────────────────────────
+    demos = replay_provider.load_demonstrations()
+    if demos:
+        for agent in population.agents:
+            replay_provider.seed_algorithm(agent, demos)
+
+    # ── register metrics providers ──────────────────────────────────────
+    rollout_metrics = RolloutMetricsProvider()
+    timing_metrics = TimingMetricsProvider()
+    registry.register('rollout', rollout_metrics.get_metrics)
+    registry.register('timing', timing_metrics.get_metrics)
+    if pool:
+        registry.register('opponent_pool', pool.get_metrics)
+    registry.register('population', population.get_metrics)
+
+    # ── main loop ───────────────────────────────────────────────────────
+    updater = AsyncUpdater()
+    total_collected = 0
+    collection_round = 0
+    gen_steps = pop_config.get('generation_steps', 1_000_000)
+    noise_scale = pop_config.get('generation_noise_scale', 0.01)
+    last_gen_step = 0
+
+    print(f'[train] {num_agents} agent(s), {num_envs} envs, '
+          f'rollout_steps={config.get("algorithm", {}).get("params", {}).get("rollout_steps", 2048)}')
+
+    try:
+        while total_collected < total_steps:
+            # Set opponents from pool
+            if pool and pool.num_snapshots() > 0:
+                snap_path = pool.sample_opponent()
+                if snap_path:
+                    envs.set_opponent_snapshot(snap_path)
+
+            # Collect rollouts and trigger updates
+            steps = collect_and_train(
+                population, envs, updater, rollout_metrics, config)
+            total_collected += steps
+            timing_metrics.add_steps(steps)
+            collection_round += 1
+
+            # Drain update metrics and log
+            update_results = updater.pop_metrics()
+            for agent_id, metrics in update_results:
+                prefixed = {f'agent_{agent_id}/{k}': v for k, v in metrics.items()}
+                logger.log(total_collected, **prefixed)
+
+            # Periodic logging
+            if collection_round % log_interval == 0:
+                custom = registry.collect()
+                logger.log(total_collected,
+                           total_steps=total_collected,
+                           **custom)
+                # Print progress
+                rm = rollout_metrics.get_metrics()
+                mean_ret = rm.get('mean_return', 0.0)
+                sps = timing_metrics.get_metrics().get('steps_per_sec', 0.0)
+                print(f'[step {total_collected:>10,}] '
+                      f'mean_return={mean_ret:.3f}  '
+                      f'steps/s={sps:.0f}  '
+                      f'scored={rollout_metrics.goals_scored}  '
+                      f'conceded={rollout_metrics.goals_conceded}')
+
+            # Save snapshots to opponent pool
+            if pool:
+                best_idx = population.rank_agents()[0]
+                best_agent = population.agents[best_idx]
+                if pool.should_swap(total_collected):
+                    pool.save_snapshot(best_agent, total_collected)
+
+            # Population generation cycle
+            if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
+                ranked = population.rank_agents()
+                best = population.agents[ranked[0]]
+                # Reset worst from best + noise
+                if len(ranked) > 1:
+                    worst_idx = ranked[-1]
+                    population.agents[worst_idx].clone_from(best, noise_scale=noise_scale)
+                    print(f'[gen {population.generation}] '
+                          f'best=agent_{ranked[0]}  worst=agent_{worst_idx} (reset)')
+                population.reset_scores()
+                last_gen_step = total_collected
+
+            # Checkpoint
+            if collection_round % (log_interval * 10) == 0:
+                best_idx = population.rank_agents()[0]
+                population.agents[best_idx].save_checkpoint(model_dir / 'latest')
+
+    except KeyboardInterrupt:
+        print('\n[train] Interrupted.')
+    finally:
+        updater.stop()
+        # Save final checkpoint
+        best_idx = population.rank_agents()[0]
+        population.agents[best_idx].save_checkpoint(model_dir / 'final')
+        print(f'[train] Saved final checkpoint to {model_dir}/final')
+
+        logger.finish()
+        envs.close()
+
+    print(f'[train] Done. {total_collected:,} total steps.')
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Train RL agent with d3rlpy.')
-
-    # Core
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--algo', default='AWAC', choices=list(ALGO_MAP.keys()))
-    parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
-                        help='Reward function: sparse (goals only) or dense (shaped)')
-    parser.add_argument('--total-steps', type=int, default=50_000_000)
-
-    # Hyperparameters
-    parser.add_argument('--actor-lr', type=float, default=3e-4)
-    parser.add_argument('--critic-lr', type=float, default=3e-4)
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--awac-lambda', type=float, default=1.0)
-    parser.add_argument('--explore-noise', type=float, default=0.1)
-    parser.add_argument('--buffer-capacity', type=int, default=1_000_000)
-    parser.add_argument('--random-steps', type=int, default=10_000)
-
-    # Architecture
-    parser.add_argument('--t-window', type=int, default=8)
-
-    # Training loop
-    parser.add_argument('--eval-interval', type=int, default=200_000)
-    parser.add_argument('--n-steps-per-epoch', type=int, default=10_000)
-    parser.add_argument('--num-envs', type=int, default=1,
-                        help='Parallel RLGym-sim environments (default: 1 = sequential)')
-    parser.add_argument('--collection-buffer-size', type=int, default=50_000,
-                        help='Transitions to collect before triggering async training (parallel path)')
-    parser.add_argument('--updates-per-swap', type=int, default=500,
-                        help='Gradient steps per training trigger (parallel path)')
-
-    # Opponent pool
-    parser.add_argument('--pool-type', default='frozen', choices=['frozen', 'evolutionary'],
-                        help='Opponent pool type: frozen (performance-gated) or evolutionary')
-    parser.add_argument('--population-size', type=int, default=10,
-                        help='Evolutionary pool: number of agents in population')
-    parser.add_argument('--num-survivors', type=int, default=3,
-                        help='Evolutionary pool: survivors kept per generation')
-    parser.add_argument('--evolution-interval', type=int, default=50_000,
-                        help='Evolutionary pool: training steps between evolutions')
-    parser.add_argument('--mutation-noise', type=float, default=0.01,
-                        help='Evolutionary pool: std of Gaussian mutation noise')
-
-    # Paths
-    parser.add_argument('--model-dir', default='models/frozen_self_play')
-    parser.add_argument('--resume-from', default=None,
-                        help='Resume from a checkpoint directory (e.g. models/frozen_self_play/seed_0)')
-
-    # W&B
-    parser.add_argument('--no-wandb', action='store_true')
-    parser.add_argument('--wandb-project', default='rlbot-baseline')
-
-    # Optuna integration
-    parser.add_argument('--params-from', default=None,
-                        help='Load best hyperparams from Optuna SQLite DB')
-    parser.add_argument('--study-name', default='baseline-hparam-search',
-                        help='Optuna study name to load best params from (used with --params-from)')
-
+    parser = argparse.ArgumentParser(description='YAML-configured RL training')
+    parser.add_argument('--config', default=None,
+                        help='YAML config file path')
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--total-steps', type=int, default=None)
+    parser.add_argument('--num-envs', type=int, default=None)
+    parser.add_argument('--no-wandb', action='store_true',
+                        help='Disable W&B logging')
     args = parser.parse_args()
 
-    config = TrainConfig(
-        seed=args.seed,
-        algo=args.algo,
-        reward_type=args.reward,
-        total_steps=args.total_steps,
-        actor_lr=args.actor_lr,
-        critic_lr=args.critic_lr,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        tau=args.tau,
-        awac_lambda=args.awac_lambda,
-        explore_noise=args.explore_noise,
-        buffer_capacity=args.buffer_capacity,
-        random_steps=args.random_steps,
-        t_window=args.t_window,
-        eval_interval=args.eval_interval,
-        n_steps_per_epoch=args.n_steps_per_epoch,
-        num_envs=args.num_envs,
-        collection_buffer_size=args.collection_buffer_size,
-        updates_per_swap=args.updates_per_swap,
-        pool_type=args.pool_type,
-        population_size=args.population_size,
-        num_survivors=args.num_survivors,
-        evolution_interval=args.evolution_interval,
-        mutation_noise=args.mutation_noise,
-        model_dir=args.model_dir,
-        no_wandb=args.no_wandb,
-        wandb_project=args.wandb_project,
-        resume_from=args.resume_from,
-    )
-
-    # Override with Optuna-tuned params if requested
-    if args.params_from:
-        params = load_params_from_optuna(args.params_from, study_name=args.study_name)
-        param_map = {
-            'actor_lr': 'actor_lr',
-            'critic_lr': 'critic_lr',
-            'awac_lambda': 'awac_lambda',
-            'tau': 'tau',
-            'batch_size': 'batch_size',
-            'gamma': 'gamma',
-            'explore_noise': 'explore_noise',
+    # Load config
+    if args.config:
+        config = load_config(args.config, cli_overrides={
+            'seed': args.seed,
+            'total_steps': args.total_steps,
+            'num_envs': args.num_envs,
+        })
+    else:
+        # No YAML — use universal defaults with PPO
+        config = dict(UNIVERSAL_DEFAULTS)
+        config['algorithm'] = {
+            'class': 'training.algorithms.ppo.PPOAlgorithm',
+            'params': {},
         }
-        for optuna_key, config_key in param_map.items():
-            if optuna_key in params:
-                setattr(config, config_key, params[optuna_key])
+        config['opponent_pool'] = {
+            'class': 'training.opponents.pool.HistoricalOpponentPool',
+            'params': {},
+        }
+        # Resolve
+        from training.algorithms.ppo import PPOAlgorithm
+        from training.opponents.pool import HistoricalOpponentPool
+        config['algorithm']['cls'] = PPOAlgorithm
+        config['algorithm']['params'] = PPOAlgorithm.default_params()
+        config['opponent_pool']['cls'] = HistoricalOpponentPool
+        config['opponent_pool']['params'] = HistoricalOpponentPool.default_params()
+        # Apply CLI overrides
+        if args.seed is not None:
+            config['seed'] = args.seed
+        if args.total_steps is not None:
+            config['total_steps'] = args.total_steps
+        if args.num_envs is not None:
+            config['num_envs'] = args.num_envs
+
+    if args.no_wandb:
+        config.setdefault('logger', {})['params'] = {'enabled': False}
 
     train(config)
 
