@@ -252,28 +252,10 @@ class PPOAlgorithm(Algorithm):
         self.encoder.eval()
         self.policy.eval()
 
-        # Compile for reduced kernel launch overhead (fixed-shape inputs).
-        # Tries inductor (best), falls back to cudagraphs (no Triton needed
-        # on Windows), and skips compile entirely if neither works.
+        # Enable TF32 tensor cores for ~2x matmul throughput on Ampere+ GPUs.
+        # Minimal precision loss (10-bit mantissa vs 23-bit) — fine for RL.
         if self.device.type == 'cuda':
-            for backend, mode in [('inductor', 'reduce-overhead'),
-                                  ('cudagraphs', None)]:
-                try:
-                    kwargs = {'backend': backend}
-                    if mode:
-                        kwargs['mode'] = mode
-                    test_enc = torch.compile(self.encoder, **kwargs)
-                    _dummy = torch.zeros(1, self.t_window, N_TOKENS,
-                                         TOKEN_FEATURES, device=self.device)
-                    with torch.no_grad():
-                        test_enc(_dummy, self._entity_ids)
-                    self.encoder = test_enc
-                    self.policy = torch.compile(self.policy, **kwargs)
-                    print(f'[ppo] torch.compile backend={backend} active')
-                    break
-                except Exception as e:
-                    print(f'[ppo] torch.compile backend={backend} failed: {e}')
-                    continue
+            torch.set_float32_matmul_precision('high')
 
         # Signals when the rollout buffer is free for new collection.
         # Cleared when an update is triggered; set again after buffer.reset().
