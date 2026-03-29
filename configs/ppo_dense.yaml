@@ -1,11 +1,11 @@
 algorithm:
-  class: training.train.PPOAlgorithm
+  class: training.algorithms.ppo.PPOAlgorithm
 
 opponent_pool:
-  class: training.self_play.HistoricalOpponentPool
+  class: training.opponents.pool.HistoricalOpponentPool
 
 reward:
-  class: training.train.DenseRewardFunction
+  class: training.rewards.dense.DenseRewardFunction
 
 seed: 0
 total_steps: 50000000

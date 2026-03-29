@@ -23,13 +23,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 from encoder import SharedTransformerEncoder, ENTITY_TYPE_IDS_1V1, D_MODEL, N_TOKENS, TOKEN_FEATURES
 from policy_head import StochasticPolicyHead
-from abstractions import Algorithm, ActionResult
+from training.abstractions import Algorithm, ActionResult
 
 
 # ---------------------------------------------------------------------------

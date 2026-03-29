@@ -28,7 +28,7 @@ from typing import Any, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 

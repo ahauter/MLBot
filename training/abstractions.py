@@ -26,7 +26,7 @@ import numpy as np
 
 
 # Re-export OpponentPool from its existing home
-from self_play import OpponentPool
+from training.opponents.pool import OpponentPool
 
 
 # ---------------------------------------------------------------------------

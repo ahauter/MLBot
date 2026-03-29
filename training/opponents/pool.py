@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 

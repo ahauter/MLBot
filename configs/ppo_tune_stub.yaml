@@ -1,8 +1,8 @@
 algorithm:
-  class: training.train.PPOAlgorithm
+  class: training.algorithms.ppo.PPOAlgorithm
 
 opponent_pool:
-  class: training.self_play.HistoricalOpponentPool
+  class: training.opponents.pool.HistoricalOpponentPool
 
 num_envs: 4
 

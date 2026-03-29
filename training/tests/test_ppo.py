@@ -24,8 +24,8 @@ sys.path.insert(0, str(_REPO / 'training'))
 
 from encoder import D_MODEL
 from policy_head import StochasticPolicyHead
-from ppo import PPOAlgorithm, RolloutBuffer, Population
-from abstractions import Algorithm, ActionResult
+from training.algorithms.ppo import PPOAlgorithm, RolloutBuffer, Population
+from training.abstractions import Algorithm, ActionResult
 
 
 # ── StochasticPolicyHead tests ─────────────────────────────────────────────

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
-_REPO = Path(__file__).parent.parent
+_REPO = Path(__file__).parent.parent.parent
 
 
 # ── evaluation tiers ────────────��────────────────────────���───────────────────
