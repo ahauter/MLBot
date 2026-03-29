@@ -24,9 +24,6 @@ rlgym-tools
 pandas
 pyarrow
 
-# RL algorithm library — provides AWAC, SAC, CQL, IQL, etc. with proper
-# Q-critics, target networks, and replay buffers.
-d3rlpy
 gymnasium
 
 # Experiment tracking and hyperparameter tuning

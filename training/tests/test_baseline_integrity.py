@@ -29,15 +29,23 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-import d3rlpy
 import gymnasium as gym
 
-from baseline_encoder_factory import TransformerEncoderFactory
 from encoder import (
     D_MODEL, N_TOKENS, TOKEN_FEATURES,
     ENTITY_TYPE_IDS_1V1, N_ENTITY_TYPES,
     SharedTransformerEncoder, _causal_mask,
 )
+
+# d3rlpy is no longer a dependency — skip tests that require it
+try:
+    import d3rlpy
+    from baseline_encoder_factory import TransformerEncoderFactory
+    _HAS_D3RLPY = True
+except ImportError:
+    _HAS_D3RLPY = False
+
+requires_d3rlpy = pytest.mark.skipif(not _HAS_D3RLPY, reason='d3rlpy not installed')
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -50,6 +58,8 @@ class DummyEnv(gym.Env):
 
 
 def _make_algo():
+    if not _HAS_D3RLPY:
+        pytest.skip('d3rlpy not installed')
     factory = TransformerEncoderFactory(t_window=8)
     algo = d3rlpy.algos.AWACConfig(
         actor_encoder_factory=factory,
@@ -233,6 +243,7 @@ class TestRewardIntegrity:
 # 3. SELF-PLAY INTEGRITY
 # ═══════════════════════════════════════════════════════════════════════════
 
+@requires_d3rlpy
 class TestSelfPlayIntegrity:
 
     def test_snapshot_weights_are_reproducible(self):
@@ -302,6 +313,7 @@ class TestSelfPlayIntegrity:
 # 4. D3RLPY INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════
 
+@requires_d3rlpy
 class TestD3rlpyIntegration:
 
     def test_target_network_weights_match_at_init(self):
@@ -391,6 +403,7 @@ class TestD3rlpyIntegration:
 # 5. SEEDING AND REPRODUCIBILITY
 # ═══════════════════════════════════════════════════════════════════════════
 
+@requires_d3rlpy
 class TestSeeding:
 
     def test_same_seed_same_weights(self):
@@ -494,6 +507,7 @@ class TestEvalProtocol:
         assert car_sections[1] == (1, 'Psyonix'), \
             f"Car 1 should be (team=1, Psyonix), got {car_sections[1]}"
 
+    @requires_d3rlpy
     def test_convergence_requires_two_consecutive(self):
         """
         Convergence detection must require 2 CONSECUTIVE checkpoints above target.

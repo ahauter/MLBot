@@ -24,11 +24,19 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-import d3rlpy
 import gymnasium as gym
 
-from baseline_encoder_factory import TransformerEncoderFactory
 from encoder import D_MODEL, N_TOKENS, TOKEN_FEATURES
+
+# d3rlpy is no longer a dependency — skip tests that require it
+try:
+    import d3rlpy
+    from baseline_encoder_factory import TransformerEncoderFactory
+    _HAS_D3RLPY = True
+except ImportError:
+    _HAS_D3RLPY = False
+
+requires_d3rlpy = pytest.mark.skipif(not _HAS_D3RLPY, reason='d3rlpy not installed')
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -46,7 +54,9 @@ class DummyEnv(gym.Env):
 
 
 def _make_algo(factory=None):
-    """Create and build a test AWAC algo."""
+    """Create and build a test AWAC algo (requires d3rlpy)."""
+    if not _HAS_D3RLPY:
+        pytest.skip('d3rlpy not installed')
     if factory is None:
         factory = TransformerEncoderFactory(t_window=8)
     algo = d3rlpy.algos.AWACConfig(
@@ -59,6 +69,7 @@ def _make_algo(factory=None):
 
 # ── encoder factory tests ───────────────────────────────────────────────────
 
+@requires_d3rlpy
 class TestEncoderFactory:
 
     def test_create_output_shape(self):
@@ -115,6 +126,7 @@ class TestEncoderFactory:
 
 # ── self-play pool tests ────────────────────────────────────────────────────
 
+@requires_d3rlpy
 class TestOpponentPool:
 
     def setup_method(self):
@@ -185,6 +197,7 @@ class TestOpponentPool:
 
 # ── train config tests ──────────────────────────────────────────────────────
 
+@requires_d3rlpy
 class TestTrainConfig:
 
     def test_config_serialization(self):
@@ -209,6 +222,7 @@ class TestTrainConfig:
 
 # ── algo build tests ────────────────────────────────────────────────────────
 
+@requires_d3rlpy
 class TestAlgoBuild:
 
     def test_build_awac(self):

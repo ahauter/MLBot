@@ -21,11 +21,19 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-import d3rlpy
 import gymnasium as gym
 
-from baseline_encoder_factory import TransformerEncoderFactory
 from frozen_self_play import EpisodeOutcomeTracker, FrozenOpponentPool, OutcomeTrackingEnv
+
+# d3rlpy is no longer a dependency — skip tests that require it
+try:
+    import d3rlpy
+    from baseline_encoder_factory import TransformerEncoderFactory
+    _HAS_D3RLPY = True
+except ImportError:
+    _HAS_D3RLPY = False
+
+requires_d3rlpy = pytest.mark.skipif(not _HAS_D3RLPY, reason='d3rlpy not installed')
 
 
 class DummyEnv(gym.Env):
@@ -40,6 +48,8 @@ class DummyEnv(gym.Env):
 
 
 def _make_algo():
+    if not _HAS_D3RLPY:
+        pytest.skip('d3rlpy not installed')
     factory = TransformerEncoderFactory(t_window=8)
     algo = d3rlpy.algos.AWACConfig(
         actor_encoder_factory=factory,
@@ -140,6 +150,7 @@ class TestEpisodeOutcomeTracker:
 
 # ── FrozenOpponentPool tests ───────────────────────────────────────────────
 
+@requires_d3rlpy
 class TestFrozenOpponentPool:
 
     def setup_method(self):
