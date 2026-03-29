@@ -85,4 +85,4 @@ class SkillHead(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path: str) -> None:
-        self.load_state_dict(torch.load(path, map_location='cpu'))
+        self.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))

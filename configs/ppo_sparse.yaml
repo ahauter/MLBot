@@ -11,10 +11,10 @@ eval_interval: 200000
 t_window: 8
 
 population:
-  agents: 3
+  agents: 4
   generation_steps: 1000000
   generation_noise_scale: 0.01
 
 wandb:
-  project: rlbot-baseline
+  project: ppo-tuning
   enabled: true

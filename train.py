@@ -22,6 +22,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib
 import multiprocessing
 import multiprocessing.connection
@@ -91,10 +92,25 @@ def resolve_or_default(config: dict, section: str, default_class):
     return cls
 
 
+def _coerce_numbers(obj):
+    """Recursively convert scientific-notation strings (e.g. '1e5') to int/float."""
+    if isinstance(obj, dict):
+        return {k: _coerce_numbers(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_coerce_numbers(v) for v in obj]
+    if isinstance(obj, str):
+        try:
+            f = float(obj)
+            return int(f) if f == int(f) else f
+        except ValueError:
+            pass
+    return obj
+
+
 def load_config(yaml_path: str, cli_overrides: Optional[dict] = None) -> dict:
     """Load YAML, resolve classes via importlib, merge defaults, apply CLI overrides."""
     with open(yaml_path) as f:
-        config = yaml.safe_load(f) or {}
+        config = _coerce_numbers(yaml.safe_load(f) or {})
 
     # Start with universal defaults, overlay YAML
     merged = _deep_merge(dict(UNIVERSAL_DEFAULTS), config)
@@ -105,7 +121,8 @@ def load_config(yaml_path: str, cli_overrides: Optional[dict] = None) -> dict:
         AlgoCls = load_class(algo_path)
         merged.setdefault('algorithm', {})['cls'] = AlgoCls
         # Merge class defaults with YAML overrides
-        class_defaults = AlgoCls.default_params() if hasattr(AlgoCls, 'default_params') else {}
+        class_defaults = AlgoCls.default_params() if hasattr(
+            AlgoCls, 'default_params') else {}
         yaml_params = merged.get('algorithm', {}).get('params', {})
         merged['algorithm']['params'] = {**class_defaults, **yaml_params}
 
@@ -114,7 +131,8 @@ def load_config(yaml_path: str, cli_overrides: Optional[dict] = None) -> dict:
     if pool_path:
         PoolCls = load_class(pool_path)
         merged.setdefault('opponent_pool', {})['cls'] = PoolCls
-        class_defaults = PoolCls.default_params() if hasattr(PoolCls, 'default_params') else {}
+        class_defaults = PoolCls.default_params() if hasattr(
+            PoolCls, 'default_params') else {}
         yaml_params = merged.get('opponent_pool', {}).get('params', {})
         merged['opponent_pool']['params'] = {**class_defaults, **yaml_params}
 
@@ -142,20 +160,26 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 class NullReplayProvider:
     """No expert data. Axis 2 cost = 0."""
+
     def load_demonstrations(self):
         return None
+
     def seed_algorithm(self, algo, demos):
         pass
+
     def get_metrics(self):
         return {}
 
 
 class NullFeedbackProvider:
     """No human feedback. Axis 3 cost = 0."""
+
     def get_feedback_reward(self, *args):
         return None
+
     def should_query(self, step):
         return False
+
     def get_metrics(self):
         return {}
 
@@ -197,10 +221,11 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                 from training.opponents.pool import load_opponent_from_snapshot
                 weights = load_opponent_from_snapshot(snap_path, device='cpu')
                 from encoder import SharedTransformerEncoder, D_MODEL
-                from policy_head import PolicyHead
+                from policy_head import StochasticPolicyHead
                 if _opponent_encoder is None:
-                    _opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL)
-                    _opponent_policy = PolicyHead(d_model=D_MODEL)
+                    _opponent_encoder = SharedTransformerEncoder(
+                        d_model=D_MODEL)
+                    _opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
                 _opponent_encoder.load_state_dict(weights['encoder'])
                 _opponent_policy.load_state_dict(weights['policy'])
                 _opponent_encoder.eval()
@@ -214,15 +239,18 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                     stacked = np.stack(list(self_env._orange_buf), axis=0)
                     flat_obs = stacked.ravel().astype(np.float32)
                     with _torch.no_grad():
-                        x = _torch.tensor(flat_obs[np.newaxis], dtype=_torch.float32)
-                        tokens = x.view(1, self_env.t_window, -1, TOKEN_FEATURES)
+                        x = _torch.tensor(
+                            flat_obs[np.newaxis], dtype=_torch.float32)
+                        tokens = x.view(
+                            1, self_env.t_window, -1, TOKEN_FEATURES)
                         eids = _torch.tensor(_EIDS, dtype=_torch.long)
                         emb = _opponent_encoder(tokens, eids)
-                        action = _opponent_policy(emb)
+                        action, _ = _opponent_policy.act_deterministic(emb)
                     return action[0].cpu().numpy().astype(np.float32)
 
                 import types
-                env._get_opponent_action = types.MethodType(_ppo_opponent_action, env)
+                env._get_opponent_action = types.MethodType(
+                    _ppo_opponent_action, env)
             conn.send(('ok',))
 
         elif cmd == 'close':
@@ -282,7 +310,8 @@ class SubprocVecEnv:
 
     def set_opponent_snapshot(self, snap_path: Optional[str], worker_indices=None):
         """Set opponent snapshot for specified workers (or all)."""
-        indices = worker_indices if worker_indices is not None else range(self.num_envs)
+        indices = worker_indices if worker_indices is not None else range(
+            self.num_envs)
         for i in indices:
             self.parents[i].send(('set_opponent_snapshot', snap_path))
         for i in indices:
@@ -351,11 +380,14 @@ class AsyncUpdater:
             self._busy.set()
             try:
                 metrics = agent.update()
+                agent.buffer.reset()
+                agent._buffer_ready.set()
                 with self._lock:
                     self._results.append((agent_id, metrics))
             except Exception as e:
                 print(f'[updater] Agent {agent_id} update failed: {e}',
                       file=sys.stderr)
+                agent._buffer_ready.set()  # unblock collection even on error
             finally:
                 self._busy.clear()
 
@@ -416,14 +448,15 @@ def collect_and_train(
     updater: AsyncUpdater,
     rollout_metrics: RolloutMetricsProvider,
     config: dict,
+    executor: concurrent.futures.ThreadPoolExecutor,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
 
     Returns total environment steps collected.
     """
-    num_envs = envs.num_envs
-    obs = envs.reset_all()  # (num_envs, obs_dim)
+    from training.abstractions import ActionResult
 
+    num_envs = envs.num_envs
     agents = population.agents
     worker_map = population.worker_assignment  # [agent_idx per worker]
 
@@ -432,24 +465,32 @@ def collect_and_train(
     for wi, ai in enumerate(worker_map):
         agent_workers.setdefault(ai, []).append(wi)
 
-    rollout_steps = config.get('algorithm', {}).get('params', {}).get('rollout_steps', 2048)
+    rollout_steps = config.get('algorithm', {}).get(
+        'params', {}).get('rollout_steps', 2048)
+
+    # If all agents are mid-update, yield briefly rather than hot-spinning
+    while not any(agents[ai]._buffer_ready.is_set() for ai in range(len(agents))):
+        time.sleep(0.005)
+
+    obs = envs.reset_all()  # (num_envs, obs_dim)
     episode_returns = np.zeros(num_envs, dtype=np.float32)
     episode_lengths = np.zeros(num_envs, dtype=np.int64)
 
-    for step in range(rollout_steps):
-        # Collect actions from each agent for its workers
+    def _select(ai_wids):
+        ai, wids = ai_wids
+        return ai, wids, agents[ai].select_action(obs[wids])
+
+    for _ in range(rollout_steps):
+        # Collect actions from all agents concurrently (parallel GPU forward passes)
         actions = np.zeros((num_envs, 8), dtype=np.float32)
         action_results = [None] * num_envs
 
-        for agent_idx, worker_ids in agent_workers.items():
-            agent = agents[agent_idx]
-            agent_obs = obs[worker_ids]  # (n_workers, obs_dim)
-            result = agent.select_action(agent_obs)
-
+        futures = {executor.submit(_select, item): item
+                   for item in agent_workers.items()}
+        for fut in concurrent.futures.as_completed(futures):
+            agent_idx, worker_ids, result = fut.result()
             for local_i, wi in enumerate(worker_ids):
                 actions[wi] = result.action[local_i]
-                # Create per-worker ActionResult slice
-                from training.abstractions import ActionResult
                 action_results[wi] = ActionResult(
                     action=result.action[local_i:local_i+1],
                     aux={k: v[local_i:local_i+1] for k, v in result.aux.items()},
@@ -458,24 +499,25 @@ def collect_and_train(
         # Step all envs
         next_obs, rewards, dones, infos = envs.step(actions)
 
-        # Store transitions per agent (vectorized)
+        # Store transitions — skip agents whose buffer is being updated
         for agent_idx, worker_ids in agent_workers.items():
             agent = agents[agent_idx]
+            if not agent._buffer_ready.is_set():
+                continue  # update in flight; discard these transitions
             w_obs = obs[worker_ids]
             w_rewards = rewards[worker_ids]
             w_dones = dones[worker_ids]
-
-            # Build a combined ActionResult for this agent's workers
             w_actions = actions[worker_ids]
-            w_log_probs = np.array([action_results[wi].aux['log_prob'][0] for wi in worker_ids])
-            w_values = np.array([action_results[wi].aux['value'][0] for wi in worker_ids])
-
-            from training.abstractions import ActionResult
+            w_log_probs = np.array(
+                [action_results[wi].aux['log_prob'][0] for wi in worker_ids])
+            w_values = np.array(
+                [action_results[wi].aux['value'][0] for wi in worker_ids])
             combined_result = ActionResult(
                 action=w_actions,
                 aux={'log_prob': w_log_probs, 'value': w_values},
             )
-            agent.store_transition(w_obs, combined_result, w_rewards, next_obs[worker_ids], w_dones, {})
+            agent.store_transition(
+                w_obs, combined_result, w_rewards, next_obs[worker_ids], w_dones, {})
 
         # Track episodes
         for wi in range(num_envs):
@@ -491,9 +533,10 @@ def collect_and_train(
 
         obs = next_obs
 
-        # Check if any agent needs an update
+        # Trigger updates for full buffers; gate immediately so no more writes land
         for agent_idx, agent in enumerate(agents):
             if agent.should_update():
+                agent._buffer_ready.clear()
                 updater.trigger(agent, agent_idx)
 
     return rollout_steps * num_envs
@@ -510,12 +553,13 @@ def train(config: dict):
     num_envs = config['num_envs']
     t_window = config.get('t_window', 8)
     reward_type = config.get('reward_type', 'sparse')
-    model_dir = Path(config.get('model_dir', 'models/baseline')) / f'seed_{seed}'
+    model_dir = Path(config.get(
+        'model_dir', 'models/baseline')) / f'seed_{seed}'
     model_dir.mkdir(parents=True, exist_ok=True)
     log_interval = config.get('log_interval', 10)
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    print(f'[train] seed={seed} device={device} total_steps={total_steps:,}')
+    print(f'[train] seed={seed} device={device} total_steps={total_steps:}')
 
     # ── resolve logger ──────────────────────────────────────────────────
     LoggerCls = resolve_or_default(config, 'logger', None)
@@ -545,13 +589,8 @@ def train(config: dict):
     from training.algorithms.ppo import Population
     pop_config = config.get('population', {})
     num_agents = pop_config.get('agents', 1)
-    population = Population(num_agents=num_agents, num_workers=num_envs, config=config)
-
-    # Move agents to device
-    for agent in population.agents:
-        agent.device = torch.device(device)
-        agent.encoder.to(device)
-        agent.policy.to(device)
+    population = Population(num_agents=num_agents, num_workers=num_envs, config={
+                            **config, 'device': device})
 
     # ── create opponent pool ────────────────────────────────────────────
     PoolCls = resolve_or_default(config, 'opponent_pool', None)
@@ -587,6 +626,7 @@ def train(config: dict):
 
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(num_agents, 1))
     total_collected = 0
     collection_round = 0
     gen_steps = pop_config.get('generation_steps', 1_000_000)
@@ -596,6 +636,8 @@ def train(config: dict):
     print(f'[train] {num_agents} agent(s), {num_envs} envs, '
           f'rollout_steps={config.get("algorithm", {}).get("params", {}).get("rollout_steps", 2048)}')
 
+    from tqdm import tqdm
+    pbar = tqdm(total=total_steps, unit='step', dynamic_ncols=True)
     try:
         while total_collected < total_steps:
             # Set opponents from pool
@@ -604,17 +646,20 @@ def train(config: dict):
                 if snap_path:
                     envs.set_opponent_snapshot(snap_path)
 
-            # Collect rollouts and trigger updates
+            # Collect rollouts and trigger updates (non-blocking; per-agent
+            # _buffer_ready gates writes while updates are in flight)
             steps = collect_and_train(
-                population, envs, updater, rollout_metrics, config)
+                population, envs, updater, rollout_metrics, config, executor)
             total_collected += steps
             timing_metrics.add_steps(steps)
             collection_round += 1
+            pbar.update(steps)
 
             # Drain update metrics and log
             update_results = updater.pop_metrics()
             for agent_id, metrics in update_results:
-                prefixed = {f'agent_{agent_id}/{k}': v for k, v in metrics.items()}
+                prefixed = {f'agent_{agent_id}/{k}': v for k,
+                            v in metrics.items()}
                 logger.log(total_collected, **prefixed)
 
             # Periodic logging
@@ -623,15 +668,15 @@ def train(config: dict):
                 logger.log(total_collected,
                            total_steps=total_collected,
                            **custom)
-                # Print progress
                 rm = rollout_metrics.get_metrics()
                 mean_ret = rm.get('mean_return', 0.0)
                 sps = timing_metrics.get_metrics().get('steps_per_sec', 0.0)
-                print(f'[step {total_collected:>10,}] '
-                      f'mean_return={mean_ret:.3f}  '
-                      f'steps/s={sps:.0f}  '
-                      f'scored={rollout_metrics.goals_scored}  '
-                      f'conceded={rollout_metrics.goals_conceded}')
+                pbar.set_postfix(
+                    ret=f'{mean_ret:.3f}',
+                    sps=f'{sps:.0f}',
+                    scored=rollout_metrics.goals_scored,
+                    conceded=rollout_metrics.goals_conceded,
+                )
 
             # Save snapshots to opponent pool
             if pool:
@@ -640,14 +685,21 @@ def train(config: dict):
                 if pool.should_swap(total_collected):
                     pool.save_snapshot(best_agent, total_collected)
 
-            # Population generation cycle
+            # Population generation cycle — wait for all updates before mutating weights
             if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
+                for a in population.agents:
+                    a._buffer_ready.wait()  # blocks until this agent's update finishes
+                # Log per-agent stats before scores are cleared
+                gen_metrics = {f'population/{k}': v
+                               for k, v in population.get_metrics().items()}
+                logger.log(total_collected, **gen_metrics)
                 ranked = population.rank_agents()
                 best = population.agents[ranked[0]]
                 # Reset worst from best + noise
                 if len(ranked) > 1:
                     worst_idx = ranked[-1]
-                    population.agents[worst_idx].clone_from(best, noise_scale=noise_scale)
+                    population.agents[worst_idx].clone_from(
+                        best, noise_scale=noise_scale)
                     print(f'[gen {population.generation}] '
                           f'best=agent_{ranked[0]}  worst=agent_{worst_idx} (reset)')
                 population.reset_scores()
@@ -656,11 +708,14 @@ def train(config: dict):
             # Checkpoint
             if collection_round % (log_interval * 10) == 0:
                 best_idx = population.rank_agents()[0]
-                population.agents[best_idx].save_checkpoint(model_dir / 'latest')
+                population.agents[best_idx].save_checkpoint(
+                    model_dir / 'latest')
 
     except KeyboardInterrupt:
         print('\n[train] Interrupted.')
     finally:
+        pbar.close()
+        executor.shutdown(wait=False)
         updater.stop()
         # Save final checkpoint
         best_idx = population.rank_agents()[0]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -184,7 +185,8 @@ class PPOAlgorithm(Algorithm):
         self.num_envs = config.get('num_envs', 1)
         self.t_window = config.get('t_window', 8)
 
-        self.device = torch.device('cpu')
+        _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(_device)
 
         # Networks
         self.encoder = SharedTransformerEncoder(d_model=D_MODEL)
@@ -209,6 +211,11 @@ class PPOAlgorithm(Algorithm):
         )
 
         self._entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+
+        # Signals when the rollout buffer is free for new collection.
+        # Cleared when an update is triggered; set again after buffer.reset().
+        self._buffer_ready = threading.Event()
+        self._buffer_ready.set()
 
     @classmethod
     def default_params(cls) -> dict:
@@ -354,8 +361,6 @@ class PPOAlgorithm(Algorithm):
                 total_approx_kl += approx_kl
                 n_updates += 1
 
-        self.buffer.reset()
-
         if n_updates == 0:
             return {}
         return {
@@ -365,7 +370,6 @@ class PPOAlgorithm(Algorithm):
             'clip_fraction': total_clip_fraction / n_updates,
             'approx_kl': total_approx_kl / n_updates,
         }
-
     def save_checkpoint(self, path: Path) -> None:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
@@ -376,7 +380,7 @@ class PPOAlgorithm(Algorithm):
         }, path / 'checkpoint.pt')
 
     def load_checkpoint(self, path: Path) -> None:
-        ckpt = torch.load(Path(path) / 'checkpoint.pt', map_location=self.device)
+        ckpt = torch.load(Path(path) / 'checkpoint.pt', map_location=self.device, weights_only=True)
         self.encoder.load_state_dict(ckpt['encoder'])
         self.policy.load_state_dict(ckpt['policy'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
@@ -476,15 +480,20 @@ class Population:
     def get_metrics(self) -> dict:
         """Return population-level metrics for logging."""
         ranked = self.rank_agents()
-        agent_means = {}
+        agent_stats = {}
         for i in range(self.num_agents):
-            if self.scores[i]:
-                agent_means[f'population/agent_{i}_mean_score'] = np.mean(self.scores[i])
+            s = self.scores[i]
+            n = len(s)
+            wins = sum(1 for x in s if x > 0)
+            losses = sum(1 for x in s if x < 0)
+            agent_stats[f'agent_{i}/num_episodes'] = n
+            agent_stats[f'agent_{i}/goals_scored'] = wins
+            agent_stats[f'agent_{i}/goals_conceded'] = losses
+            agent_stats[f'agent_{i}/win_rate'] = (wins - losses) / n if n > 0 else 0.0
         return {
-            'population/generation': self.generation,
-            'population/num_agents': self.num_agents,
-            'population/best_agent': ranked[0] if ranked else -1,
-            **agent_means,
+            'generation': self.generation,
+            'best_agent': ranked[0] if ranked else -1,
+            **agent_stats,
         }
 
     def reset_scores(self) -> None:

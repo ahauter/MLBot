@@ -107,13 +107,13 @@ class BaselineGymEnv(gym.Env):
         """
         import torch
         from encoder import SharedTransformerEncoder, D_MODEL
-        from policy_head import PolicyHead
+        from policy_head import StochasticPolicyHead
         from training.opponents.pool import load_opponent_from_snapshot
 
         weights = load_opponent_from_snapshot(snap_path, device='cpu')
         if self._opponent_encoder is None:
             self._opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL)
-            self._opponent_policy = PolicyHead(d_model=D_MODEL)
+            self._opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
         self._opponent_encoder.load_state_dict(weights['encoder'])
         self._opponent_policy.load_state_dict(weights['policy'])
         self._opponent_encoder.eval()
@@ -233,12 +233,12 @@ class BaselineGymEnv(gym.Env):
         )
 
     def _make_obs_builder(self):
-        from rlgym_env import TokenObsBuilder
+        from environments.rlgym_components import TokenObsBuilder
         return TokenObsBuilder()
 
     def _make_reward(self):
         if self.reward_type == 'dense':
-            from dense_reward import DenseRewardFunction
+            from rewards.dense import DenseRewardFunction
             self._dense_reward_fn = DenseRewardFunction(weights=self.dense_reward_weights)
             return self._dense_reward_fn
         return self._make_sparse_reward()
@@ -333,5 +333,5 @@ class BaselineGymEnv(gym.Env):
             tokens = x.view(1, self.t_window, N_TOKENS, TOKEN_FEATURES)
             eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
             emb = self._opponent_encoder(tokens, eids)
-            action = self._opponent_policy(emb)
+            action, _ = self._opponent_policy.act_deterministic(emb)
         return action[0].cpu().numpy().astype(np.float32)

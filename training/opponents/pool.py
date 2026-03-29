@@ -213,6 +213,6 @@ def load_opponent_from_snapshot(snap_dir: str | Path, device: str = 'cpu') -> Di
     """
     snap_dir = Path(snap_dir)
     return {
-        'encoder': torch.load(str(snap_dir / _ENCODER_FILE), map_location=device),
-        'policy': torch.load(str(snap_dir / _POLICY_FILE), map_location=device),
+        'encoder': torch.load(str(snap_dir / _ENCODER_FILE), map_location=device, weights_only=True),
+        'policy': torch.load(str(snap_dir / _POLICY_FILE), map_location=device, weights_only=True),
     }

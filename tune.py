@@ -105,8 +105,9 @@ def load_config(yaml_path: str) -> dict:
     Merges class defaults with YAML overrides for both params and search_space.
     Attaches the resolved class object under config['algorithm']['cls'].
     """
+    from train import _coerce_numbers
     with open(yaml_path) as f:
-        config = yaml.safe_load(f)
+        config = _coerce_numbers(yaml.safe_load(f))
 
     # Resolve algorithm class
     algo_class_path = config.get('algorithm', {}).get('class')
@@ -201,11 +202,8 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
     AlgoCls = config['algorithm']['cls']
 
     # Create a single agent (no population, for speed)
-    agent_config = {**config, 'num_envs': 1}
+    agent_config = {**config, 'num_envs': 1, 'device': device}
     agent = AlgoCls(agent_config)
-    agent.device = torch.device(device)
-    agent.encoder.to(device)
-    agent.policy.to(device)
 
     # Create environment — use DummyEnv if rlgym-sim isn't available
     t_window = config.get('t_window', 8)
