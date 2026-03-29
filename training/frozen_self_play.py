@@ -98,7 +98,7 @@ class FrozenOpponentPool(OpponentPool):
     window_size : int
         Episode window for outcome tracking (default 100).
     score_threshold : float
-        Mean-outcome threshold for promotion (default 0.5).
+        Mean-outcome threshold for promotion (default 0.1).
     """
 
     def __init__(
@@ -107,7 +107,7 @@ class FrozenOpponentPool(OpponentPool):
         algo_builder=None,
         max_snapshots: int = 5,
         window_size: int = 100,
-        score_threshold: float = 0.5,
+        score_threshold: float = 0.1,
     ):
         super().__init__(snapshot_dir, algo_builder, max_snapshots)
         self.score_threshold = score_threshold
