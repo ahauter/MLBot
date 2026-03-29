@@ -681,19 +681,15 @@ def collect_and_train(
 
     for _ in range(rollout_steps):
         # Collect actions from all agents sequentially
-        # (GIL serializes GPU calls anyway; ThreadPoolExecutor added pure overhead)
         actions = np.zeros((num_envs, 8), dtype=np.float32)
-        action_results = [None] * num_envs
+        agent_results: Dict[int, ActionResult] = {}
 
         _t0 = time.perf_counter()
         for agent_idx, worker_ids in agent_workers.items():
             result = agents[agent_idx].select_action(obs[worker_ids])
             for local_i, wi in enumerate(worker_ids):
                 actions[wi] = result.action[local_i]
-                action_results[wi] = ActionResult(
-                    action=result.action[local_i:local_i+1],
-                    aux={k: v[local_i:local_i+1] for k, v in result.aux.items()},
-                )
+            agent_results[agent_idx] = result
         if profiler:
             profiler.add_time('action_select_time', time.perf_counter() - _t0)
 
@@ -711,20 +707,11 @@ def collect_and_train(
                 if profiler:
                     profiler.incr('transitions_discarded', len(worker_ids))
                 continue  # update in flight; discard these transitions
-            w_obs = obs[worker_ids]
-            w_rewards = rewards[worker_ids]
-            w_dones = dones[worker_ids]
-            w_actions = actions[worker_ids]
-            w_log_probs = np.array(
-                [action_results[wi].aux['log_prob'][0] for wi in worker_ids])
-            w_values = np.array(
-                [action_results[wi].aux['value'][0] for wi in worker_ids])
-            combined_result = ActionResult(
-                action=w_actions,
-                aux={'log_prob': w_log_probs, 'value': w_values},
-            )
+            result = agent_results[agent_idx]
             agent.store_transition(
-                w_obs, combined_result, w_rewards, next_obs[worker_ids], w_dones, {})
+                obs[worker_ids], result,
+                rewards[worker_ids], next_obs[worker_ids],
+                dones[worker_ids], {})
             if profiler:
                 profiler.incr('transitions_collected', len(worker_ids))
         if profiler:
@@ -955,7 +942,8 @@ def train(config: dict):
         # Generate profiling report if enabled
         if profiling_enabled:
             report = profiler.generate_report(
-                config, update_times=all_update_times or None)
+                {**config, 'device': device},
+                update_times=all_update_times or None)
             if profiling_report_path:
                 report_path = Path(profiling_report_path)
                 report_path.parent.mkdir(parents=True, exist_ok=True)

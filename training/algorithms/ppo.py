@@ -248,6 +248,10 @@ class PPOAlgorithm(Algorithm):
 
         self._entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=self.device)
 
+        # Start in eval mode for inference; update() switches to train mode
+        self.encoder.eval()
+        self.policy.eval()
+
         # Signals when the rollout buffer is free for new collection.
         # Cleared when an update is triggered; set again after buffer.reset().
         self._buffer_ready = threading.Event()
@@ -287,20 +291,16 @@ class PPOAlgorithm(Algorithm):
         tokens = x.view(batch, self.t_window, N_TOKENS, TOKEN_FEATURES)
         return self.encoder(tokens, self._entity_ids)
 
+    @torch.no_grad()
     def select_action(self, obs: np.ndarray) -> ActionResult:
         """Pick actions for a batch of observations (on-policy, stochastic)."""
-        self.encoder.eval()
-        self.policy.eval()
-        with torch.no_grad():
-            emb = self._encode(obs)
-            action, log_prob, value, entropy = self.policy(emb)
-        self.encoder.train()
-        self.policy.train()
+        emb = self._encode(obs)
+        action, log_prob, value, entropy = self.policy(emb)
         return ActionResult(
             action=action.cpu().numpy(),
             aux={
-                'log_prob': log_prob.cpu().numpy(),
-                'value': value.cpu().numpy(),
+                'log_prob': log_prob.cpu(),
+                'value': value.cpu(),
             },
         )
 
@@ -316,13 +316,20 @@ class PPOAlgorithm(Algorithm):
         """Store a transition. For vectorized envs, reward/done are arrays."""
         reward_arr = np.atleast_1d(np.asarray(reward, dtype=np.float32))
         done_arr = np.atleast_1d(np.asarray(done, dtype=np.float32))
+        # log_prob/value may be tensors or numpy; coerce to numpy for buffer
+        lp = action_result.aux['log_prob']
+        val = action_result.aux['value']
+        if isinstance(lp, torch.Tensor):
+            lp = lp.numpy()
+        if isinstance(val, torch.Tensor):
+            val = val.numpy()
         self.buffer.add(
             obs=obs,
             action=action_result.action,
             reward=reward_arr,
             done=done_arr,
-            log_prob=action_result.aux['log_prob'],
-            value=action_result.aux['value'],
+            log_prob=lp,
+            value=val,
         )
 
     def should_update(self) -> bool:
@@ -330,6 +337,9 @@ class PPOAlgorithm(Algorithm):
 
     def update(self) -> dict:
         """Run PPO gradient updates over the collected rollout."""
+        self.encoder.train()
+        self.policy.train()
+
         # Compute last values for GAE
         last_obs = self.buffer.obs[self.buffer.pos - 1]  # (num_envs, obs_dim)
         with torch.no_grad():
@@ -397,6 +407,10 @@ class PPOAlgorithm(Algorithm):
                 total_clip_fraction += clip_fraction
                 total_approx_kl += approx_kl
                 n_updates += 1
+
+        # Return to eval mode for inference
+        self.encoder.eval()
+        self.policy.eval()
 
         if n_updates == 0:
             return {}
