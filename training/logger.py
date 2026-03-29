@@ -1,17 +1,16 @@
 """
-Experiment Logger
-=================
-Thin wrapper around Weights & Biases with a graceful stdout fallback,
-plus a MetricsRegistry for decoupled, main-thread-safe custom metric logging.
+Experiment Loggers
+==================
+Three MetricLogger implementations (W&B, stdout, TensorBoard) plus the
+MetricsRegistry for decoupled, main-thread-safe custom metric collection.
 
 Usage
 -----
-    from logger import ExperimentLogger, MetricsRegistry
-    from train_config import TrainConfig
+    from logger import WandbLogger, StdoutLogger, TensorBoardLogger, MetricsRegistry
 
-    config = TrainConfig()
-    logger = ExperimentLogger(config)          # W&B if available, else stdout
-    logger.log(episode, total_loss=0.5, ...)
+    logger = WandbLogger()
+    logger.init(config)               # config is a dict (from YAML)
+    logger.log(step, total_loss=0.5)
     logger.finish()
 
     # Registry pattern — components register metric providers,
@@ -19,68 +18,74 @@ Usage
     registry = MetricsRegistry()
     registry.register('frozen_self_play', pool.get_metrics)
     registry.register('reward', reward_fn.get_metrics)
-    metrics = registry.collect()               # {'frozen_self_play/swap_count': 3, ...}
+    metrics = registry.collect()       # {'frozen_self_play/swap_count': 3, ...}
 
 W&B is enabled when:
-  - The `wandb` package is installed, AND
+  - The ``wandb`` package is installed, AND
   - either WANDB_API_KEY is set or the user is already logged in locally.
 
-Pass ``enabled=False`` or set ``WANDB_DISABLED=true`` to force stdout mode.
+Pass ``enabled: false`` in config['wandb'] or set ``WANDB_DISABLED=true``
+to force stdout mode.
 """
 from __future__ import annotations
 
-import dataclasses
 import os
 import sys
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional
 
+from abstractions import MetricLogger
 
-class ExperimentLogger:
-    """
-    Logs training metrics to W&B (if available) with a stdout fallback.
 
-    Parameters
-    ----------
-    config : TrainConfig
-        Full training configuration (logged as W&B run hyperparameters).
-    enabled : bool
-        Set False to force stdout-only mode regardless of W&B availability.
-    group : str | None
-        Optional W&B run group (e.g. 'optuna-study').
-    """
+# ── W&B Logger ───────────────────────────────────────────────────────────────
 
-    def __init__(self, config, *, enabled: bool = True, group: Optional[str] = None) -> None:
+class WandbLogger(MetricLogger):
+    """W&B logging with stdout fallback. Default logger."""
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return {'project': 'rlbot-baseline', 'enabled': True, 'group': None}
+
+    def __init__(self) -> None:
         self._wandb = None
-        self._enabled = enabled
 
-        if enabled:
-            self._wandb = self._try_init_wandb(config, group)
+    def init(self, config: dict) -> None:
+        # Extract params from config — support both nested logger.params and
+        # top-level wandb key for convenience
+        logger_section = config.get('logger', {})
+        params = {**self.default_params(), **logger_section.get('params', {})}
 
+        # Also merge top-level 'wandb' key if present (YAML shorthand)
+        wandb_section = config.get('wandb', {})
+        if wandb_section:
+            params.update(wandb_section)
+
+        if not params.get('enabled', True):
+            print('[logger] W&B disabled by config — logging to stdout only.')
+            return
+
+        self._wandb = self._try_init_wandb(config, params)
         if self._wandb is None:
             print('[logger] W&B not active — logging to stdout only.')
 
-    # ── public API ────────────────────────────────────────────────────────────
-
     def log(self, step: int, **metrics: Any) -> None:
-        """Log a dict of scalar metrics at the given training step."""
         if self._wandb is not None:
             self._wandb.log(metrics, step=step)
         else:
-            # Compact stdout line every 100 steps; always log when called
-            parts = '  '.join(f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}'
-                              for k, v in metrics.items())
-            print(f'[ep {step:05d}] {parts}')
+            parts = '  '.join(
+                f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}'
+                for k, v in metrics.items()
+            )
+            print(f'[step {step:07d}] {parts}')
 
     def finish(self) -> None:
-        """Mark the W&B run as finished."""
         if self._wandb is not None:
             self._wandb.finish()
 
-    # ── internals ─────────────────────────────────────────────────────────────
+    # ── internals ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _try_init_wandb(config, group: Optional[str]):
+    def _try_init_wandb(config: dict, params: dict):
         """Attempt to initialise W&B. Returns the wandb module or None."""
         if os.environ.get('WANDB_DISABLED', '').lower() in ('true', '1', 'yes'):
             return None
@@ -89,36 +94,102 @@ class ExperimentLogger:
         except ImportError:
             return None
 
-        # Check credentials via wandb's own mechanism — handles env vars,
-        # ~/.netrc, ~/_netrc (Windows), and wandb settings files correctly.
+        # Check credentials
         api_key = os.environ.get('WANDB_API_KEY', '')
         if not api_key:
             try:
-                # Returns True if already authenticated (no prompts, no network)
                 logged_in = wandb.login(anonymous='never', relogin=False)
             except Exception:
                 logged_in = False
             if not logged_in:
-                print('[logger] No W&B credentials found — '
-                      'falling back to stdout. Run `wandb login` to enable W&B.',
-                      file=sys.stderr)
+                print(
+                    '[logger] No W&B credentials found — '
+                    'falling back to stdout. Run `wandb login` to enable W&B.',
+                    file=sys.stderr,
+                )
                 return None
 
         try:
-            cfg_dict = dataclasses.asdict(config)
+            project = params.get('project', 'rlbot-baseline')
+            group = params.get('group', None)
+            run_name = params.get('run_name', None)
+
+            # Build a flat config dict for W&B (exclude non-serializable keys)
+            wandb_config = {
+                k: v for k, v in config.items()
+                if k not in ('algorithm', 'opponent_pool', 'environment',
+                             'reward', 'logger') or not isinstance(v, dict)
+            }
+
             wandb.init(
-                project=config.wandb_project,
-                name=config.wandb_run_name,
-                group=group or config.wandb_group,
-                config=cfg_dict,
+                project=project,
+                name=run_name,
+                group=group,
+                config=wandb_config,
                 resume='allow',
             )
             return wandb
         except Exception as exc:  # noqa: BLE001
-            print(f'[logger] W&B init failed ({exc}) — falling back to stdout.',
-                  file=sys.stderr)
+            print(
+                f'[logger] W&B init failed ({exc}) — falling back to stdout.',
+                file=sys.stderr,
+            )
             return None
 
+
+# ── Stdout Logger ────────────────────────────────────────────────────────────
+
+class StdoutLogger(MetricLogger):
+    """CLI-only logging. No external dependencies."""
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return {}
+
+    def init(self, config: dict) -> None:
+        pass
+
+    def log(self, step: int, **metrics: Any) -> None:
+        parts = '  '.join(
+            f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}'
+            for k, v in metrics.items()
+        )
+        print(f'[step {step:07d}] {parts}')
+
+    def finish(self) -> None:
+        pass
+
+
+# ── TensorBoard Logger ──────────────────────────────────────────────────────
+
+class TensorBoardLogger(MetricLogger):
+    """TensorBoard logging."""
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return {'log_dir': 'runs/'}
+
+    def __init__(self) -> None:
+        self._writer = None
+
+    def init(self, config: dict) -> None:
+        from torch.utils.tensorboard import SummaryWriter
+
+        logger_section = config.get('logger', {})
+        params = {**self.default_params(), **logger_section.get('params', {})}
+        self._writer = SummaryWriter(log_dir=params.get('log_dir', 'runs/'))
+
+    def log(self, step: int, **metrics: Any) -> None:
+        if self._writer is not None:
+            for k, v in metrics.items():
+                self._writer.add_scalar(k, v, step)
+
+    def finish(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+
+
+# ── Metrics Registry (unchanged) ────────────────────────────────────────────
 
 class MetricsRegistry:
     """

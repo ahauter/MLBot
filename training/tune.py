@@ -1,58 +1,143 @@
 #!/usr/bin/env python3
 """
-Hyperparameter Tuning with Optuna (d3rlpy)
-==========================================
-Searches over training hyperparameters using Optuna with ASHA pruning.
-Each trial runs a shortened d3rlpy training session and reports mean
-episode reward. Best params can be loaded by train.py --params-from.
+YAML-Based Hyperparameter Tuning with Optuna
+=============================================
+Algorithm-agnostic hyperparameter search driven by YAML config stubs.
+
+Flow:
+  1. Load a stub YAML config (specifies algorithm class + search space)
+  2. Optuna samples hyperparameters from the search space
+  3. Each trial creates an Algorithm instance, runs a short training loop
+  4. Best params are emitted as a complete YAML config
+  5. Optionally auto-launch multi-seed training with the best config
 
 Usage
 -----
-    # Run 50 trials:
-    python training/tune.py
+    # Run 50 trials with a stub config:
+    python training/tune.py --config configs/ppo_tune_stub.yaml
 
-    # Show best trial:
-    python training/tune.py --show-best
+    # Show best trial from a previous study:
+    python training/tune.py --config configs/ppo_tune_stub.yaml --show-best
 
-    # Auto-launch 10-seed baseline after tuning:
-    python training/tune.py --auto-seeds
+    # Emit tuned config and auto-launch 5 seeds:
+    python training/tune.py --config configs/ppo_tune_stub.yaml --auto-seeds 5
 
     # Override trials or step budget:
-    python training/tune.py --n-trials 20 --steps-per-trial 200000
+    python training/tune.py --config configs/ppo_tune_stub.yaml --n-trials 20 --steps-per-trial 200000
 
 Requirements
 ------------
-    pip install optuna d3rlpy gymnasium
+    pip install optuna pyyaml gymnasium torch
 """
 from __future__ import annotations
 
 import argparse
+import copy
+import gc
+import importlib
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 
-# ── study settings ───────────────────────────────────────────────────────────
+# ── utility functions ────────────────────────────────────────────────────────
 
-STUDY_NAME = 'baseline-hparam-search'
-STORAGE_PATH = 'sqlite:///optuna_baseline.db'
+def load_class(dotted_path: str):
+    """Import a class from a dotted module path, e.g. 'training.train.PPOAlgorithm'."""
+    module_path, class_name = dotted_path.rsplit('.', 1)
+    return getattr(importlib.import_module(module_path), class_name)
 
 
-# ── reward-tracking wrapper ──────────────────────────────────────────────────
+def sample_from_search_space(trial, search_space: dict) -> dict:
+    """Sample Optuna params from a search space dict.
+
+    Each entry in search_space maps a dotted param path to a spec dict:
+        'algorithm.params.lr': {'type': 'float', 'low': 1e-5, 'high': 1e-3, 'log': True}
+        'algorithm.params.batch_size': {'type': 'int', 'low': 64, 'high': 512}
+        'algorithm.params.activation': {'type': 'categorical', 'choices': ['relu', 'tanh']}
+    """
+    overrides = {}
+    for param_path, spec in search_space.items():
+        if spec['type'] == 'float':
+            val = trial.suggest_float(
+                param_path, spec['low'], spec['high'],
+                log=spec.get('log', False),
+            )
+        elif spec['type'] == 'int':
+            val = trial.suggest_int(
+                param_path, spec['low'], spec['high'],
+                log=spec.get('log', False),
+            )
+        elif spec['type'] == 'categorical':
+            val = trial.suggest_categorical(param_path, spec['choices'])
+        else:
+            raise ValueError(f"Unknown search space type: {spec['type']}")
+        overrides[param_path] = val
+    return overrides
+
+
+def apply_overrides(config: dict, overrides: dict) -> None:
+    """Set nested keys by dotted path.
+
+    Example: 'algorithm.params.lr' -> config['algorithm']['params']['lr']
+    """
+    for dotted_path, value in overrides.items():
+        keys = dotted_path.split('.')
+        d = config
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
+
+
+def load_config(yaml_path: str) -> dict:
+    """Load a stub YAML config and resolve the algorithm class.
+
+    Merges class defaults with YAML overrides for both params and search_space.
+    Attaches the resolved class object under config['algorithm']['cls'].
+    """
+    with open(yaml_path) as f:
+        config = yaml.safe_load(f)
+
+    # Resolve algorithm class
+    algo_class_path = config.get('algorithm', {}).get('class')
+    if algo_class_path is None:
+        raise ValueError("Config must specify algorithm.class (dotted path)")
+
+    AlgoCls = load_class(algo_class_path)
+    config.setdefault('algorithm', {})['cls'] = AlgoCls
+
+    # Merge class defaults with YAML overrides for params
+    class_defaults = {}
+    if hasattr(AlgoCls, 'default_params'):
+        class_defaults = AlgoCls.default_params()
+    yaml_params = config.get('algorithm', {}).get('params', {})
+    config['algorithm']['params'] = {**class_defaults, **yaml_params}
+
+    # Build search space: class defaults + YAML overrides
+    class_search_space = {}
+    if hasattr(AlgoCls, 'default_search_space'):
+        class_search_space = AlgoCls.default_search_space()
+    yaml_search_space = config.get('search_space', {})
+    config['search_space'] = {**class_search_space, **yaml_search_space}
+
+    return config
+
+
+# ── reward tracking ──────────────────────────────────────────────────────────
 
 class RewardTracker:
-    """
-    Wraps a gymnasium env to track episode returns.
+    """Wraps a gymnasium env to track episode returns for Optuna pruning.
 
-    d3rlpy's fit_online doesn't expose episode rewards in its callback,
-    so we track them here and read from the callback.
+    Algorithm-agnostic: works with any env that follows the gymnasium API.
     """
 
     def __init__(self, env):
@@ -96,259 +181,141 @@ class RewardTracker:
 
 # ── objective ────────────────────────────────────────────────────────────────
 
-def objective(trial, steps_per_trial: int, use_wandb: bool, num_envs: int = 1,
-              shared_envs=None, reward_type: str = 'sparse', wandb_project: str = 'rlbot-baseline-tuning') -> float:
-    """
-    Single Optuna trial: sample hyperparams, run shortened training,
-    return mean episode reward.
-    """
-    import d3rlpy
-    from d3rlpy.algos.qlearning.explorers import NormalNoise
-    from d3rlpy.logging import FileAdapterFactory, WanDBAdapterFactory
+def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> float:
+    """Single Optuna trial: sample hyperparams, run short training, return mean reward.
 
-    from baseline_encoder_factory import TransformerEncoderFactory
+    Creates an Algorithm instance from the config, runs collection/update loops,
+    and reports intermediate values for Optuna pruning.
+    """
+    import optuna
     from gym_env import BaselineGymEnv
 
-    # ── sample hyperparameters ───────────────────────────────────────────
-    actor_lr = trial.suggest_float('actor_lr', 1e-5, 1e-3, log=True)
-    critic_lr = trial.suggest_float('critic_lr', 1e-5, 1e-3, log=True)
-    awac_lambda = trial.suggest_float('awac_lambda', 0.1, 5.0)
-    tau = trial.suggest_float('tau', 0.001, 0.05, log=True)
-    batch_size = trial.suggest_int('batch_size', 64, 512, log=True)
-    gamma = trial.suggest_float('gamma', 0.95, 0.999)
-    explore_noise = trial.suggest_float('explore_noise', 0.01, 0.3)
+    config = copy.deepcopy(stub_config)
 
-    # ── fast-fail guards ─────────────────────────────────────────────────
-    try:
-        import os as _os
-        import psutil as _psutil
-        _proc = _psutil.Process(_os.getpid())
-        _total_mb = sum(
-            p.memory_info().rss
-            for p in [_proc] + _proc.children(recursive=True)
-            if p.is_running()
-        ) / 1024 ** 2
-        assert _total_mb < 28 * 1024, (
-            f"Memory guard: process tree using {_total_mb / 1024:.1f} GB >= 28 GB limit. "
-            f"Aborting before trial {trial.number} to prevent system thrash."
-        )
-    except ImportError:
-        pass  # psutil not installed — skip memory guard
+    # Sample hyperparameters from search space
+    overrides = sample_from_search_space(trial, config.get('search_space', {}))
+    apply_overrides(config, overrides)
+    config['total_steps'] = steps_per_trial
 
-    if shared_envs is not None:
-        n_dead = sum(1 for p in shared_envs._procs if not p.is_alive())
-        if n_dead:
-            print(
-                f'[tune] Warning: {n_dead}/{shared_envs.num_envs} workers died — respawning before trial {trial.number}', file=sys.stderr)
-            shared_envs.respawn_dead()
+    # Resolve algorithm class
+    AlgoCls = config['algorithm']['cls']
 
-    t_window = 8
-    encoder_factory = TransformerEncoderFactory(t_window=t_window)
+    # Create a single agent (no population, for speed)
+    agent = AlgoCls(agent_id=0, config=config, device=device)
 
-    algo = d3rlpy.algos.AWACConfig(
-        batch_size=batch_size,
-        gamma=gamma,
-        actor_learning_rate=actor_lr,
-        critic_learning_rate=critic_lr,
-        actor_encoder_factory=encoder_factory,
-        critic_encoder_factory=encoder_factory,
-        tau=tau,
-        lam=awac_lambda,
-    ).create(device=('cuda:0' if __import__('torch').cuda.is_available() else 'cpu'))
+    # Create environment
+    t_window = config.get('t_window', 8)
+    reward_class_path = config.get('reward', {}).get('class', None)
+    reward_type = 'sparse'
+    if reward_class_path and 'Dense' in reward_class_path:
+        reward_type = 'dense'
 
     raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
     env = RewardTracker(raw_env)
 
-    buffer = d3rlpy.dataset.create_fifo_replay_buffer(
-        limit=100_000 * num_envs, env=env)
-    explorer = NormalNoise(std=explore_noise)
+    pruning_interval = 50_000
+    total_step = 0
+    obs, _ = env.reset()
 
-    if use_wandb:
-        logger_adapter = WanDBAdapterFactory(project=wandb_project)
-    else:
-        logger_adapter = FileAdapterFactory(
-            root_dir=f'models/tune/trial_{trial.number}'
-        )
-
-    pruning_interval = 50_000  # check every 50k steps
-
-    parallel = num_envs > 1
-
-    # Shared reward tracker for both paths
-    episode_returns: deque = env.episode_returns  # reuse RewardTracker's deque
-
-    def _mean_return(last_n: int = 100) -> float:
-        if not episode_returns:
-            return 0.0
-        recent = list(episode_returns)[-last_n:]
-        return float(np.mean(recent))
-
-    def callback(algo_obj, epoch, total_step):
-        import optuna
-        if total_step > 0 and total_step % pruning_interval < max(1000, num_envs):
-            mean_r = _mean_return(100)
-            if len(episode_returns) > 0:
-                trial.report(mean_r, step=total_step)
-                if trial.should_prune():
-                    raise optuna.exceptions.TrialPruned()
-
-    _owns_envs = False
-    envs = shared_envs  # reuse caller-managed workers if provided
-    _wandb_run = None
     try:
-        if parallel:
-            from train import (
-                SubprocVecEnv, fit_online_parallel, TrainConfig as _TC,
-            )
+        while total_step < steps_per_trial:
+            # Collect a transition via Algorithm ABC interface
+            action_result = agent.select_action(obs)
+            next_obs, reward, terminated, truncated, info = env.step(action_result.action)
+            done = terminated or truncated
 
-            if envs is None:
-                envs = SubprocVecEnv(num_envs=num_envs, t_window=t_window,
-                                     reward_type=reward_type)
-                _owns_envs = True
+            # Store transition (Algorithm manages its own buffer)
+            agent.store_transition(obs, action_result, reward, next_obs, done, info)
 
-            # Initialize W&B for parallel path (sequential path gets it from d3rlpy)
-            if use_wandb:
-                try:
-                    import wandb
-                    _wandb_run = wandb.init(
-                        project=wandb_project,
-                        name=f'tune_trial_{trial.number}',
-                        group='optuna',
-                        config={
-                            'trial_number': trial.number,
-                            'actor_lr': actor_lr,
-                            'critic_lr': critic_lr,
-                            'awac_lambda': awac_lambda,
-                            'tau': tau,
-                            'batch_size': batch_size,
-                            'gamma': gamma,
-                            'explore_noise': explore_noise,
-                            'num_envs': num_envs,
-                            'steps_per_trial': steps_per_trial,
-                        },
-                        reinit=True,
-                    )
-                except ImportError:
-                    pass
+            obs = next_obs
+            total_step += 1
 
-            # Build algo before parallel loop
-            algo.build_with_env(raw_env)
+            if done:
+                obs, _ = env.reset()
 
-            # Parallel path uses on_episode_complete to feed the shared deque
-            def _on_ep_complete(ep_return: float):
-                episode_returns.append(ep_return)
+            # Update when the algorithm says it has enough data
+            if agent.should_update():
+                agent.update()
 
-            # Build a minimal TrainConfig for fit_online_parallel
-            par_config = _TC(
-                total_steps=steps_per_trial,
-                num_envs=num_envs,
-                t_window=t_window,
-                random_steps=5_000,
-                update_interval=1,
-                n_steps_per_epoch=10_000,
-                batch_size=batch_size,
-                explore_noise=explore_noise,
-            )
-            fit_online_parallel(
-                algo=algo,
-                config=par_config,
-                envs=envs,
-                buffer=buffer,
-                explorer=explorer,
-                callback=callback,
-                on_episode_complete=_on_ep_complete,
-            )
-        else:
-            algo.fit_online(
-                env=env,
-                buffer=buffer,
-                explorer=explorer,
-                n_steps=steps_per_trial,
-                n_steps_per_epoch=10_000,
-                random_steps=5_000,
-                experiment_name=f'tune_trial_{trial.number}',
-                logger_adapter=logger_adapter,
-                show_progress=True,
-                callback=callback,
-            )
+            # Report to Optuna for pruning
+            if total_step > 0 and total_step % pruning_interval == 0:
+                mean_r = env.mean_return(100)
+                if len(env.episode_returns) > 0:
+                    trial.report(mean_r, step=total_step)
+                    if trial.should_prune():
+                        raise optuna.exceptions.TrialPruned()
+
+    except optuna.exceptions.TrialPruned:
+        raise
     except Exception as e:
-        try:
-            import optuna
-            if isinstance(e, optuna.exceptions.TrialPruned):
-                raise
-        except ImportError:
-            pass
         print(f'Trial {trial.number} failed: {e}', file=sys.stderr)
         return float('-inf')
     finally:
-        if _owns_envs and envs is not None:
-            envs.close()
-            envs.assert_workers_dead()
-        if _wandb_run is not None:
-            import wandb
-            wandb.finish()
         raw_env.close()
-        # Free d3rlpy model + replay buffer to prevent memory accumulation.
-        # Delete all local objects that may hold GPU tensors or reference cycles
-        # before invoking the GC, so that torch.cuda.empty_cache() actually
-        # reclaims VRAM. Two gc.collect() passes are needed: the first breaks
-        # reference cycles, the second collects objects freed by the first pass.
-        del encoder_factory, explorer, env, raw_env
-        del algo, buffer
-        import gc
+        del agent
         gc.collect()
         gc.collect()
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                from src.encoder import _causal_mask
-                _causal_mask.cache_clear()
         except ImportError:
             pass
 
-    mean_reward = _mean_return(100)
-    assert not np.isnan(mean_reward), \
-        f"Trial {trial.number}: NaN reward — training diverged"
+    mean_reward = env.mean_return(100)
+    if np.isnan(mean_reward):
+        print(f"Trial {trial.number}: NaN reward -- training diverged",
+              file=sys.stderr)
+        return float('-inf')
     return mean_reward
 
 
-# ── auto-seed launcher ──────────────────────────────────────────────────────
+# ── YAML emission ────────────────────────────────────────────────────────────
 
-def launch_seeds(study, n_seeds: int = 10, extra_args: list = None) -> None:
+def emit_complete_yaml(stub_config: dict, best_params: dict, output_path: str) -> None:
+    """Write a complete YAML config with best params, no search_space key.
+
+    The output YAML is ready to be passed to `python training/train.py --config`.
     """
-    Run baseline training sequentially for each seed using best params from
-    Optuna study. Seeds run one at a time so they don't compete for the GPU.
-    """
-    best = study.best_params
-    Path('models/baseline').mkdir(parents=True, exist_ok=True)
+    config = copy.deepcopy(stub_config)
+    apply_overrides(config, best_params)
 
-    print(f'\n=== Running {n_seeds} seeds with best params ===')
-    for k, v in best.items():
-        print(f'  {k}: {v}')
-    print()
+    # Remove search space (tuning is done)
+    config.pop('search_space', None)
 
+    # Remove non-serializable cls references
+    for section in ('algorithm', 'opponent_pool', 'environment', 'reward',
+                    'replay', 'feedback', 'evaluation', 'logger'):
+        if section in config and isinstance(config[section], dict):
+            config[section].pop('cls', None)
+
+    # Set full training budget
+    config['total_steps'] = config.get('total_steps', 50_000_000)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    print(f'Wrote tuned config to: {output_path}')
+
+
+def launch_seeds(output_yaml: str, n_seeds: int) -> None:
+    """Launch multi-seed training runs sequentially with the tuned config."""
+    print(f'\n=== Launching {n_seeds} seeds with config: {output_yaml} ===')
     for seed in range(n_seeds):
         cmd = [
             sys.executable, 'training/train.py',
+            '--config', output_yaml,
             '--seed', str(seed),
-            '--actor-lr', str(best.get('actor_lr', 3e-4)),
-            '--critic-lr', str(best.get('critic_lr', 3e-4)),
-            '--awac-lambda', str(best.get('awac_lambda', 1.0)),
-            '--tau', str(best.get('tau', 0.005)),
-            '--batch-size', str(int(best.get('batch_size', 256))),
-            '--gamma', str(best.get('gamma', 0.99)),
-            '--explore-noise', str(best.get('explore_noise', 0.1)),
         ]
-        if extra_args:
-            cmd.extend(extra_args)
+        log_dir = Path('models/tuned')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f'seed_{seed}.log'
 
-        log_path = f'models/baseline/seed_{seed}.log'
-        print(f'  Seed {seed}/{n_seeds - 1}: log: {log_path}')
+        print(f'  Seed {seed}/{n_seeds - 1}: log -> {log_path}')
         with open(log_path, 'w') as log_file:
             subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        status = 'OK'
-        print(f'  Seed {seed} complete: {status}')
+        print(f'  Seed {seed} complete.')
+    print('All seeds complete.')
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -362,28 +329,43 @@ def main():
         print('Optuna required: pip install optuna', file=sys.stderr)
         sys.exit(1)
 
+    import torch
+
     parser = argparse.ArgumentParser(
-        description='Baseline hyperparameter tuning.')
-    parser.add_argument('--n-trials', type=int, default=50)
-    parser.add_argument('--steps-per-trial', type=int, default=500_000)
-    parser.add_argument('--num-envs', type=int, default=1,
-                        help='Parallel RLGym-sim environments per trial (default: 1)')
-    parser.add_argument('--reward', default='sparse', choices=['sparse', 'dense'],
-                        help='Reward function: sparse (goals only) or dense (shaped)')
-    parser.add_argument('--no-wandb', action='store_true')
-    parser.add_argument('--wandb-project', default='rlbot-baseline-tuning',
-                        help='W&B project name (default: rlbot-baseline-tuning)')
-    parser.add_argument('--show-best', action='store_true')
-    parser.add_argument('--study-name', default=STUDY_NAME)
-    parser.add_argument('--storage', default=STORAGE_PATH)
-    # Auto-seed launching
-    parser.add_argument('--auto-seeds', action='store_true',
-                        help='Auto-launch baseline seeds after tuning completes')
-    parser.add_argument('--n-seeds', type=int, default=10,
-                        help='Number of seeds to launch (default: 10)')
+        description='YAML-based hyperparameter tuning with Optuna')
+    parser.add_argument('--config', required=True,
+                        help='Stub YAML config path')
+    parser.add_argument('--n-trials', type=int, default=50,
+                        help='Number of Optuna trials (default: 50)')
+    parser.add_argument('--steps-per-trial', type=int, default=500_000,
+                        help='Environment steps per trial (default: 500000)')
+    parser.add_argument('--output', default=None,
+                        help='Output YAML path (default: configs/<name>_tuned_best.yaml)')
+    parser.add_argument('--show-best', action='store_true',
+                        help='Show best trial and exit')
+    parser.add_argument('--auto-seeds', type=int, default=0,
+                        help='Auto-launch N seeds after tuning (0 = disabled)')
+    parser.add_argument('--study-name', default='yaml-hparam-search',
+                        help='Optuna study name')
+    parser.add_argument('--storage', default=None,
+                        help='Optuna storage URL (default: sqlite:///<config_stem>_optuna.db)')
     parser.add_argument('--reset', action='store_true',
-                        help='Delete existing study and start HP tuning from scratch')
+                        help='Delete existing study and start from scratch')
+    parser.add_argument('--device', default=None,
+                        help='Torch device (default: auto-detect)')
     args = parser.parse_args()
+
+    # Derive defaults
+    config_stem = Path(args.config).stem
+    if args.storage is None:
+        args.storage = f'sqlite:///{config_stem}_optuna.db'
+    if args.output is None:
+        args.output = f'configs/{config_stem}_tuned_best.yaml'
+    if args.device is None:
+        args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+    # Load stub config
+    stub_config = load_config(args.config)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -393,8 +375,7 @@ def main():
                                 storage=args.storage)
             print(f'Deleted existing study "{args.study_name}".')
         except KeyError:
-            print(
-                f'No existing study "{args.study_name}" found — starting fresh.')
+            print(f'No existing study "{args.study_name}" -- starting fresh.')
 
     study = optuna.create_study(
         direction='maximize',
@@ -408,6 +389,7 @@ def main():
         load_if_exists=not args.reset,
     )
 
+    # Show best and exit
     if args.show_best:
         if not study.trials:
             print('No completed trials yet.')
@@ -418,54 +400,40 @@ def main():
             print('  Hyperparameters:')
             for k, v in best.params.items():
                 print(f'    {k}: {v}')
-            print(f'\nUse with: python training/train.py '
-                  f'--params-from {args.storage.replace("sqlite:///", "")}')
         return
 
+    # Run optimization
     n_existing = len([t for t in study.trials if t.state.is_finished()])
-    print(f'Study "{args.study_name}" — {n_existing} completed trials.')
-    print(
-        f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each)...')
+    print(f'Study "{args.study_name}" -- {n_existing} completed trials.')
+    print(f'Running {args.n_trials} more ({args.steps_per_trial:,} steps each, '
+          f'device={args.device})...')
+    search_space = stub_config.get('search_space', {})
+    if search_space:
+        print(f'Search space ({len(search_space)} params):')
+        for param_path, spec in search_space.items():
+            print(f'  {param_path}: {spec}')
+    else:
+        print('Warning: empty search space -- trials will all use default params.')
 
-    # Hoist worker pool: spawn once and reuse across all trials to avoid
-    # the per-trial spawn overhead (~576 MB × num_envs) that causes slowdown.
-    shared_envs = None
-    if args.num_envs > 1:
-        from train import SubprocVecEnv
-        shared_envs = SubprocVecEnv(num_envs=args.num_envs, t_window=8,
-                                    reward_type=args.reward)
-        print(f'Spawned {args.num_envs} persistent worker processes '
-              f'(pids: {[p.pid for p in shared_envs._procs]})')
+    study.optimize(
+        lambda trial: objective(trial, stub_config, args.steps_per_trial, args.device),
+        n_trials=args.n_trials,
+        show_progress_bar=True,
+    )
 
-    try:
-        study.optimize(
-            lambda trial: objective(
-                trial, args.steps_per_trial, not args.no_wandb, args.num_envs,
-                shared_envs=shared_envs, wandb_project=args.wandb_project,
-                reward_type=args.reward,
-            ),
-            n_trials=args.n_trials,
-            show_progress_bar=True,
-        )
-    finally:
-        if shared_envs is not None:
-            shared_envs.close()
-
+    # Report results
     print('\n=== Tuning complete ===')
     best = study.best_trial
     print(f'Best trial #{best.number}  reward={best.value:.4f}')
     for k, v in best.params.items():
         print(f'  {k}: {v}')
 
-    # ── auto-launch seeds ────────────────────────────────────────────────
-    if args.auto_seeds:
-        extra = []
-        if args.reward != 'sparse':
-            extra.extend(['--reward', args.reward])
-        if args.no_wandb:
-            extra.append('--no-wandb')
-        launch_seeds(study, n_seeds=args.n_seeds, extra_args=extra)
-        print('All seeds complete.')
+    # Emit complete YAML
+    emit_complete_yaml(stub_config, best.params, args.output)
+
+    # Auto-launch seeds
+    if args.auto_seeds > 0:
+        launch_seeds(args.output, args.auto_seeds)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,11 @@
+algorithm:
+  class: training.train.PPOAlgorithm
+
+opponent_pool:
+  class: training.self_play.HistoricalOpponentPool
+
+num_envs: 4
+
+wandb:
+  project: rlbot-baseline-tuning
+  enabled: true
