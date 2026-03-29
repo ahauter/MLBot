@@ -663,3 +663,58 @@ class TestCollectAndTrain:
         finally:
             updater.stop()
             vec.close()
+
+
+# ── Tune integration ────────────────────────────────────────────────────────
+
+class TestTuneIntegration:
+    """Test the Optuna tuning pipeline with DummyEnv."""
+
+    def test_tune_single_trial(self):
+        pytest.importorskip('optuna')
+        import optuna
+        from tune import load_config, objective
+
+        config = load_config(str(_REPO / 'configs' / 'ppo_tune_stub.yaml'))
+        study = optuna.create_study(direction='maximize')
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        study.optimize(
+            lambda trial: objective(trial, config, steps_per_trial=200, device='cpu'),
+            n_trials=1,
+        )
+        assert len(study.trials) == 1
+        assert study.best_value is not None
+        assert np.isfinite(study.best_value)
+
+    def test_tune_reward_tracker(self):
+        from tune import RewardTracker
+        env = DummyEnv(t_window=8, max_steps=30, goal_prob=0.1)
+        tracked = RewardTracker(env)
+        obs, _ = tracked.reset()
+        assert obs.shape == (800,)
+
+        for _ in range(100):
+            action = np.random.uniform(-1, 1, size=8).astype(np.float32)
+            obs, reward, done, _, info = tracked.step(action)
+            if done:
+                obs, _ = tracked.reset()
+
+        assert len(tracked.episode_returns) > 0
+        assert np.isfinite(tracked.mean_return())
+
+    def test_tune_emit_yaml(self):
+        from tune import load_config, emit_complete_yaml
+        import tempfile
+
+        config = load_config(str(_REPO / 'configs' / 'ppo_tune_stub.yaml'))
+        best_params = {'algorithm.params.lr': 1e-4, 'algorithm.params.clip_epsilon': 0.15}
+
+        with tempfile.NamedTemporaryFile(suffix='.yaml', delete=False) as f:
+            emit_complete_yaml(config, best_params, f.name)
+            import yaml
+            with open(f.name) as rf:
+                result = yaml.safe_load(rf)
+            assert result['algorithm']['params']['lr'] == 1e-4
+            assert result['algorithm']['params']['clip_epsilon'] == 0.15
+            assert 'search_space' not in result

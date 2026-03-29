@@ -42,6 +42,7 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+import torch
 import yaml
 
 _REPO = Path(__file__).parent
@@ -188,7 +189,6 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
     and reports intermediate values for Optuna pruning.
     """
     import optuna
-    from training.environments.baseline_env import BaselineGymEnv
 
     config = copy.deepcopy(stub_config)
 
@@ -201,16 +201,26 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
     AlgoCls = config['algorithm']['cls']
 
     # Create a single agent (no population, for speed)
-    agent = AlgoCls(agent_id=0, config=config, device=device)
+    agent_config = {**config, 'num_envs': 1}
+    agent = AlgoCls(agent_config)
+    agent.device = torch.device(device)
+    agent.encoder.to(device)
+    agent.policy.to(device)
 
-    # Create environment
+    # Create environment — use DummyEnv if rlgym-sim isn't available
     t_window = config.get('t_window', 8)
     reward_class_path = config.get('reward', {}).get('class', None)
     reward_type = 'sparse'
     if reward_class_path and 'Dense' in reward_class_path:
         reward_type = 'dense'
 
-    raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
+    try:
+        import rlgym_sim  # noqa: F401 — probe for availability
+        from training.environments.baseline_env import BaselineGymEnv
+        raw_env = BaselineGymEnv(t_window=t_window, reward_type=reward_type)
+    except (ImportError, ModuleNotFoundError):
+        from training.environments.dummy_env import DummyEnv
+        raw_env = DummyEnv(t_window=t_window, reward_type=reward_type)
     env = RewardTracker(raw_env)
 
     pruning_interval = 50_000
@@ -220,12 +230,18 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
     try:
         while total_step < steps_per_trial:
             # Collect a transition via Algorithm ABC interface
-            action_result = agent.select_action(obs)
-            next_obs, reward, terminated, truncated, info = env.step(action_result.action)
+            obs_batch = obs[np.newaxis]  # (1, obs_dim)
+            action_result = agent.select_action(obs_batch)
+            action_flat = action_result.action[0]  # (8,)
+            next_obs, reward, terminated, truncated, info = env.step(action_flat)
             done = terminated or truncated
 
             # Store transition (Algorithm manages its own buffer)
-            agent.store_transition(obs, action_result, reward, next_obs, done, info)
+            agent.store_transition(
+                obs_batch, action_result,
+                np.array([reward]), next_obs[np.newaxis],
+                np.array([float(done)]), info,
+            )
 
             obs = next_obs
             total_step += 1
@@ -255,12 +271,8 @@ def objective(trial, stub_config: dict, steps_per_trial: int, device: str) -> fl
         del agent
         gc.collect()
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     mean_reward = env.mean_return(100)
     if np.isnan(mean_reward):
