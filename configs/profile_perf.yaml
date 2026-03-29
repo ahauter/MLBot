@@ -1,0 +1,22 @@
+algorithm:
+  class: training.algorithms.ppo.PPOAlgorithm
+
+seed: 0
+total_steps: 100000
+num_envs: 8
+t_window: 8
+log_interval: 5
+
+env_class: training.environments.dummy_env.DummyEnv
+
+population:
+  agents: 4
+  generation_steps: 1000000
+  generation_noise_scale: 0.01
+
+profiling:
+  enabled: true
+  report: models/profiling_report.md
+
+wandb:
+  enabled: false

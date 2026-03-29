@@ -22,7 +22,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import importlib
 import multiprocessing
 import multiprocessing.connection
@@ -188,10 +187,15 @@ class NullFeedbackProvider:
 
 def _env_worker(conn: multiprocessing.connection.Connection,
                 t_window: int, reward_type: str,
-                dense_reward_weights: Optional[dict] = None):
-    """Child process: owns one BaselineGymEnv, responds to commands."""
-    from training.environments.baseline_env import BaselineGymEnv
-    env = BaselineGymEnv(
+                dense_reward_weights: Optional[dict] = None,
+                env_class: Optional[str] = None):
+    """Child process: owns one gym env, responds to commands."""
+    if env_class:
+        EnvCls = load_class(env_class)
+    else:
+        from training.environments.baseline_env import BaselineGymEnv
+        EnvCls = BaselineGymEnv
+    env = EnvCls(
         t_window=t_window,
         reward_type=reward_type,
         dense_reward_weights=dense_reward_weights,
@@ -267,7 +271,8 @@ class SubprocVecEnv:
 
     def __init__(self, num_envs: int, t_window: int = 8,
                  reward_type: str = 'sparse',
-                 dense_reward_weights: Optional[dict] = None):
+                 dense_reward_weights: Optional[dict] = None,
+                 env_class: Optional[str] = None):
         self.num_envs = num_envs
         self.parents: List[multiprocessing.connection.Connection] = []
         self.procs: List[multiprocessing.Process] = []
@@ -276,7 +281,8 @@ class SubprocVecEnv:
             parent_conn, child_conn = multiprocessing.Pipe()
             proc = multiprocessing.Process(
                 target=_env_worker,
-                args=(child_conn, t_window, reward_type, dense_reward_weights),
+                args=(child_conn, t_window, reward_type, dense_reward_weights,
+                      env_class),
                 daemon=True,
             )
             proc.start()
@@ -492,6 +498,143 @@ class CollectionProfiler:
                 metrics[k] = v
         return metrics
 
+    def generate_report(self, config: dict,
+                        update_times: Optional[List[tuple]] = None) -> str:
+        """Generate a formatted profiling report from collected history.
+
+        Parameters
+        ----------
+        config : dict
+            Training config (for system/hyperparameter context).
+        update_times : list of (agent_id, wall_time) tuples, optional
+            GPU update wall times collected during training.
+
+        Returns
+        -------
+        str
+            Markdown-formatted report suitable for pasting into a conversation.
+        """
+        import os
+
+        if not self._history:
+            return '# Profiling Report\n\nNo data collected.\n'
+
+        history = list(self._history)
+
+        # Collect all timer and counter keys across rounds
+        timer_keys = sorted({k for snap in history for k in snap
+                             if k.endswith('_time') and k != 'round_total_time'})
+        counter_keys = sorted({k for snap in history for k in snap
+                               if not k.endswith('_time')
+                               and k != 'round_total_time'})
+
+        def _stats(values):
+            arr = np.array(values, dtype=np.float64)
+            return float(np.mean(arr)), float(np.std(arr))
+
+        lines: List[str] = []
+        lines.append('# Training Performance Profile')
+        lines.append('')
+
+        # System info
+        device = config.get('device', 'cpu')
+        cuda_avail = torch.cuda.is_available()
+        gpu_name = ''
+        if cuda_avail and torch.cuda.device_count() > 0:
+            gpu_name = torch.cuda.get_device_name(0)
+        lines.append('## System')
+        lines.append(f'- Device: `{device}`')
+        lines.append(f'- CUDA available: {cuda_avail}')
+        if gpu_name:
+            lines.append(f'- GPU: {gpu_name}')
+        lines.append(f'- CPU count: {os.cpu_count()}')
+        lines.append(f'- Rounds collected: {len(history)}')
+        lines.append('')
+
+        # Config summary
+        pop_cfg = config.get('population', {})
+        algo_params = config.get('algorithm', {}).get('params', {})
+        lines.append('## Config')
+        lines.append(f'- Agents: {pop_cfg.get("agents", 1)}')
+        lines.append(f'- Envs: {config.get("num_envs", 8)}')
+        lines.append(f'- rollout_steps: {algo_params.get("rollout_steps", 2048)}')
+        lines.append(f'- minibatch_size: {algo_params.get("minibatch_size", "N/A")}')
+        lines.append(f'- ppo_epochs: {algo_params.get("ppo_epochs", "N/A")}')
+        lines.append(f'- t_window: {config.get("t_window", 8)}')
+        lines.append('')
+
+        # Time breakdown table
+        lines.append('## Per-Round Time Breakdown')
+        lines.append('')
+        lines.append('| Category | Mean (s) | Std (s) | Mean % |')
+        lines.append('|----------|----------|---------|--------|')
+
+        round_totals = [s.get('round_total_time', 0) for s in history]
+        rt_mean, rt_std = _stats(round_totals)
+
+        for key in timer_keys:
+            vals = [s.get(key, 0.0) for s in history]
+            mean, std = _stats(vals)
+            pct = 100.0 * mean / rt_mean if rt_mean > 0 else 0
+            label = key.replace('_time', '').replace('_', ' ')
+            lines.append(f'| {label} | {mean:.4f} | {std:.4f} | {pct:.1f}% |')
+
+        lines.append(f'| **round total** | **{rt_mean:.4f}** | **{rt_std:.4f}** | **100%** |')
+        lines.append('')
+
+        # Throughput
+        if rt_mean > 0:
+            rollout_steps = algo_params.get('rollout_steps', 2048)
+            num_envs = config.get('num_envs', 8)
+            steps_per_round = rollout_steps * num_envs
+            sps = steps_per_round / rt_mean
+            lines.append(f'## Throughput')
+            lines.append(f'- Steps per round: {steps_per_round:,}')
+            lines.append(f'- **Steps/sec: {sps:.1f}**')
+            lines.append(f'- Projected steps/hour: {sps * 3600:,.0f}')
+            lines.append('')
+
+        # Counters
+        lines.append('## Transition Stats (per round)')
+        lines.append('')
+        lines.append('| Counter | Mean | Std |')
+        lines.append('|---------|------|-----|')
+        for key in counter_keys:
+            vals = [float(s.get(key, 0)) for s in history]
+            mean, std = _stats(vals)
+            label = key.replace('_', ' ')
+            lines.append(f'| {label} | {mean:.1f} | {std:.1f} |')
+
+        # Waste rate
+        collected = [float(s.get('transitions_collected', 0)) for s in history]
+        discarded = [float(s.get('transitions_discarded', 0)) for s in history]
+        total_trans = [c + d for c, d in zip(collected, discarded)]
+        waste_rates = [d / t if t > 0 else 0 for d, t in zip(discarded, total_trans)]
+        if waste_rates:
+            wr_mean, wr_std = _stats(waste_rates)
+            lines.append(f'| **waste rate** | **{wr_mean*100:.1f}%** | {wr_std*100:.1f}% |')
+        lines.append('')
+
+        # Update times — aggregate per agent
+        if update_times:
+            agent_times: Dict[int, List[float]] = {}
+            for agent_id, wt in update_times:
+                agent_times.setdefault(agent_id, []).append(wt)
+            lines.append('## GPU Update Wall Times')
+            lines.append('')
+            lines.append('| Agent | Count | Mean (s) | Std (s) | Min (s) | Max (s) |')
+            lines.append('|-------|-------|----------|---------|---------|---------|')
+            for aid in sorted(agent_times):
+                vals = agent_times[aid]
+                mean, std = _stats(vals)
+                lines.append(
+                    f'| agent_{aid} | {len(vals)} '
+                    f'| {mean:.3f} | {std:.3f} '
+                    f'| {min(vals):.3f} | {max(vals):.3f} |')
+            lines.append('')
+
+        return '\n'.join(lines)
+
 
 # ── collect and train ───────────────────────────────────────────────────────
 
@@ -501,7 +644,6 @@ def collect_and_train(
     updater: AsyncUpdater,
     rollout_metrics: RolloutMetricsProvider,
     config: dict,
-    executor: concurrent.futures.ThreadPoolExecutor,
     profiler: Optional[CollectionProfiler] = None,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
@@ -537,20 +679,15 @@ def collect_and_train(
     episode_returns = np.zeros(num_envs, dtype=np.float32)
     episode_lengths = np.zeros(num_envs, dtype=np.int64)
 
-    def _select(ai_wids):
-        ai, wids = ai_wids
-        return ai, wids, agents[ai].select_action(obs[wids])
-
     for _ in range(rollout_steps):
-        # Collect actions from all agents concurrently (parallel GPU forward passes)
+        # Collect actions from all agents sequentially
+        # (GIL serializes GPU calls anyway; ThreadPoolExecutor added pure overhead)
         actions = np.zeros((num_envs, 8), dtype=np.float32)
         action_results = [None] * num_envs
 
         _t0 = time.perf_counter()
-        futures = {executor.submit(_select, item): item
-                   for item in agent_workers.items()}
-        for fut in concurrent.futures.as_completed(futures):
-            agent_idx, worker_ids, result = fut.result()
+        for agent_idx, worker_ids in agent_workers.items():
+            result = agents[agent_idx].select_action(obs[worker_ids])
             for local_i, wi in enumerate(worker_ids):
                 actions[wi] = result.action[local_i]
                 action_results[wi] = ActionResult(
@@ -678,11 +815,13 @@ def train(config: dict):
 
     # ── create vectorized envs ──────────────────────────────────────────
     dense_weights = config.get('dense_reward_weights', None)
+    env_class = config.get('env_class', None)
     envs = SubprocVecEnv(
         num_envs=num_envs,
         t_window=t_window,
         reward_type=reward_type,
         dense_reward_weights=dense_weights,
+        env_class=env_class,
     )
 
     # ── seed from replay data ───────────────────────────────────────────
@@ -702,9 +841,14 @@ def train(config: dict):
         registry.register('opponent_pool', pool.get_metrics)
     registry.register('population', population.get_metrics)
 
+    # ── profiling config ──────────────────────────────────────────────
+    profiling_cfg = config.get('profiling', {})
+    profiling_enabled = profiling_cfg.get('enabled', False)
+    profiling_report_path = profiling_cfg.get('report', None)
+    all_update_times: List[tuple] = []  # (agent_id, wall_time) for report
+
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(num_agents, 1))
     total_collected = 0
     collection_round = 0
     gen_steps = pop_config.get('generation_steps', 1_000_000)
@@ -731,7 +875,7 @@ def train(config: dict):
             # Collect rollouts and trigger updates (non-blocking; per-agent
             # _buffer_ready gates writes while updates are in flight)
             steps = collect_and_train(
-                population, envs, updater, rollout_metrics, config, executor,
+                population, envs, updater, rollout_metrics, config,
                 profiler=profiler)
             profiler.end_round()
             total_collected += steps
@@ -745,6 +889,9 @@ def train(config: dict):
                 prefixed = {f'agent_{agent_id}/{k}': v for k,
                             v in metrics.items()}
                 logger.log(total_collected, **prefixed)
+                if profiling_enabled and 'update_wall_time' in metrics:
+                    all_update_times.append(
+                        (agent_id, metrics['update_wall_time']))
 
             # Periodic logging
             if collection_round % log_interval == 0:
@@ -799,12 +946,23 @@ def train(config: dict):
         print('\n[train] Interrupted.')
     finally:
         pbar.close()
-        executor.shutdown(wait=False)
         updater.stop()
         # Save final checkpoint
         best_idx = population.rank_agents()[0]
         population.agents[best_idx].save_checkpoint(model_dir / 'final')
         print(f'[train] Saved final checkpoint to {model_dir}/final')
+
+        # Generate profiling report if enabled
+        if profiling_enabled:
+            report = profiler.generate_report(
+                config, update_times=all_update_times or None)
+            if profiling_report_path:
+                report_path = Path(profiling_report_path)
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(report)
+                print(f'[train] Profiling report saved to {report_path}')
+            else:
+                print(report)
 
         logger.finish()
         envs.close()

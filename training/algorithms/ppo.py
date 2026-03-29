@@ -153,6 +153,42 @@ class RolloutBuffer:
                 'returns': flat_returns[idx],
             }
 
+    def iterate_minibatches_gpu(self, minibatch_size: int, device: torch.device):
+        """
+        Yield GPU-resident minibatch tensors. Converts numpy→GPU once per epoch,
+        then slices on-device. Avoids per-minibatch numpy→torch overhead.
+        """
+        total = self.pos * self.num_envs
+
+        # Single numpy→GPU transfer per array
+        t_obs = torch.tensor(
+            self.obs[:self.pos].reshape(total, self.obs_dim),
+            dtype=torch.float32, device=device)
+        t_actions = torch.tensor(
+            self.actions[:self.pos].reshape(total, self.action_dim),
+            dtype=torch.float32, device=device)
+        t_log_probs = torch.tensor(
+            self.log_probs[:self.pos].reshape(total),
+            dtype=torch.float32, device=device)
+        t_advantages = torch.tensor(
+            self.advantages[:self.pos].reshape(total),
+            dtype=torch.float32, device=device)
+        t_returns = torch.tensor(
+            self.returns[:self.pos].reshape(total),
+            dtype=torch.float32, device=device)
+
+        indices = torch.randperm(total, device=device)
+        for start in range(0, total, minibatch_size):
+            end = min(start + minibatch_size, total)
+            idx = indices[start:end]
+            yield {
+                'obs': t_obs[idx],
+                'actions': t_actions[idx],
+                'log_probs': t_log_probs[idx],
+                'advantages': t_advantages[idx],
+                'returns': t_returns[idx],
+            }
+
     def reset(self) -> None:
         """Reset buffer position (does not zero arrays for speed)."""
         self.pos = 0
@@ -210,7 +246,7 @@ class PPOAlgorithm(Algorithm):
             gae_lambda=self.gae_lambda,
         )
 
-        self._entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+        self._entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=self.device)
 
         # Signals when the rollout buffer is free for new collection.
         # Cleared when an update is triggered; set again after buffer.reset().
@@ -229,7 +265,7 @@ class PPOAlgorithm(Algorithm):
             'max_grad_norm': 0.5,
             'rollout_steps': 2048,
             'ppo_epochs': 4,
-            'minibatch_size': 64,
+            'minibatch_size': 512,
         }
 
     @classmethod
@@ -249,7 +285,7 @@ class PPOAlgorithm(Algorithm):
         x = torch.tensor(obs, dtype=torch.float32, device=self.device)
         batch = x.shape[0]
         tokens = x.view(batch, self.t_window, N_TOKENS, TOKEN_FEATURES)
-        return self.encoder(tokens, self._entity_ids.to(self.device))
+        return self.encoder(tokens, self._entity_ids)
 
     def select_action(self, obs: np.ndarray) -> ActionResult:
         """Pick actions for a batch of observations (on-policy, stochastic)."""
@@ -312,12 +348,13 @@ class PPOAlgorithm(Algorithm):
         n_updates = 0
 
         for _ in range(self.ppo_epochs):
-            for batch in self.buffer.iterate_minibatches(self.minibatch_size):
-                obs_t = torch.tensor(batch['obs'], dtype=torch.float32, device=self.device)
-                actions_t = torch.tensor(batch['actions'], dtype=torch.float32, device=self.device)
-                old_log_probs_t = torch.tensor(batch['log_probs'], dtype=torch.float32, device=self.device)
-                advantages_t = torch.tensor(batch['advantages'], dtype=torch.float32, device=self.device)
-                returns_t = torch.tensor(batch['returns'], dtype=torch.float32, device=self.device)
+            for batch in self.buffer.iterate_minibatches_gpu(
+                    self.minibatch_size, self.device):
+                obs_t = batch['obs']
+                actions_t = batch['actions']
+                old_log_probs_t = batch['log_probs']
+                advantages_t = batch['advantages']
+                returns_t = batch['returns']
 
                 # Normalize advantages
                 if advantages_t.numel() > 1:
@@ -326,7 +363,7 @@ class PPOAlgorithm(Algorithm):
                 # Forward
                 b = obs_t.shape[0]
                 tokens = obs_t.view(b, self.t_window, N_TOKENS, TOKEN_FEATURES)
-                emb = self.encoder(tokens, self._entity_ids.to(self.device))
+                emb = self.encoder(tokens, self._entity_ids)
                 new_log_probs, new_values, entropy = self.policy.evaluate_actions(emb, actions_t)
 
                 # Policy loss (PPO-Clip)
