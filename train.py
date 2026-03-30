@@ -347,10 +347,11 @@ class SubprocVecEnv:
     Parameters
     ----------
     num_envs : int
-        Total number of environments (must be divisible by envs_per_worker).
+        Number of worker processes to spawn.
     envs_per_worker : int
         Number of arenas per subprocess.  Default 1 preserves the
-        original one-process-per-env behaviour.
+        original one-process-per-env behaviour.  Total logical
+        environments = ``num_envs * envs_per_worker``.
     """
 
     def __init__(self, num_envs: int, t_window: int = 8,
@@ -358,12 +359,9 @@ class SubprocVecEnv:
                  dense_reward_weights: Optional[dict] = None,
                  env_class: Optional[str] = None,
                  envs_per_worker: int = 1):
-        assert num_envs % envs_per_worker == 0, (
-            f'num_envs ({num_envs}) must be divisible by '
-            f'envs_per_worker ({envs_per_worker})')
-        self.num_envs = num_envs
+        self.num_workers = num_envs
         self.envs_per_worker = envs_per_worker
-        self.num_workers = num_envs // envs_per_worker
+        self.num_envs = num_envs * envs_per_worker  # total logical envs
         self.parents: List[multiprocessing.connection.Connection] = []
         self.procs: List[multiprocessing.Process] = []
 
@@ -698,7 +696,9 @@ class CollectionProfiler:
         sched_cfg = config.get('scheduler', {})
         lines.append('## Config')
         lines.append(f'- Agents: {pop_cfg.get("agents", 1)}')
-        lines.append(f'- Envs: {config.get("num_envs", 8)}')
+        _ne = config.get('num_envs', 8)
+        _epw = config.get('envs_per_worker', 1)
+        lines.append(f'- Workers: {_ne}, envs_per_worker: {_epw}, total_envs: {_ne * _epw}')
         lines.append(f'- Scheduler: {sched_cfg.get("class", "InterleavedScheduler")}')
         lines.append(f'- rollout_steps: {algo_params.get("rollout_steps", 2048)}')
         lines.append(f'- minibatch_size: {algo_params.get("minibatch_size", "N/A")}')
@@ -745,8 +745,8 @@ class CollectionProfiler:
                 steps_per_round = int(np.mean(collected_vals))
             else:
                 rollout_steps = algo_params.get('rollout_steps', 2048)
-                num_envs = config.get('num_envs', 8)
-                steps_per_round = rollout_steps * num_envs
+                _total = config.get('num_envs', 8) * config.get('envs_per_worker', 1)
+                steps_per_round = rollout_steps * _total
             sps = steps_per_round / rt_mean
             lines.append(f'## Throughput')
             lines.append(f'- Steps per round: {steps_per_round:,}')
@@ -1086,11 +1086,13 @@ def train(config: dict):
     from training.algorithms.ppo import Population
     pop_config = config.get('population', {})
     num_agents = pop_config.get('agents', 1)
-    agent_envs = scheduler.envs_per_agent(num_envs, num_agents)
-    population = Population(num_agents=num_agents, num_workers=num_envs,
+    envs_per_worker = config.get('envs_per_worker', 1)
+    total_envs = num_envs * envs_per_worker
+    agent_envs = scheduler.envs_per_agent(total_envs, num_agents)
+    population = Population(num_agents=num_agents, num_workers=total_envs,
                             config={**config, 'device': device},
                             envs_per_agent=agent_envs)
-    scheduler.init(population, num_envs, config)
+    scheduler.init(population, total_envs, config)
 
     # ── create opponent pool ────────────────────────────────────────────
     PoolCls = resolve_or_default(config, 'opponent_pool', None)
@@ -1103,7 +1105,6 @@ def train(config: dict):
     # ── create vectorized envs ──────────────────────────────────────────
     dense_weights = config.get('dense_reward_weights', None)
     env_class = config.get('env_class', None)
-    envs_per_worker = config.get('envs_per_worker', 1)
     envs = SubprocVecEnv(
         num_envs=num_envs,
         t_window=t_window,
