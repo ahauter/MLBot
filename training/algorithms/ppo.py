@@ -481,18 +481,25 @@ class Population:
         Shared configuration dict passed to each PPOAlgorithm.
     """
 
-    def __init__(self, num_agents: int, num_workers: int, config: dict):
+    def __init__(self, num_agents: int, num_workers: int, config: dict,
+                 envs_per_agent: Optional[int] = None):
         self.num_agents = num_agents
         self.num_workers = num_workers
 
-        # Assign workers to agents
+        # Assign workers to agents (used for interleaved scoring)
         self.worker_assignment = self._assign_workers(num_workers, num_agents)
 
-        # Create agents, each with its share of workers
+        # Buffer sizing: explicit envs_per_agent (from scheduler) or infer from assignment
+        if envs_per_agent is None:
+            envs_per_agent_map = {
+                i: self.worker_assignment.count(i) for i in range(num_agents)}
+        else:
+            envs_per_agent_map = {i: envs_per_agent for i in range(num_agents)}
+
+        # Create agents, each with buffer sized for its env count
         self.agents: List[PPOAlgorithm] = []
         for i in range(num_agents):
-            agent_num_envs = self.worker_assignment.count(i)
-            agent_config = {**config, 'num_envs': agent_num_envs}
+            agent_config = {**config, 'num_envs': envs_per_agent_map[i]}
             self.agents.append(PPOAlgorithm(agent_config))
 
         # Score tracking per agent

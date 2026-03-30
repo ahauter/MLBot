@@ -19,7 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -233,6 +233,55 @@ class FeedbackProvider(ABC):
     def get_metrics(self) -> dict:
         """Track Axis 3 cost: labels consumed, annotation time, etc."""
         return {}
+
+
+# ---------------------------------------------------------------------------
+# EvaluationHook — Evaluation protocol
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# CollectionScheduler — Agent-environment scheduling
+# ---------------------------------------------------------------------------
+
+class CollectionScheduler(ABC):
+    """
+    Controls how agents are assigned to environment workers each step.
+
+    Different hardware profiles benefit from different strategies:
+      - InterleavedScheduler: all agents collect simultaneously, envs split
+        evenly. Best when num_envs >> num_agents.
+      - SerialScheduler: one agent at a time uses ALL envs, then rotates.
+        Best when num_envs is small relative to num_agents (larger batches
+        per forward pass, fewer GPU kernel launches).
+
+    Swap via YAML config:
+        scheduler:
+          class: training.schedulers.SerialScheduler
+    """
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return {}
+
+    @abstractmethod
+    def init(self, population, num_envs: int, config: dict) -> None:
+        """Initialize with population and environment info."""
+
+    @abstractmethod
+    def envs_per_agent(self, num_envs: int, num_agents: int) -> int:
+        """How many envs each agent's buffer should be sized for."""
+
+    @abstractmethod
+    def iter_steps(self, rollout_steps: int) -> Iterator[Dict[int, List[int]]]:
+        """Yield {agent_idx: [worker_ids]} for each collection step.
+
+        May yield more than rollout_steps total steps if agents are
+        rotated serially (each agent needs its own rollout_steps).
+        """
+
+    def on_round_start(self) -> None:
+        """Called at the start of each collection round. Optional hook."""
+        pass
 
 
 # ---------------------------------------------------------------------------

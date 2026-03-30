@@ -1,6 +1,9 @@
 algorithm:
   class: training.algorithms.ppo.PPOAlgorithm
 
+scheduler:
+  class: training.schedulers.SerialScheduler
+
 seed: 0
 total_steps: 100000
 num_envs: 8
