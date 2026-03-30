@@ -209,6 +209,68 @@ class BaselineGymEnv(gym.Env):
         reward = blue_reward
         return obs, reward, done, False, info
 
+    def get_opponent_obs(self) -> np.ndarray:
+        """Return current stacked orange observation for external inference."""
+        return self._get_stacked_orange_obs()
+
+    def step_with_opponent_action(
+        self, action: np.ndarray, opp_action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        """Step with an externally-computed opponent action.
+
+        Same as step() but skips _get_opponent_action() — the caller
+        provides the opponent action directly (for batched GPU inference).
+        """
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        opp_action = np.clip(opp_action, -1.0, 1.0).astype(np.float32)
+        assert action.shape == (8,), f"Bad action shape: {action.shape}"
+        assert opp_action.shape == (8,), f"Bad opponent action: {opp_action.shape}"
+
+        obs_list, rewards, terminated, _info = self._env.step(
+            np.stack([action, opp_action], axis=0)
+        )
+        blue_obs, orange_obs = self._parse_obs(obs_list)
+        blue_tokens = self._to_tokens(blue_obs)
+        orange_tokens = self._to_tokens(orange_obs)
+
+        self._blue_buf.append(blue_tokens)
+        self._orange_buf.append(orange_tokens)
+        self._step_count += 1
+
+        blue_reward = float(rewards[0])
+        orange_reward = float(rewards[1])
+
+        if self.reward_type == 'sparse':
+            assert -1.0 <= blue_reward <= 1.0, f"Reward out of range: {blue_reward}"
+            if not terminated:
+                assert blue_reward == 0.0, \
+                    f"Non-zero mid-episode reward: {blue_reward} (reward leakage!)"
+
+        if terminated and self.reward_type == 'dense' and self._dense_reward_fn is not None:
+            remaining = max(0, self.max_steps - self._step_count)
+            if remaining > 0:
+                bonus = remaining * self._dense_reward_fn.max_step_reward
+                ball_y = _info['state'].ball.position[1]
+                if ball_y > _GOAL_Y:
+                    blue_reward += bonus
+                elif ball_y < -_GOAL_Y:
+                    orange_reward += bonus
+
+        timed_out = self._step_count >= self.max_steps
+        done = bool(terminated or timed_out)
+
+        obs = self._get_stacked_obs()
+        ball_y = _info['state'].ball.position[1]
+        goal = (1 if ball_y > _GOAL_Y else -1) if terminated else 0
+        info = {
+            'orange_obs': self._get_stacked_orange_obs(),
+            'orange_action': opp_action,
+            'orange_reward': orange_reward,
+            'goal': goal,
+        }
+        reward = blue_reward
+        return obs, reward, done, False, info
+
     def close(self) -> None:
         if self._env is not None:
             self._env.close()

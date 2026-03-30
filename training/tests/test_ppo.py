@@ -547,14 +547,15 @@ class TestPopulation:
         assignment = Population._assign_workers(4, 1)
         assert assignment == [0, 0, 0, 0]
 
-    def test_generation_ranking(self):
+    def test_generation_ranking(self, tmp_path):
         """Add scores, verify ranking works."""
         config = {
             'algorithm': {'params': {'rollout_steps': 8}},
             'num_envs': 1,
             't_window': 8,
         }
-        pop = Population(num_agents=3, num_workers=3, config=config)
+        pop = Population(num_agents=3, num_workers=3, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
 
         pop.add_score(0, 1.0)
         pop.add_score(0, 2.0)  # mean = 1.5
@@ -566,46 +567,51 @@ class TestPopulation:
         ranking = pop.rank_agents()
         assert ranking == [1, 2, 0], f"Expected [1, 2, 0], got {ranking}"
 
-    def test_ranking_with_no_scores(self):
+    def test_ranking_with_no_scores(self, tmp_path):
         """Agents with no scores rank last."""
         config = {
             'algorithm': {'params': {'rollout_steps': 8}},
             'num_envs': 1,
             't_window': 8,
         }
-        pop = Population(num_agents=3, num_workers=3, config=config)
+        pop = Population(num_agents=3, num_workers=3, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         pop.add_score(0, 5.0)
         # Agents 1 and 2 have no scores
 
         ranking = pop.rank_agents()
         assert ranking[0] == 0, "Agent 0 should rank first"
 
-    def test_get_metrics(self):
+    def test_get_metrics(self, tmp_path):
         """Population.get_metrics() returns dict with expected keys."""
         config = {
             'algorithm': {'params': {'rollout_steps': 8}},
             'num_envs': 1,
             't_window': 8,
         }
-        pop = Population(num_agents=2, num_workers=4, config=config)
+        pop = Population(num_agents=2, num_workers=4, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         pop.add_score(0, 1.0)
         pop.add_score(1, 2.0)
 
         metrics = pop.get_metrics()
-        assert 'population/generation' in metrics
-        assert 'population/num_agents' in metrics
-        assert 'population/best_agent' in metrics
-        assert metrics['population/num_agents'] == 2
-        assert metrics['population/generation'] == 0
+        assert 'generation' in metrics
+        assert 'num_agents' in metrics
+        assert 'best_agent' in metrics
+        assert 'pool_size' in metrics
+        assert metrics['num_agents'] == 2
+        assert metrics['generation'] == 0
+        assert metrics['pool_size'] == 0
 
-    def test_reset_scores(self):
+    def test_reset_scores(self, tmp_path):
         """reset_scores clears scores and increments generation."""
         config = {
             'algorithm': {'params': {'rollout_steps': 8}},
             'num_envs': 1,
             't_window': 8,
         }
-        pop = Population(num_agents=2, num_workers=2, config=config)
+        pop = Population(num_agents=2, num_workers=2, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         pop.add_score(0, 1.0)
         pop.add_score(1, 2.0)
         assert pop.generation == 0
@@ -614,14 +620,66 @@ class TestPopulation:
         assert pop.generation == 1
         assert all(len(s) == 0 for s in pop.scores)
 
-    def test_population_creates_agents(self):
+    def test_population_creates_agents(self, tmp_path):
         """Population should create the right number of agents."""
         config = {
             'algorithm': {'params': {'rollout_steps': 8}},
             'num_envs': 1,
             't_window': 8,
         }
-        pop = Population(num_agents=3, num_workers=6, config=config)
+        pop = Population(num_agents=3, num_workers=6, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         assert len(pop.agents) == 3
         for agent in pop.agents:
             assert isinstance(agent, PPOAlgorithm)
+
+    def test_is_opponent_pool(self, tmp_path):
+        """Population should be an OpponentPool instance."""
+        from training.opponents.pool import OpponentPool
+        config = {
+            'algorithm': {'params': {'rollout_steps': 8}},
+            'num_envs': 1,
+            't_window': 8,
+        }
+        pop = Population(num_agents=2, num_workers=4, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
+        assert isinstance(pop, OpponentPool)
+
+    def test_snapshot_save_sample(self, tmp_path):
+        """save_snapshot + sample_opponent round-trip."""
+        config = {
+            'algorithm': {'params': {'rollout_steps': 8}},
+            'num_envs': 1,
+            't_window': 8,
+        }
+        pop = Population(num_agents=1, num_workers=1, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
+
+        assert pop.num_snapshots() == 0
+        assert pop.sample_opponent() is None
+
+        # Save a snapshot from agent 0
+        pop.save_snapshot(pop.agents[0], step=100)
+        assert pop.num_snapshots() == 1
+
+        path = pop.sample_opponent()
+        assert path is not None
+        assert 'step_' in path
+
+    def test_should_swap(self, tmp_path):
+        """should_swap respects snapshot_interval."""
+        config = {
+            'algorithm': {'params': {'rollout_steps': 8}},
+            'num_envs': 1,
+            't_window': 8,
+        }
+        pop = Population(num_agents=1, num_workers=1, config=config,
+                         snapshot_dir=tmp_path / 'snaps',
+                         snapshot_interval=100)
+
+        assert pop.should_swap(0) is False  # 0 - 0 = 0 < 100
+        assert pop.should_swap(100) is True
+
+        pop.save_snapshot(pop.agents[0], step=100)
+        assert pop.should_swap(150) is False
+        assert pop.should_swap(200) is True

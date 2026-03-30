@@ -181,6 +181,17 @@ class DummyEnv(gym.Env):
         }
         return obs, reward, done, False, info
 
+    def get_opponent_obs(self) -> np.ndarray:
+        """Return current stacked orange observation for external inference."""
+        return self._get_stacked_orange_obs()
+
+    def step_with_opponent_action(
+        self, action: np.ndarray, opp_action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        """Step with externally-computed opponent action. DummyEnv ignores
+        opponent actions, so this delegates to step()."""
+        return self.step(action)
+
     def close(self) -> None:
         pass
 

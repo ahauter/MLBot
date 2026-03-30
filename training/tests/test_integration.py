@@ -282,10 +282,11 @@ class TestPPOWithDummyEnv:
 class TestPopulationWithDummyEnv:
     """Test population-based training with DummyEnv."""
 
-    def test_population_collect(self):
+    def test_population_collect(self, tmp_path):
         """Multiple agents collect from their assigned envs."""
         config = _small_config(num_envs=4, rollout_steps=16)
-        pop = Population(num_agents=2, num_workers=4, config=config)
+        pop = Population(num_agents=2, num_workers=4, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
 
         envs = [DummyEnv(t_window=8, max_steps=200) for _ in range(4)]
         obs_list = [env.reset()[0] for env in envs]
@@ -347,10 +348,11 @@ class TestPopulationWithDummyEnv:
         for agent in pop.agents:
             assert agent.buffer.pos == 16
 
-    def test_population_generation_cycle(self):
+    def test_population_generation_cycle(self, tmp_path):
         """Test ranking and cloning in a generation cycle."""
         config = _small_config(num_envs=4, rollout_steps=16)
-        pop = Population(num_agents=3, num_workers=6, config=config)
+        pop = Population(num_agents=3, num_workers=6, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
 
         # Simulate scores
         for _ in range(10):
@@ -513,8 +515,14 @@ def _dummy_env_worker(conn, t_window, reward_type, dense_reward_weights=None):
         elif cmd == 'step':
             obs, reward, done, truncated, info = env.step(data)
             conn.send(('step', obs, reward, done, truncated, info))
-        elif cmd == 'set_opponent_snapshot':
-            conn.send(('ok',))
+        elif cmd == 'get_opponent_obs':
+            obs = env.get_opponent_obs()
+            conn.send(('opponent_obs', obs))
+        elif cmd == 'step_with_opp':
+            blue_action, opp_action = data
+            obs, reward, done, truncated, info = env.step_with_opponent_action(
+                blue_action, opp_action)
+            conn.send(('step', obs, reward, done, truncated, info))
         elif cmd == 'close':
             env.close()
             conn.send(('closed',))
@@ -563,12 +571,27 @@ class DummySubprocVecEnv:
         return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
                 np.array(dones, dtype=np.float32), infos)
 
-    def set_opponent_snapshot(self, snap_path, worker_indices=None):
-        indices = worker_indices if worker_indices is not None else range(self.num_envs)
-        for i in indices:
-            self.parents[i].send(('set_opponent_snapshot', snap_path))
-        for i in indices:
-            self.parents[i].recv()
+    def get_opponent_obs(self):
+        for conn in self.parents:
+            conn.send(('get_opponent_obs', None))
+        obs_list = []
+        for conn in self.parents:
+            _, obs = conn.recv()
+            obs_list.append(obs)
+        return np.stack(obs_list)
+
+    def step_with_opponent_actions(self, blue_actions, opp_actions):
+        for i, conn in enumerate(self.parents):
+            conn.send(('step_with_opp', (blue_actions[i], opp_actions[i])))
+        obs_list, rewards, dones, infos = [], [], [], []
+        for conn in self.parents:
+            _, obs, reward, done, truncated, info = conn.recv()
+            obs_list.append(obs)
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
+        return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.float32), infos)
 
     def close(self):
         for conn in self.parents:
@@ -618,17 +641,22 @@ class TestSubprocVecEnv:
 class TestCollectAndTrain:
     """End-to-end test of the collect_and_train function with DummyEnv."""
 
-    def test_collect_and_train_single_agent(self):
+    def test_collect_and_train_single_agent(self, tmp_path):
         from train import collect_and_train, AsyncUpdater, RolloutMetricsProvider
+        from training.schedulers import InterleavedScheduler
 
         config = _small_config(num_envs=2, rollout_steps=32)
-        pop = Population(num_agents=1, num_workers=2, config=config)
+        pop = Population(num_agents=1, num_workers=2, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         rollout_metrics = RolloutMetricsProvider()
         updater = AsyncUpdater()
+        scheduler = InterleavedScheduler()
+        scheduler.init(pop, 2, config)
 
         vec = DummySubprocVecEnv(num_envs=2, t_window=8)
         try:
-            steps = collect_and_train(pop, vec, updater, rollout_metrics, config)
+            steps = collect_and_train(pop, vec, updater, rollout_metrics, config,
+                                      scheduler)
             assert steps == 32 * 2  # rollout_steps * num_envs
 
             # Wait a moment for async update
@@ -643,17 +671,22 @@ class TestCollectAndTrain:
             updater.stop()
             vec.close()
 
-    def test_collect_and_train_multi_agent(self):
+    def test_collect_and_train_multi_agent(self, tmp_path):
         from train import collect_and_train, AsyncUpdater, RolloutMetricsProvider
+        from training.schedulers import InterleavedScheduler
 
         config = _small_config(num_envs=4, rollout_steps=32)
-        pop = Population(num_agents=2, num_workers=4, config=config)
+        pop = Population(num_agents=2, num_workers=4, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
         rollout_metrics = RolloutMetricsProvider()
         updater = AsyncUpdater()
+        scheduler = InterleavedScheduler()
+        scheduler.init(pop, 4, config)
 
         vec = DummySubprocVecEnv(num_envs=4, t_window=8)
         try:
-            steps = collect_and_train(pop, vec, updater, rollout_metrics, config)
+            steps = collect_and_train(pop, vec, updater, rollout_metrics, config,
+                                      scheduler)
             assert steps == 32 * 4
 
             import time

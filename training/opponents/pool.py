@@ -1,8 +1,12 @@
 """
-Self-Play Opponent Pool
-=======================
-Abstract base class for self-play opponent pools, plus concrete
-implementations for the abstracted training framework.
+Self-Play Agent / Opponent Pool
+================================
+Abstract base class for agent pools (managing live agents and/or
+historical opponent snapshots), plus concrete implementations.
+
+The ABC supports both:
+  - Snapshot management: save/sample/swap opponent snapshots
+  - Agent management: scoring, ranking, generation cycles (Population)
 
 Snapshots are saved as PyTorch state_dicts (encoder + policy weights).
 The training loop calls save_snapshot() / sample_opponent() through
@@ -94,6 +98,33 @@ class OpponentPool(ABC):
     def get_metrics(self) -> dict:
         """Return metrics for MetricsRegistry."""
         return {'pool_size': self.num_snapshots()}
+
+    # ── agent management (non-abstract, overridden by Population) ─────────
+
+    def add_score(self, agent_idx: int, score: float) -> None:
+        """Record episode outcome for an agent. No-op by default."""
+
+    def rank_agents(self) -> List[int]:
+        """Rank agents by performance descending. Returns [0] by default."""
+        return [0]
+
+    def reset_scores(self) -> None:
+        """Clear scores after a generation. No-op by default."""
+
+    @property
+    def agents(self) -> List:
+        """List of Algorithm instances managed by this pool."""
+        raise NotImplementedError("Subclass must implement `agents` property")
+
+    @property
+    def num_agents(self) -> int:
+        """Number of agents in the pool."""
+        return 1
+
+    @property
+    def generation(self) -> int:
+        """Current generation counter."""
+        return 0
 
     # ── shared internals ──────────────────────────────────────────────────
 

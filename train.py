@@ -200,9 +200,6 @@ def _env_worker(conn: multiprocessing.connection.Connection,
         reward_type=reward_type,
         dense_reward_weights=dense_reward_weights,
     )
-    # Opponent state for PPO snapshots
-    _opponent_encoder = None
-    _opponent_policy = None
 
     while True:
         try:
@@ -218,44 +215,15 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             obs, reward, done, truncated, info = env.step(data)
             conn.send(('step', obs, reward, done, truncated, info))
 
-        elif cmd == 'set_opponent_snapshot':
-            # Load opponent from snapshot path for PPO self-play
-            snap_path = data
-            if snap_path is not None:
-                from training.opponents.pool import load_opponent_from_snapshot
-                weights = load_opponent_from_snapshot(snap_path, device='cpu')
-                from encoder import SharedTransformerEncoder, D_MODEL
-                from policy_head import StochasticPolicyHead
-                if _opponent_encoder is None:
-                    _opponent_encoder = SharedTransformerEncoder(
-                        d_model=D_MODEL)
-                    _opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
-                _opponent_encoder.load_state_dict(weights['encoder'])
-                _opponent_policy.load_state_dict(weights['policy'])
-                _opponent_encoder.eval()
-                _opponent_policy.eval()
+        elif cmd == 'get_opponent_obs':
+            obs = env.get_opponent_obs()
+            conn.send(('opponent_obs', obs))
 
-                # Monkey-patch the env's opponent action method
-                import torch as _torch
-                from encoder import ENTITY_TYPE_IDS_1V1 as _EIDS
-
-                def _ppo_opponent_action(self_env):
-                    stacked = np.stack(list(self_env._orange_buf), axis=0)
-                    flat_obs = stacked.ravel().astype(np.float32)
-                    with _torch.no_grad():
-                        x = _torch.tensor(
-                            flat_obs[np.newaxis], dtype=_torch.float32)
-                        tokens = x.view(
-                            1, self_env.t_window, -1, TOKEN_FEATURES)
-                        eids = _torch.tensor(_EIDS, dtype=_torch.long)
-                        emb = _opponent_encoder(tokens, eids)
-                        action, _ = _opponent_policy.act_deterministic(emb)
-                    return action[0].cpu().numpy().astype(np.float32)
-
-                import types
-                env._get_opponent_action = types.MethodType(
-                    _ppo_opponent_action, env)
-            conn.send(('ok',))
+        elif cmd == 'step_with_opp':
+            blue_action, opp_action = data
+            obs, reward, done, truncated, info = env.step_with_opponent_action(
+                blue_action, opp_action)
+            conn.send(('step', obs, reward, done, truncated, info))
 
         elif cmd == 'close':
             env.close()
@@ -314,14 +282,30 @@ class SubprocVecEnv:
         return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
                 np.array(dones, dtype=np.float32), infos)
 
-    def set_opponent_snapshot(self, snap_path: Optional[str], worker_indices=None):
-        """Set opponent snapshot for specified workers (or all)."""
-        indices = worker_indices if worker_indices is not None else range(
-            self.num_envs)
-        for i in indices:
-            self.parents[i].send(('set_opponent_snapshot', snap_path))
-        for i in indices:
-            self.parents[i].recv()
+    def get_opponent_obs(self) -> np.ndarray:
+        """Get stacked orange observations from all envs. Returns (num_envs, obs_dim)."""
+        for conn in self.parents:
+            conn.send(('get_opponent_obs', None))
+        obs_list = []
+        for conn in self.parents:
+            tag, obs = conn.recv()
+            obs_list.append(obs)
+        return np.stack(obs_list, axis=0)
+
+    def step_with_opponent_actions(self, blue_actions: np.ndarray,
+                                   opp_actions: np.ndarray):
+        """Step all envs with pre-computed opponent actions. Same return as step()."""
+        for i, conn in enumerate(self.parents):
+            conn.send(('step_with_opp', (blue_actions[i], opp_actions[i])))
+        obs_list, rewards, dones, infos = [], [], [], []
+        for conn in self.parents:
+            tag, obs, reward, done, truncated, info = conn.recv()
+            obs_list.append(obs)
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
+        return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.float32), infos)
 
     def close(self):
         for conn in self.parents:
@@ -798,6 +782,33 @@ class CollectionProfiler:
         plt.close(fig)
 
 
+# ── batched opponent inference ──────────────────────────────────────────────
+
+@torch.no_grad()
+def _opponent_inference(opp_obs: np.ndarray, encoder, policy,
+                        device: str, t_window: int) -> np.ndarray:
+    """Batched GPU forward pass for opponent actions.
+
+    Parameters
+    ----------
+    opp_obs : (num_envs, obs_dim) flat orange observations
+    encoder, policy : opponent's frozen encoder and policy on device
+    device : torch device string
+    t_window : number of stacked frames
+
+    Returns
+    -------
+    (num_envs, 8) numpy array of opponent actions
+    """
+    from encoder import ENTITY_TYPE_IDS_1V1
+    x = torch.tensor(opp_obs, dtype=torch.float32, device=device)
+    tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
+    eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
+    emb = encoder(tokens, eids)
+    action, _ = policy.act_deterministic(emb)
+    return action.cpu().numpy()
+
+
 # ── collect and train ───────────────────────────────────────────────────────
 
 def collect_and_train(
@@ -808,10 +819,15 @@ def collect_and_train(
     config: dict,
     scheduler,
     profiler: Optional[CollectionProfiler] = None,
+    opponent_encoder=None,
+    opponent_policy=None,
+    opponent_loaded: bool = False,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
 
     The scheduler controls which agents use which envs each step.
+    When opponent_loaded is True, opponent inference runs centrally
+    on GPU via opponent_encoder/opponent_policy (batched).
     Returns total environment steps collected.
     """
     from training.abstractions import ActionResult
@@ -873,9 +889,17 @@ def collect_and_train(
             profiler.add_time('action_select_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'action_select')
 
-        # Step all envs
+        # Step all envs (with batched GPU opponent inference when available)
         _t0 = time.perf_counter()
-        next_obs, rewards, dones, infos = envs.step(actions)
+        if opponent_loaded:
+            opp_obs = envs.get_opponent_obs()
+            opp_actions = _opponent_inference(
+                opp_obs, opponent_encoder, opponent_policy,
+                config.get('device', 'cpu'), config.get('t_window', 8))
+            next_obs, rewards, dones, infos = envs.step_with_opponent_actions(
+                actions, opp_actions)
+        else:
+            next_obs, rewards, dones, infos = envs.step(actions)
         _t1 = time.perf_counter()
         if profiler:
             profiler.add_time('env_step_time', _t1 - _t0)
@@ -983,23 +1007,21 @@ def train(config: dict):
     SchedulerCls = resolve_or_default(config, 'scheduler', InterleavedScheduler)
     scheduler = SchedulerCls()
 
-    # ── create population ───────────────────────────────────────────────
+    # ── create population (unified agent + opponent pool) ────────────────
     from training.algorithms.ppo import Population
     pop_config = config.get('population', {})
     num_agents = pop_config.get('agents', 1)
+    pool_params = config.get('opponent_pool', {}).get('params', {})
+    snapshot_dir = config.get('snapshot_dir', 'models/snapshots')
     agent_envs = scheduler.envs_per_agent(num_envs, num_agents)
-    population = Population(num_agents=num_agents, num_workers=num_envs,
-                            config={**config, 'device': device},
-                            envs_per_agent=agent_envs)
+    population = Population(
+        num_agents=num_agents, num_workers=num_envs,
+        config={**config, 'device': device},
+        envs_per_agent=agent_envs,
+        snapshot_dir=snapshot_dir,
+        **pool_params,
+    )
     scheduler.init(population, num_envs, config)
-
-    # ── create opponent pool ────────────────────────────────────────────
-    PoolCls = resolve_or_default(config, 'opponent_pool', None)
-    pool = None
-    if PoolCls is not None:
-        pool_params = config.get('opponent_pool', {}).get('params', {})
-        snapshot_dir = config.get('snapshot_dir', 'models/snapshots')
-        pool = PoolCls(snapshot_dir=snapshot_dir, **pool_params)
 
     # ── create vectorized envs ──────────────────────────────────────────
     dense_weights = config.get('dense_reward_weights', None)
@@ -1025,8 +1047,6 @@ def train(config: dict):
     registry.register('rollout', rollout_metrics.get_metrics)
     registry.register('timing', timing_metrics.get_metrics)
     registry.register('perf', profiler.get_metrics)
-    if pool:
-        registry.register('opponent_pool', pool.get_metrics)
     registry.register('population', population.get_metrics)
 
     # ── profiling config ──────────────────────────────────────────────
@@ -1038,6 +1058,17 @@ def train(config: dict):
     if profiling_enabled and waterfall_path:
         profiler._waterfall_rounds = waterfall_rounds
     all_update_times: List[tuple] = []  # (agent_id, wall_time) for report
+
+    # ── opponent model (centralized GPU inference) ───────────────────────
+    from encoder import SharedTransformerEncoder, D_MODEL
+    from policy_head import StochasticPolicyHead
+    from training.opponents.pool import load_opponent_from_snapshot
+
+    opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL).to(device)
+    opponent_policy = StochasticPolicyHead(d_model=D_MODEL).to(device)
+    opponent_encoder.eval()
+    opponent_policy.eval()
+    opponent_loaded = False
 
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
@@ -1056,19 +1087,26 @@ def train(config: dict):
         while total_collected < total_steps:
             profiler.start_round()
 
-            # Set opponents from pool
-            if pool and pool.num_snapshots() > 0:
-                snap_path = pool.sample_opponent()
+            # Sample opponent snapshot and load onto GPU
+            if population.num_snapshots() > 0:
+                snap_path = population.sample_opponent()
                 if snap_path:
                     _t0 = time.perf_counter()
-                    envs.set_opponent_snapshot(snap_path)
+                    weights = load_opponent_from_snapshot(snap_path, device=device)
+                    opponent_encoder.load_state_dict(weights['encoder'])
+                    opponent_policy.load_state_dict(weights['policy'])
+                    opponent_loaded = True
                     profiler.add_time('opponent_load_time', time.perf_counter() - _t0)
 
             # Collect rollouts and trigger updates (non-blocking; per-agent
             # _buffer_ready gates writes while updates are in flight)
             steps = collect_and_train(
-                population, envs, updater, rollout_metrics, config,
-                scheduler, profiler=profiler)
+                population, envs, updater, rollout_metrics,
+                {**config, 'device': device},
+                scheduler, profiler=profiler,
+                opponent_encoder=opponent_encoder,
+                opponent_policy=opponent_policy,
+                opponent_loaded=opponent_loaded)
             total_collected += steps
             timing_metrics.add_steps(steps)
             collection_round += 1
@@ -1108,13 +1146,12 @@ def train(config: dict):
             profiler.add_time('logging_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'logging')
 
-            # Save snapshots to opponent pool
+            # Save snapshots to opponent pool (population IS the pool)
             _t0 = time.perf_counter()
-            if pool:
-                best_idx = population.rank_agents()[0]
-                best_agent = population.agents[best_idx]
-                if pool.should_swap(total_collected):
-                    pool.save_snapshot(best_agent, total_collected)
+            best_idx = population.rank_agents()[0]
+            best_agent = population.agents[best_idx]
+            if population.should_swap(total_collected):
+                population.save_snapshot(best_agent, total_collected)
             _t1 = time.perf_counter()
             profiler.add_time('snapshot_save_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'snapshot_save')
