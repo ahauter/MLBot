@@ -644,29 +644,24 @@ def collect_and_train(
     updater: AsyncUpdater,
     rollout_metrics: RolloutMetricsProvider,
     config: dict,
+    scheduler,
     profiler: Optional[CollectionProfiler] = None,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
 
+    The scheduler controls which agents use which envs each step.
     Returns total environment steps collected.
     """
     from training.abstractions import ActionResult
 
     num_envs = envs.num_envs
     agents = population.agents
-    worker_map = population.worker_assignment  # [agent_idx per worker]
-
-    # Group workers by agent
-    agent_workers: Dict[int, List[int]] = {}
-    for wi, ai in enumerate(worker_map):
-        agent_workers.setdefault(ai, []).append(wi)
-
     rollout_steps = config.get('algorithm', {}).get(
         'params', {}).get('rollout_steps', 2048)
 
     # If all agents are mid-update, yield briefly rather than hot-spinning
     _t0 = time.perf_counter()
-    while not any(agents[ai]._buffer_ready.is_set() for ai in range(len(agents))):
+    while not any(a._buffer_ready.is_set() for a in agents):
         time.sleep(0.005)
     if profiler:
         profiler.add_time('idle_time', time.perf_counter() - _t0)
@@ -678,11 +673,26 @@ def collect_and_train(
 
     episode_returns = np.zeros(num_envs, dtype=np.float32)
     episode_lengths = np.zeros(num_envs, dtype=np.int64)
+    total_steps = 0
+    prev_agents = None
 
-    for _ in range(rollout_steps):
-        # Collect actions from all agents sequentially
+    scheduler.on_round_start()
+
+    for agent_workers in scheduler.iter_steps(rollout_steps):
+        # Detect agent rotation (for serial scheduler) — reset envs
+        current_agents = frozenset(agent_workers.keys())
+        if prev_agents is not None and current_agents != prev_agents:
+            _t0 = time.perf_counter()
+            obs = envs.reset_all()
+            episode_returns[:] = 0.0
+            episode_lengths[:] = 0
+            if profiler:
+                profiler.add_time('env_reset_time', time.perf_counter() - _t0)
+        prev_agents = current_agents
+
+        # Action selection — only active agents this step
         actions = np.zeros((num_envs, 8), dtype=np.float32)
-        agent_results: Dict[int, ActionResult] = {}
+        agent_results: Dict[int, Any] = {}
 
         _t0 = time.perf_counter()
         for agent_idx, worker_ids in agent_workers.items():
@@ -706,7 +716,7 @@ def collect_and_train(
             if not agent._buffer_ready.is_set():
                 if profiler:
                     profiler.incr('transitions_discarded', len(worker_ids))
-                continue  # update in flight; discard these transitions
+                continue
             result = agent_results[agent_idx]
             agent.store_transition(
                 obs[worker_ids], result,
@@ -717,7 +727,7 @@ def collect_and_train(
         if profiler:
             profiler.add_time('store_transition_time', time.perf_counter() - _t0)
 
-        # Track episodes
+        # Track episodes — credit the agent controlling each worker
         for wi in range(num_envs):
             episode_returns[wi] += rewards[wi]
             episode_lengths[wi] += 1
@@ -725,21 +735,26 @@ def collect_and_train(
                 goal = infos[wi].get('goal', 0)
                 rollout_metrics.on_episode_end(
                     episode_returns[wi], int(episode_lengths[wi]), goal)
-                population.add_score(worker_map[wi], float(goal))
+                for ai, wids in agent_workers.items():
+                    if wi in wids:
+                        population.add_score(ai, float(goal))
+                        break
                 episode_returns[wi] = 0.0
                 episode_lengths[wi] = 0
                 if profiler:
                     profiler.incr('episodes_completed')
 
         obs = next_obs
+        total_steps += num_envs
 
-        # Trigger updates for full buffers; gate immediately so no more writes land
-        for agent_idx, agent in enumerate(agents):
+        # Trigger updates for full buffers
+        for agent_idx in agent_workers:
+            agent = agents[agent_idx]
             if agent.should_update():
                 agent._buffer_ready.clear()
                 updater.trigger(agent, agent_idx)
 
-    return rollout_steps * num_envs
+    return total_steps
 
 
 # ── main training loop ──────────────────────────────────────────────────────
@@ -785,12 +800,20 @@ def train(config: dict):
     FeedbackCls = resolve_or_default(config, 'feedback', NullFeedbackProvider)
     feedback_provider = FeedbackCls()
 
+    # ── resolve collection scheduler ───────────────────────────────────
+    from training.schedulers import InterleavedScheduler
+    SchedulerCls = resolve_or_default(config, 'scheduler', InterleavedScheduler)
+    scheduler = SchedulerCls()
+
     # ── create population ───────────────────────────────────────────────
     from training.algorithms.ppo import Population
     pop_config = config.get('population', {})
     num_agents = pop_config.get('agents', 1)
-    population = Population(num_agents=num_agents, num_workers=num_envs, config={
-                            **config, 'device': device})
+    agent_envs = scheduler.envs_per_agent(num_envs, num_agents)
+    population = Population(num_agents=num_agents, num_workers=num_envs,
+                            config={**config, 'device': device},
+                            envs_per_agent=agent_envs)
+    scheduler.init(population, num_envs, config)
 
     # ── create opponent pool ────────────────────────────────────────────
     PoolCls = resolve_or_default(config, 'opponent_pool', None)
@@ -863,7 +886,7 @@ def train(config: dict):
             # _buffer_ready gates writes while updates are in flight)
             steps = collect_and_train(
                 population, envs, updater, rollout_metrics, config,
-                profiler=profiler)
+                scheduler, profiler=profiler)
             profiler.end_round()
             total_collected += steps
             timing_metrics.add_steps(steps)
