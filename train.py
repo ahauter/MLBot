@@ -217,6 +217,8 @@ def _env_worker(conn: multiprocessing.connection.Connection,
     # Shared opponent state for PPO snapshots (one model for all envs)
     _opponent_encoder = None
     _opponent_policy = None
+    _torch = None
+    _EIDS = None
 
     while True:
         try:
@@ -234,6 +236,26 @@ def _env_worker(conn: multiprocessing.connection.Connection,
         elif cmd == 'step':
             # data is (n, 8) actions
             actions = data
+
+            # Pre-compute all opponent actions in one batched forward pass
+            if _opponent_encoder is not None and n > 1:
+                flat_list = []
+                for e in envs:
+                    stacked = np.stack(list(e._orange_buf), axis=0)
+                    flat_list.append(stacked.ravel().astype(np.float32))
+                batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
+
+                with _torch.no_grad():
+                    x = _torch.tensor(batch, dtype=_torch.float32)
+                    tokens = x.view(
+                        n, envs[0].t_window, -1, TOKEN_FEATURES)
+                    eids = _torch.tensor(_EIDS, dtype=_torch.long)
+                    emb = _opponent_encoder(tokens, eids)
+                    opp_actions, _ = _opponent_policy.act_deterministic(emb)
+                opp_np = opp_actions.cpu().numpy().astype(np.float32)
+                for i, e in enumerate(envs):
+                    e._cached_opp_action = opp_np[i]
+
             obs_list, rewards, dones, infos = [], [], [], []
             for i, env in enumerate(envs):
                 obs, reward, done, truncated, info = env.step(actions[i])
@@ -265,41 +287,44 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                 _opponent_encoder.eval()
                 _opponent_policy.eval()
 
-                # Batched opponent action: one forward pass for all envs
-                import torch as _torch
-                from encoder import ENTITY_TYPE_IDS_1V1 as _EIDS
+                # Import torch/constants once for use in step handler
+                if _torch is None:
+                    import torch as _t
+                    from encoder import ENTITY_TYPE_IDS_1V1 as _e
+                    _torch = _t
+                    _EIDS = _e
 
-                _all_envs = envs  # capture for closure
+                if n > 1:
+                    # Multi-env: monkey-patch to read cached action
+                    # (computed in the step handler above)
+                    import types
 
-                def _batched_opponent_action(self_env):
-                    """Batched opponent inference across all envs in worker."""
-                    # Collect orange obs from every env in this worker
-                    flat_list = []
-                    for e in _all_envs:
-                        stacked = np.stack(list(e._orange_buf), axis=0)
-                        flat_list.append(stacked.ravel().astype(np.float32))
-                    batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
+                    def _cached_opponent_action(self_env):
+                        return self_env._cached_opp_action
 
-                    with _torch.no_grad():
-                        x = _torch.tensor(batch, dtype=_torch.float32)
-                        tokens = x.view(
-                            len(_all_envs), self_env.t_window,
-                            -1, TOKEN_FEATURES)
-                        eids = _torch.tensor(_EIDS, dtype=_torch.long)
-                        emb = _opponent_encoder(tokens, eids)
-                        actions, _ = _opponent_policy.act_deterministic(emb)
-                    all_actions = actions.cpu().numpy().astype(np.float32)
+                    for env in envs:
+                        env._cached_opp_action = np.zeros(8, dtype=np.float32)
+                        env._get_opponent_action = types.MethodType(
+                            _cached_opponent_action, env)
+                else:
+                    # Single env: inline forward pass (no caching needed)
+                    import types
 
-                    # Find this env's index and return its action
-                    for idx, e in enumerate(_all_envs):
-                        if e is self_env:
-                            return all_actions[idx]
-                    return all_actions[0]  # fallback
+                    def _single_opponent_action(self_env):
+                        stacked = np.stack(list(self_env._orange_buf), axis=0)
+                        flat_obs = stacked.ravel().astype(np.float32)
+                        with _torch.no_grad():
+                            x = _torch.tensor(
+                                flat_obs[np.newaxis], dtype=_torch.float32)
+                            tokens = x.view(
+                                1, self_env.t_window, -1, TOKEN_FEATURES)
+                            eids = _torch.tensor(_EIDS, dtype=_torch.long)
+                            emb = _opponent_encoder(tokens, eids)
+                            action, _ = _opponent_policy.act_deterministic(emb)
+                        return action[0].cpu().numpy().astype(np.float32)
 
-                import types
-                for env in envs:
-                    env._get_opponent_action = types.MethodType(
-                        _batched_opponent_action, env)
+                    envs[0]._get_opponent_action = types.MethodType(
+                        _single_opponent_action, envs[0])
             conn.send(('ok',))
 
         elif cmd == 'close':
