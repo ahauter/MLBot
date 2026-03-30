@@ -10,9 +10,10 @@ scheduler:
 seed: 0
 total_steps: 5e7
 num_envs: 8
-envs_per_worker: 1
+envs_per_worker: 16
 eval_interval: 1e5
 t_window: 8
+log_interval: 100
 
 population:
   agents: 4
