@@ -14,6 +14,19 @@ Each snapshot contains N entity tokens (N varies by game mode):
 
 TOKEN_FEATURES = 10.  All values individually normalised to [-1, 1].
 
+Rotation conversion (GPU-side)
+------------------------------
+Tokens are stored with Euler angles (yaw/π, pitch/π, roll/π) in features 6-8.
+Inside forward(), car tokens are expanded on-GPU from 10 to 13 features by
+replacing the 3 Euler angles with 6 direction-vector components:
+
+  [fwd_x, fwd_y, fwd_z, up_x, up_y, up_z]
+
+These unit-vector components are naturally in [-1, 1] and avoid the
+wraparound discontinuity and gimbal-lock issues of Euler angles.
+The conversion uses torch.no_grad() — no backprop through sin/cos.
+ENCODER_INPUT_DIM = 13 is the feature width after expansion.
+
 Entity type IDs (shared contract across all game modes):
     0 = ball
     1 = own car
@@ -63,8 +76,9 @@ MAX_TIME     = 300.0
 
 # ── token dimensions ──────────────────────────────────────────────────────────
 
-TOKEN_FEATURES = 10
-D_MODEL        = 64
+TOKEN_FEATURES    = 10   # stored feature width (Euler angles in slots 6-8)
+ENCODER_INPUT_DIM = 13   # after GPU-side Euler → forward+up expansion
+D_MODEL           = 64
 
 # N_TOKENS=10 kept for backward compatibility with 1v1 tokenisers.
 # New code should read N from the token array shape, not this constant.
@@ -83,6 +97,41 @@ N_ENTITY_TYPES = 5   # ball=0, own_car=1, opp_car=2, boost_pad=3, game_state=4
 ENTITY_TYPE_IDS_1V1: List[int] = [0, 1, 2, 3, 3, 3, 3, 3, 3, 4]
 
 _N_BIG_PADS = 6
+
+
+# ── Euler → forward/up conversion (GPU-side) ─────────────────────────────────
+
+def _euler_features_to_forward_up(x: torch.Tensor) -> torch.Tensor:
+    """Replace Euler angle features [6:9] with forward+up vectors [6:12].
+
+    Input:  (*, F)  where F >= 10, features 6/7/8 = yaw/π, pitch/π, roll/π
+    Output: (*, F+3) — features 6-11 = [fwd_x, fwd_y, fwd_z, up_x, up_y, up_z],
+                       original feature 9 (boost/etc) moves to index 12.
+
+    Runs under torch.no_grad() — no backprop through sin/cos.
+    """
+    # Recover radians from the normalised [-1, 1] storage.
+    yaw   = x[..., 6] * math.pi
+    pitch = x[..., 7] * math.pi
+    roll  = x[..., 8] * math.pi
+
+    cy, sy = torch.cos(yaw),   torch.sin(yaw)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cr, sr = torch.cos(roll),  torch.sin(roll)
+
+    # Same rotation-matrix decomposition as src/util/orientation.py.
+    fwd_x = cp * cy
+    fwd_y = cp * sy
+    fwd_z = sp
+    up_x  = -cr * cy * sp - sr * sy
+    up_y  = -cr * sy * sp + sr * cy
+    up_z  = cp * cr
+
+    # Stack the six direction components: (*, 6)
+    dir_vec = torch.stack([fwd_x, fwd_y, fwd_z, up_x, up_y, up_z], dim=-1)
+
+    # Reassemble: [pos+vel (0:6), dir_vec (6), remaining (9:)]
+    return torch.cat([x[..., :6], dir_vec, x[..., 9:]], dim=-1)
 
 
 # ── causal mask ───────────────────────────────────────────────────────────────
@@ -281,7 +330,7 @@ class SharedTransformerEncoder(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        self.input_projection = nn.Linear(TOKEN_FEATURES, d_model)
+        self.input_projection = nn.Linear(ENCODER_INPUT_DIM, d_model)
 
         # Entity type embedding — replaces the old slot-indexed pos_embedding.
         # Keyed by entity type ID (0-4), shared across all game modes.
@@ -326,6 +375,8 @@ class SharedTransformerEncoder(nn.Module):
             entity_type_ids = entity_type_ids[entity_perm]
 
         x = tokens.reshape(batch, T * N, F)
+        with torch.no_grad():
+            x = _euler_features_to_forward_up(x)              # (batch, T*N, 13)
         x = self.input_projection(x)                          # (batch, T*N, D)
 
         # Entity type embeddings — tiled across T timesteps
@@ -361,5 +412,16 @@ class SharedTransformerEncoder(nn.Module):
         state = torch.load(path, map_location='cpu', weights_only=True)
         # Migration: old checkpoints have pos_embedding — drop it silently.
         state.pop('pos_embedding', None)
+        # Migration: old checkpoints have input_projection sized for
+        # TOKEN_FEATURES=10 (Euler angles).  Expand to ENCODER_INPUT_DIM=13
+        # (forward+up vectors).  New columns start at zero so the model
+        # initially ignores the direction features until fine-tuned.
+        old_w = state.get('input_projection.weight')
+        if old_w is not None and old_w.shape[1] == TOKEN_FEATURES:
+            new_w = torch.zeros(old_w.shape[0], ENCODER_INPUT_DIM)
+            new_w[:, :6]  = old_w[:, :6]   # pos + vel unchanged
+            new_w[:, 12:] = old_w[:, 9:]   # boost / trailing features
+            # cols 6-11 (forward+up) start at zero
+            state['input_projection.weight'] = new_w
         model.load_state_dict(state, strict=False)
         return model

@@ -83,9 +83,9 @@ python -m pytest training/tests/
 
 Flat vector: **(800,)** = 8 frames x 10 tokens x 10 features, all normalized to [-1, 1].
 
-**Token layout (1v1, 10 tokens):**
+**Token layout (1v1, 10 tokens) — stored format:**
 
-| Slot | Entity | Features |
+| Slot | Entity | Features (TOKEN_FEATURES=10) |
 |------|--------|----------|
 | 0 | Ball | x, y, z, vx, vy, vz, av_x, av_y, av_z, 0 |
 | 1 | Own car | x, y, z, vx, vy, vz, yaw, pitch, roll, boost |
@@ -93,13 +93,25 @@ Flat vector: **(800,)** = 8 frames x 10 tokens x 10 features, all normalized to 
 | 3-8 | Big boost pads (6) | x, y, z, active, 0, 0, 0, 0, 0, 0 |
 | 9 | Game state | score_diff, time_rem, overtime, 0, ... |
 
+**GPU-side rotation expansion:** Inside `encoder.forward()`, car token Euler angles
+(features 6-8) are converted to forward+up unit vectors (6 components) under
+`torch.no_grad()`. This expands each token from 10 to 13 features
+(ENCODER_INPUT_DIM=13) before the linear projection. The expansion avoids
+wraparound discontinuities and gimbal lock inherent in Euler angles. Non-car
+tokens receive zero-padding in the extra 3 slots.
+
+| Slot | Internal features after expansion (ENCODER_INPUT_DIM=13) |
+|------|----------|
+| 1, 2 (cars) | x, y, z, vx, vy, vz, **fwd_x, fwd_y, fwd_z, up_x, up_y, up_z**, boost |
+
 Entity type IDs: ball=0, own_car=1, opp_car=2, boost_pad=3, game_state=4.
 
 ### Encoder
 
 `SharedTransformerEncoder` in `src/encoder.py`:
 - Input: (batch, T, N, F) where T=8 frames, N=10 tokens, F=10 features
-- Linear projection F → D_MODEL (64)
+- GPU-side Euler → forward+up expansion: F=10 → 13 (no backprop through trig)
+- Linear projection 13 → D_MODEL (64)
 - Entity type embedding (5 types) + time embedding (T positions)
 - 2 transformer layers, 4 heads, FFN dim 128, pre-norm
 - Output: **(batch, 64)** — mean pool over most-recent timestep tokens
