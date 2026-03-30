@@ -16,8 +16,10 @@ opponent_pool:
 seed: 0
 total_steps: 5e7
 num_envs: 8
+envs_per_worker: 16
 eval_interval: 1e5
 t_window: 8
+log_interval: 100
 
 wandb:
   project: ppo-pop-0

@@ -13,6 +13,7 @@ opponent_pool:
 
 seed: 0
 total_steps: 100000
+envs_per_worker: 16
 num_envs: 8
 t_window: 8
 log_interval: 5

@@ -53,6 +53,7 @@ UNIVERSAL_DEFAULTS = {
     'eval_interval': 200_000,
     't_window': 8,
     'num_envs': 8,
+    'envs_per_worker': 1,
     'reward_type': 'sparse',
     'model_dir': 'models/baseline',
     'log_interval': 10,
@@ -183,18 +184,36 @@ class NullFeedbackProvider:
 def _env_worker(conn: multiprocessing.connection.Connection,
                 t_window: int, reward_type: str,
                 dense_reward_weights: Optional[dict] = None,
-                env_class: Optional[str] = None):
-    """Child process: owns one gym env, responds to commands."""
+                env_class: Optional[str] = None,
+                envs_per_worker: int = 1):
+    """Child process: owns one or more gym envs, responds to commands.
+
+    When envs_per_worker > 1, multiple rlgym-sim arenas run in a single
+    process.  Opponent inference is batched across all arenas so the
+    encoder+policy forward pass runs once at batch=N instead of N times
+    at batch=1.
+    """
     if env_class:
         EnvCls = load_class(env_class)
     else:
         from training.environments.baseline_env import BaselineGymEnv
         EnvCls = BaselineGymEnv
-    env = EnvCls(
-        t_window=t_window,
-        reward_type=reward_type,
-        dense_reward_weights=dense_reward_weights,
-    )
+
+    n = envs_per_worker
+    envs = [
+        EnvCls(
+            t_window=t_window,
+            reward_type=reward_type,
+            dense_reward_weights=dense_reward_weights,
+        )
+        for _ in range(n)
+    ]
+
+    # Shared opponent state for PPO snapshots (one model for all envs)
+    _opponent_encoder = None
+    _opponent_policy = None
+    _torch = None
+    _EIDS = None
 
     while True:
         try:
@@ -203,25 +222,133 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             break
 
         if cmd == 'reset':
-            obs, info = env.reset()
-            conn.send(('obs', obs, info))
+            obs_list = []
+            for env in envs:
+                obs, _info = env.reset()
+                obs_list.append(obs)
+            conn.send(('obs', np.stack(obs_list, axis=0)))
 
         elif cmd == 'step':
-            obs, reward, done, truncated, info = env.step(data)
-            conn.send(('step', obs, reward, done, truncated, info))
+            # data is (n, 8) actions
+            actions = data
+
+            # Pre-compute all opponent actions in one batched forward pass
+            if _opponent_encoder is not None and n > 1:
+                flat_list = []
+                for e in envs:
+                    stacked = np.stack(list(e._orange_buf), axis=0)
+                    flat_list.append(stacked.ravel().astype(np.float32))
+                batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
+
+                with _torch.no_grad():
+                    x = _torch.tensor(batch, dtype=_torch.float32)
+                    tokens = x.view(
+                        n, envs[0].t_window, -1, TOKEN_FEATURES)
+                    eids = _torch.tensor(_EIDS, dtype=_torch.long)
+                    emb = _opponent_encoder(tokens, eids)
+                    opp_actions, _ = _opponent_policy.act_deterministic(emb)
+                opp_np = opp_actions.cpu().numpy().astype(np.float32)
+                for i, e in enumerate(envs):
+                    e._cached_opp_action = opp_np[i]
+
+            obs_list, rewards, dones, infos = [], [], [], []
+            for i, env in enumerate(envs):
+                obs, reward, done, truncated, info = env.step(actions[i])
+                obs_list.append(obs)
+                rewards.append(reward)
+                dones.append(done)
+                infos.append(info)
+            conn.send((
+                'step',
+                np.stack(obs_list, axis=0),
+                np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.float32),
+                infos,
+            ))
 
         elif cmd == 'get_opponent_obs':
-            obs = env.get_opponent_obs()
-            conn.send(('opponent_obs', obs))
+            obs_list = []
+            for env in envs:
+                obs_list.append(env.get_opponent_obs())
+            conn.send(('opponent_obs', np.stack(obs_list, axis=0)))
 
         elif cmd == 'step_with_opp':
-            blue_action, opp_action = data
-            obs, reward, done, truncated, info = env.step_with_opponent_action(
-                blue_action, opp_action)
-            conn.send(('step', obs, reward, done, truncated, info))
+            blue_actions, opp_actions = data  # (n, 8) each
+            obs_list, rewards, dones, infos = [], [], [], []
+            for i, env in enumerate(envs):
+                obs, reward, done, truncated, info = env.step_with_opponent_action(
+                    blue_actions[i], opp_actions[i])
+                obs_list.append(obs)
+                rewards.append(reward)
+                dones.append(done)
+                infos.append(info)
+            conn.send((
+                'step',
+                np.stack(obs_list, axis=0),
+                np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.float32),
+                infos,
+            ))
+
+        elif cmd == 'set_opponent_snapshot':
+            snap_path = data
+            if snap_path is not None:
+                from training.opponents.pool import load_opponent_from_snapshot
+                weights = load_opponent_from_snapshot(snap_path, device='cpu')
+                from encoder import SharedTransformerEncoder, D_MODEL
+                from policy_head import StochasticPolicyHead
+                if _opponent_encoder is None:
+                    _opponent_encoder = SharedTransformerEncoder(
+                        d_model=D_MODEL)
+                    _opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
+                _opponent_encoder.load_state_dict(weights['encoder'])
+                _opponent_policy.load_state_dict(weights['policy'])
+                _opponent_encoder.eval()
+                _opponent_policy.eval()
+
+                # Import torch/constants once for use in step handler
+                if _torch is None:
+                    import torch as _t
+                    from encoder import ENTITY_TYPE_IDS_1V1 as _e
+                    _torch = _t
+                    _EIDS = _e
+
+                if n > 1:
+                    # Multi-env: monkey-patch to read cached action
+                    # (computed in the step handler above)
+                    import types
+
+                    def _cached_opponent_action(self_env):
+                        return self_env._cached_opp_action
+
+                    for env in envs:
+                        env._cached_opp_action = np.zeros(8, dtype=np.float32)
+                        env._get_opponent_action = types.MethodType(
+                            _cached_opponent_action, env)
+                else:
+                    # Single env: inline forward pass (no caching needed)
+                    import types
+
+                    def _single_opponent_action(self_env):
+                        stacked = np.stack(list(self_env._orange_buf), axis=0)
+                        flat_obs = stacked.ravel().astype(np.float32)
+                        with _torch.no_grad():
+                            x = _torch.tensor(
+                                flat_obs[np.newaxis], dtype=_torch.float32)
+                            tokens = x.view(
+                                1, self_env.t_window, -1, TOKEN_FEATURES)
+                            eids = _torch.tensor(_EIDS, dtype=_torch.long)
+                            emb = _opponent_encoder(tokens, eids)
+                            action, _ = _opponent_policy.act_deterministic(emb)
+                        return action[0].cpu().numpy().astype(np.float32)
+
+                    envs[0]._get_opponent_action = types.MethodType(
+                        _single_opponent_action, envs[0])
+            conn.send(('ok',))
 
         elif cmd == 'close':
-            env.close()
+            for env in envs:
+                env.close()
             conn.send(('closed',))
             break
 
@@ -230,22 +357,39 @@ def _env_worker(conn: multiprocessing.connection.Connection,
 
 
 class SubprocVecEnv:
-    """Vectorized environment using subprocesses."""
+    """Vectorized environment using subprocesses.
+
+    Each worker process can manage multiple rlgym-sim arenas
+    (controlled by ``envs_per_worker``).  This reduces IPC overhead
+    and enables batched opponent inference within each worker.
+
+    Parameters
+    ----------
+    num_envs : int
+        Number of worker processes to spawn.
+    envs_per_worker : int
+        Number of arenas per subprocess.  Default 1 preserves the
+        original one-process-per-env behaviour.  Total logical
+        environments = ``num_envs * envs_per_worker``.
+    """
 
     def __init__(self, num_envs: int, t_window: int = 8,
                  reward_type: str = 'sparse',
                  dense_reward_weights: Optional[dict] = None,
-                 env_class: Optional[str] = None):
-        self.num_envs = num_envs
+                 env_class: Optional[str] = None,
+                 envs_per_worker: int = 1):
+        self.num_workers = num_envs
+        self.envs_per_worker = envs_per_worker
+        self.num_envs = num_envs * envs_per_worker  # total logical envs
         self.parents: List[multiprocessing.connection.Connection] = []
         self.procs: List[multiprocessing.Process] = []
 
-        for i in range(num_envs):
+        for i in range(self.num_workers):
             parent_conn, child_conn = multiprocessing.Pipe()
             proc = multiprocessing.Process(
                 target=_env_worker,
                 args=(child_conn, t_window, reward_type, dense_reward_weights,
-                      env_class),
+                      env_class, envs_per_worker),
                 daemon=True,
             )
             proc.start()
@@ -259,23 +403,26 @@ class SubprocVecEnv:
             conn.send(('reset', None))
         obs_list = []
         for conn in self.parents:
-            tag, obs, info = conn.recv()
-            obs_list.append(obs)
-        return np.stack(obs_list, axis=0)
+            tag, obs_batch = conn.recv()
+            obs_list.append(obs_batch)  # (envs_per_worker, obs_dim)
+        return np.concatenate(obs_list, axis=0)  # (num_envs, obs_dim)
 
     def step(self, actions: np.ndarray):
         """Step all envs. Returns (obs, rewards, dones, infos)."""
+        epw = self.envs_per_worker
         for i, conn in enumerate(self.parents):
-            conn.send(('step', actions[i]))
-        obs_list, rewards, dones, infos = [], [], [], []
+            conn.send(('step', actions[i * epw:(i + 1) * epw]))
+        obs_list, rew_list, done_list, infos = [], [], [], []
         for conn in self.parents:
-            tag, obs, reward, done, truncated, info = conn.recv()
-            obs_list.append(obs)
-            rewards.append(reward)
-            dones.append(done)
-            infos.append(info)
-        return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.float32), infos)
+            tag, obs_batch, rew_batch, done_batch, info_batch = conn.recv()
+            obs_list.append(obs_batch)
+            rew_list.append(rew_batch)
+            done_list.append(done_batch)
+            infos.extend(info_batch)
+        return (np.concatenate(obs_list, axis=0),
+                np.concatenate(rew_list, axis=0),
+                np.concatenate(done_list, axis=0),
+                infos)
 
     def get_opponent_obs(self) -> np.ndarray:
         """Get stacked orange observations from all envs. Returns (num_envs, obs_dim)."""
@@ -283,24 +430,45 @@ class SubprocVecEnv:
             conn.send(('get_opponent_obs', None))
         obs_list = []
         for conn in self.parents:
-            tag, obs = conn.recv()
-            obs_list.append(obs)
-        return np.stack(obs_list, axis=0)
+            tag, obs_batch = conn.recv()
+            obs_list.append(obs_batch)  # (envs_per_worker, obs_dim)
+        return np.concatenate(obs_list, axis=0)  # (num_envs, obs_dim)
 
     def step_with_opponent_actions(self, blue_actions: np.ndarray,
                                    opp_actions: np.ndarray):
         """Step all envs with pre-computed opponent actions. Same return as step()."""
+        epw = self.envs_per_worker
         for i, conn in enumerate(self.parents):
-            conn.send(('step_with_opp', (blue_actions[i], opp_actions[i])))
-        obs_list, rewards, dones, infos = [], [], [], []
+            conn.send(('step_with_opp', (
+                blue_actions[i * epw:(i + 1) * epw],
+                opp_actions[i * epw:(i + 1) * epw],
+            )))
+        obs_list, rew_list, done_list, infos = [], [], [], []
         for conn in self.parents:
-            tag, obs, reward, done, truncated, info = conn.recv()
-            obs_list.append(obs)
-            rewards.append(reward)
-            dones.append(done)
-            infos.append(info)
-        return (np.stack(obs_list), np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.float32), infos)
+            tag, obs_batch, rew_batch, done_batch, info_batch = conn.recv()
+            obs_list.append(obs_batch)
+            rew_list.append(rew_batch)
+            done_list.append(done_batch)
+            infos.extend(info_batch)
+        return (np.concatenate(obs_list, axis=0),
+                np.concatenate(rew_list, axis=0),
+                np.concatenate(done_list, axis=0),
+                infos)
+
+    def set_opponent_snapshot(self, snap_path: Optional[str], worker_indices=None):
+        """Set opponent snapshot for specified workers (or all).
+
+        ``worker_indices`` are *env* indices (0..num_envs-1). The
+        corresponding worker processes are deduced automatically.
+        """
+        if worker_indices is None:
+            worker_ids = set(range(self.num_workers))
+        else:
+            worker_ids = {i // self.envs_per_worker for i in worker_indices}
+        for wi in worker_ids:
+            self.parents[wi].send(('set_opponent_snapshot', snap_path))
+        for wi in worker_ids:
+            self.parents[wi].recv()
 
     def close(self):
         for conn in self.parents:
@@ -578,7 +746,9 @@ class CollectionProfiler:
         sched_cfg = config.get('scheduler', {})
         lines.append('## Config')
         lines.append(f'- Agents: {pop_cfg.get("agents", 1)}')
-        lines.append(f'- Envs: {config.get("num_envs", 8)}')
+        _ne = config.get('num_envs', 8)
+        _epw = config.get('envs_per_worker', 1)
+        lines.append(f'- Workers: {_ne}, envs_per_worker: {_epw}, total_envs: {_ne * _epw}')
         lines.append(f'- Scheduler: {sched_cfg.get("class", "InterleavedScheduler")}')
         lines.append(f'- rollout_steps: {algo_params.get("rollout_steps", 2048)}')
         lines.append(f'- minibatch_size: {algo_params.get("minibatch_size", "N/A")}')
@@ -625,8 +795,8 @@ class CollectionProfiler:
                 steps_per_round = int(np.mean(collected_vals))
             else:
                 rollout_steps = algo_params.get('rollout_steps', 2048)
-                num_envs = config.get('num_envs', 8)
-                steps_per_round = rollout_steps * num_envs
+                _total = config.get('num_envs', 8) * config.get('envs_per_worker', 1)
+                steps_per_round = rollout_steps * _total
             sps = steps_per_round / rt_mean
             lines.append(f'## Throughput')
             lines.append(f'- Steps per round: {steps_per_round:,}')
@@ -1009,15 +1179,17 @@ def train(config: dict):
     pool_params = config.get('opponent_pool', {}).get('params', {})
     num_agents = pool_params.get('agents', 1)
     snapshot_dir = config.get('snapshot_dir', 'models/snapshots')
-    agent_envs = scheduler.envs_per_agent(num_envs, num_agents)
+    envs_per_worker = config.get('envs_per_worker', 1)
+    total_envs = num_envs * envs_per_worker
+    agent_envs = scheduler.envs_per_agent(total_envs, num_agents)
     population = PopCls(
-        num_agents=num_agents, num_workers=num_envs,
+        num_agents=num_agents, num_workers=total_envs,
         config={**config, 'device': device},
         envs_per_agent=agent_envs,
         snapshot_dir=snapshot_dir,
         **{k: v for k, v in pool_params.items() if k not in ('agents',)},
     )
-    scheduler.init(population, num_envs, config)
+    scheduler.init(population, total_envs, config)
 
     # ── create vectorized envs ──────────────────────────────────────────
     dense_weights = config.get('dense_reward_weights', None)
@@ -1028,6 +1200,7 @@ def train(config: dict):
         reward_type=reward_type,
         dense_reward_weights=dense_weights,
         env_class=env_class,
+        envs_per_worker=envs_per_worker,
     )
 
     # ── seed from replay data ───────────────────────────────────────────
