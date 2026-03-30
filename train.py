@@ -1246,6 +1246,7 @@ def train(config: dict):
     gen_steps = pool_params.get('generation_steps', 1_000_000)
     noise_scale = pool_params.get('generation_noise_scale', 0.01)
     last_gen_step = 0
+    generation_pending = False
 
     print(f'[train] {num_agents} agent(s), {num_envs} envs, '
           f'rollout_steps={config.get("algorithm", {}).get("params", {}).get("rollout_steps", 2048)}')
@@ -1255,6 +1256,31 @@ def train(config: dict):
     try:
         while total_collected < total_steps:
             profiler.start_round()
+
+            # Deferred generation cycle — executes at the TOP of the loop
+            # so GPU updates from the previous round overlap with between-
+            # round ops. By now the updates have had time to finish.
+            _t0 = time.perf_counter()
+            if generation_pending:
+                for a in population.agents:
+                    a._buffer_ready.wait()
+                gen_metrics = {f'population/{k}': v
+                               for k, v in population.get_metrics().items()}
+                logger.log(total_collected, **gen_metrics)
+                ranked = population.rank_agents()
+                best = population.agents[ranked[0]]
+                if len(ranked) > 1:
+                    worst_idx = ranked[-1]
+                    population.agents[worst_idx].clone_from(
+                        best, noise_scale=noise_scale)
+                    print(f'[gen {population.generation}] '
+                          f'best=agent_{ranked[0]}  worst=agent_{worst_idx} (reset)')
+                population.reset_scores()
+                last_gen_step = total_collected
+                generation_pending = False
+            _t1 = time.perf_counter()
+            profiler.add_time('generation_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'generation')
 
             # Sample opponent snapshot and load onto GPU
             if population.num_snapshots() > 0:
@@ -1325,29 +1351,9 @@ def train(config: dict):
             profiler.add_time('snapshot_save_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'snapshot_save')
 
-            # Population generation cycle — wait for all updates before mutating weights
-            _t0 = time.perf_counter()
+            # Mark generation as pending (deferred to top of next iteration)
             if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
-                for a in population.agents:
-                    a._buffer_ready.wait()  # blocks until this agent's update finishes
-                # Log per-agent stats before scores are cleared
-                gen_metrics = {f'population/{k}': v
-                               for k, v in population.get_metrics().items()}
-                logger.log(total_collected, **gen_metrics)
-                ranked = population.rank_agents()
-                best = population.agents[ranked[0]]
-                # Reset worst from best + noise
-                if len(ranked) > 1:
-                    worst_idx = ranked[-1]
-                    population.agents[worst_idx].clone_from(
-                        best, noise_scale=noise_scale)
-                    print(f'[gen {population.generation}] '
-                          f'best=agent_{ranked[0]}  worst=agent_{worst_idx} (reset)')
-                population.reset_scores()
-                last_gen_step = total_collected
-            _t1 = time.perf_counter()
-            profiler.add_time('generation_time', _t1 - _t0)
-            profiler.record_event(_t0, _t1, 'generation')
+                generation_pending = True
 
             # Checkpoint
             _t0 = time.perf_counter()

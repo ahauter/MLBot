@@ -274,7 +274,7 @@ class PPOAlgorithm(Algorithm):
             'max_grad_norm': 0.5,
             'rollout_steps': 2048,
             'ppo_epochs': 4,
-            'minibatch_size': 512,
+            'minibatch_size': 2048,
         }
 
     @classmethod
@@ -286,7 +286,7 @@ class PPOAlgorithm(Algorithm):
             'algorithm.params.ent_coef': {'type': 'float', 'low': 0.001, 'high': 0.1, 'log': True},
             'algorithm.params.gae_lambda': {'type': 'float', 'low': 0.9, 'high': 1.0},
             'algorithm.params.ppo_epochs': {'type': 'int', 'low': 2, 'high': 10},
-            'algorithm.params.minibatch_size': {'type': 'categorical', 'choices': [32, 64, 128, 256]},
+            'algorithm.params.minibatch_size': {'type': 'categorical', 'choices': [256, 512, 1024, 2048]},
         }
 
     def _encode(self, obs: np.ndarray) -> torch.Tensor:
