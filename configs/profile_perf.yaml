@@ -20,6 +20,8 @@ population:
 profiling:
   enabled: true
   report: models/profiling_report.md
+  waterfall: models/waterfall.png
+  waterfall_rounds: 2
 
 wandb:
   enabled: false
