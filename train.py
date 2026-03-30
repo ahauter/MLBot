@@ -582,11 +582,16 @@ class CollectionProfiler:
         lines.append(f'| **round total** | **{rt_mean:.4f}** | **{rt_std:.4f}** | **100%** |')
         lines.append('')
 
-        # Throughput
+        # Throughput — use actual transitions_collected if available,
+        # otherwise fall back to config-based estimate
         if rt_mean > 0:
-            rollout_steps = algo_params.get('rollout_steps', 2048)
-            num_envs = config.get('num_envs', 8)
-            steps_per_round = rollout_steps * num_envs
+            collected_vals = [s.get('transitions_collected', 0) for s in history]
+            if any(c > 0 for c in collected_vals):
+                steps_per_round = int(np.mean(collected_vals))
+            else:
+                rollout_steps = algo_params.get('rollout_steps', 2048)
+                num_envs = config.get('num_envs', 8)
+                steps_per_round = rollout_steps * num_envs
             sps = steps_per_round / rt_mean
             lines.append(f'## Throughput')
             lines.append(f'- Steps per round: {steps_per_round:,}')
