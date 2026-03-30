@@ -10,8 +10,6 @@ num_envs: 8
 t_window: 8
 log_interval: 5
 
-env_class: training.environments.dummy_env.DummyEnv
-
 population:
   agents: 4
   generation_steps: 10000
