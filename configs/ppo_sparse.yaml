@@ -2,18 +2,17 @@ algorithm:
   class: training.algorithms.ppo.PPOAlgorithm
 
 opponent_pool:
-  class: training.opponents.pool.HistoricalOpponentPool
+  class: training.opponents.population.Population
+  params:
+    agents: 4
+    generation_steps: 1000000
+    generation_noise_scale: 0.01
 
 seed: 0
 total_steps: 50000000
 num_envs: 8
 eval_interval: 200000
 t_window: 8
-
-population:
-  agents: 4
-  generation_steps: 1000000
-  generation_noise_scale: 0.01
 
 wandb:
   project: ppo-tuning

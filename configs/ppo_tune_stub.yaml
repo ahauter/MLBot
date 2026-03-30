@@ -2,7 +2,7 @@ algorithm:
   class: training.algorithms.ppo.PPOAlgorithm
 
 opponent_pool:
-  class: training.opponents.pool.HistoricalOpponentPool
+  class: training.opponents.population.Population
 
 num_envs: 4
 

@@ -22,7 +22,8 @@ sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO))
 
 from training.environments.dummy_env import DummyEnv
-from training.algorithms.ppo import PPOAlgorithm, RolloutBuffer, Population
+from training.algorithms.ppo import PPOAlgorithm, RolloutBuffer
+from training.opponents.population import Population
 from training.abstractions import Algorithm, ActionResult
 from training.opponents.pool import HistoricalOpponentPool, load_opponent_from_snapshot
 from training.loggers.stdout import StdoutLogger
@@ -469,6 +470,9 @@ class TestConfigLoading:
         assert config['algorithm']['cls'].__name__ == 'PPOAlgorithm'
         assert 'lr' in config['algorithm']['params']
         assert config['algorithm']['params']['rollout_steps'] == 2048
+        # opponent_pool should resolve to Population
+        assert config['opponent_pool']['cls'].__name__ == 'Population'
+        assert 'agents' in config['opponent_pool']['params']
 
     def test_yaml_overrides_defaults(self):
         from train import load_config

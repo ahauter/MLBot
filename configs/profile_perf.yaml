@@ -4,16 +4,18 @@ algorithm:
 scheduler:
   class: training.schedulers.SerialScheduler
 
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 4
+    generation_steps: 10000
+    generation_noise_scale: 0.01
+
 seed: 0
 total_steps: 100000
 num_envs: 8
 t_window: 8
 log_interval: 5
-
-population:
-  agents: 4
-  generation_steps: 10000
-  generation_noise_scale: 0.01
 
 profiling:
   enabled: true

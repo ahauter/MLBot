@@ -7,15 +7,17 @@ reward:
 scheduler:
   class: training.schedulers.SerialScheduler
 
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 4
+    generation_steps: 1e5
+
 seed: 0
 total_steps: 5e7
 num_envs: 8
 eval_interval: 1e5
 t_window: 8
-
-population:
-  agents: 4
-  generation_steps: 1e5
 
 wandb:
   project: ppo-pop-0

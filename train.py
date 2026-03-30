@@ -57,11 +57,6 @@ UNIVERSAL_DEFAULTS = {
     'model_dir': 'models/baseline',
     'log_interval': 10,
     'snapshot_dir': 'models/snapshots',
-    'population': {
-        'agents': 1,
-        'generation_steps': 1_000_000,
-        'generation_noise_scale': 0.01,
-    },
 }
 
 
@@ -1007,19 +1002,20 @@ def train(config: dict):
     SchedulerCls = resolve_or_default(config, 'scheduler', InterleavedScheduler)
     scheduler = SchedulerCls()
 
-    # ── create population (unified agent + opponent pool) ────────────────
-    from training.algorithms.ppo import Population
-    pop_config = config.get('population', {})
-    num_agents = pop_config.get('agents', 1)
+    # ── create population from opponent_pool config ──────────────────────
+    PopCls = config.get('opponent_pool', {}).get('cls')
+    if PopCls is None:
+        from training.opponents.population import Population as PopCls
     pool_params = config.get('opponent_pool', {}).get('params', {})
+    num_agents = pool_params.get('agents', 1)
     snapshot_dir = config.get('snapshot_dir', 'models/snapshots')
     agent_envs = scheduler.envs_per_agent(num_envs, num_agents)
-    population = Population(
+    population = PopCls(
         num_agents=num_agents, num_workers=num_envs,
         config={**config, 'device': device},
         envs_per_agent=agent_envs,
         snapshot_dir=snapshot_dir,
-        **pool_params,
+        **{k: v for k, v in pool_params.items() if k not in ('agents',)},
     )
     scheduler.init(population, num_envs, config)
 
@@ -1074,8 +1070,8 @@ def train(config: dict):
     updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
     total_collected = 0
     collection_round = 0
-    gen_steps = pop_config.get('generation_steps', 1_000_000)
-    noise_scale = pop_config.get('generation_noise_scale', 0.01)
+    gen_steps = pool_params.get('generation_steps', 1_000_000)
+    noise_scale = pool_params.get('generation_noise_scale', 0.01)
     last_gen_step = 0
 
     print(f'[train] {num_agents} agent(s), {num_envs} envs, '
