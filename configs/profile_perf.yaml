@@ -11,7 +11,7 @@ env_class: training.environments.dummy_env.DummyEnv
 
 population:
   agents: 4
-  generation_steps: 1000000
+  generation_steps: 10000
   generation_noise_scale: 0.01
 
 profiling:
