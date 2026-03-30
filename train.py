@@ -346,12 +346,13 @@ class AsyncUpdater:
     Multiple agents queue up — processed FIFO, one at a time.
     """
 
-    def __init__(self):
+    def __init__(self, profiler: Optional['CollectionProfiler'] = None):
         self._queue: Queue = Queue()
         self._stop = threading.Event()
         self._busy = threading.Event()
         self._results: List = []
         self._lock = threading.Lock()
+        self._profiler = profiler
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -387,7 +388,13 @@ class AsyncUpdater:
             try:
                 _t0 = time.perf_counter()
                 metrics = agent.update()
-                metrics['update_wall_time'] = time.perf_counter() - _t0
+                _t1 = time.perf_counter()
+                metrics['update_wall_time'] = _t1 - _t0
+                # Record GPU timeline event if profiler is attached
+                if self._profiler is not None:
+                    self._profiler.record_event(
+                        _t0, _t1, 'gpu_update', thread='gpu',
+                        agent_id=agent_id)
                 agent.buffer.reset()
                 agent._buffer_ready.set()
                 with self._lock:
@@ -451,17 +458,48 @@ class TimingMetricsProvider:
 # ── collection profiler ─────────────────────────────────────────────────────
 
 class CollectionProfiler:
-    """Per-collection-round wall-clock breakdown and transition counters.
+    """Training loop profiler with per-round timing, counters, and waterfall chart.
 
     Follows the MetricsRegistry provider contract: get_metrics() -> dict.
     Uses time.perf_counter() for sub-microsecond monotonic timing.
+
+    Every phase of the training loop has a canonical timing key. The waterfall
+    records absolute start/end timestamps for the first N rounds so a
+    matplotlib chart can show main-thread vs GPU-thread concurrency.
     """
 
-    def __init__(self):
+    # Canonical timing categories — defines report ordering.
+    TIMING_KEYS = [
+        'idle_time',              # waiting for agent buffers to free up
+        'env_reset_time',         # env resets (including agent rotation resets)
+        'action_select_time',     # GPU forward passes for action selection
+        'env_step_time',          # physics sim + subprocess IPC
+        'store_transition_time',  # writing transitions to rollout buffer
+        'episode_tracking_time',  # episode return/length tracking + scoring
+        'opponent_load_time',     # loading opponent snapshot into workers
+        'metrics_drain_time',     # draining AsyncUpdater results + per-agent logging
+        'logging_time',           # registry.collect() + logger.log() + tqdm
+        'snapshot_save_time',     # saving snapshots to opponent pool
+        'generation_time',        # PBT generation cycle (wait/rank/clone/reset)
+        'checkpoint_time',        # saving model checkpoints
+    ]
+
+    COUNTER_KEYS = [
+        'transitions_collected',
+        'transitions_discarded',
+        'episodes_completed',
+    ]
+
+    def __init__(self, waterfall_rounds: int = 0):
         self._timers: Dict[str, float] = {}
         self._counters: Dict[str, int] = {}
         self._history: deque = deque(maxlen=100)
         self._round_start: float = 0.0
+        self._round_count: int = 0
+        # Waterfall: list of (start, end, category, thread, agent_id) tuples
+        self._waterfall_rounds = waterfall_rounds
+        self._timeline: List[tuple] = []
+        self._timeline_lock = threading.Lock()
 
     def start_round(self):
         """Call at the beginning of each collection round."""
@@ -477,11 +515,24 @@ class CollectionProfiler:
         """Increment a named counter."""
         self._counters[name] = self._counters.get(name, 0) + n
 
+    def record_event(self, start: float, end: float, category: str,
+                     thread: str = 'main', agent_id: int = -1):
+        """Record an absolute-time event for the waterfall chart.
+
+        Only records during the first waterfall_rounds rounds.
+        Thread-safe (called from both main and GPU threads).
+        """
+        if self._round_count < self._waterfall_rounds:
+            with self._timeline_lock:
+                self._timeline.append(
+                    (start, end, category, thread, agent_id))
+
     def end_round(self):
         """Call at the end of each collection round. Snapshots current data."""
         total = time.perf_counter() - self._round_start
         snapshot = {**self._timers, 'round_total_time': total, **self._counters}
         self._history.append(snapshot)
+        self._round_count += 1
 
     def get_metrics(self) -> dict:
         """Return latest round's breakdown with absolute times and percentages."""
@@ -499,7 +550,8 @@ class CollectionProfiler:
         return metrics
 
     def generate_report(self, config: dict,
-                        update_times: Optional[List[tuple]] = None) -> str:
+                        update_times: Optional[List[tuple]] = None,
+                        waterfall_path: Optional[str] = None) -> str:
         """Generate a formatted profiling report from collected history.
 
         Parameters
@@ -508,11 +560,8 @@ class CollectionProfiler:
             Training config (for system/hyperparameter context).
         update_times : list of (agent_id, wall_time) tuples, optional
             GPU update wall times collected during training.
-
-        Returns
-        -------
-        str
-            Markdown-formatted report suitable for pasting into a conversation.
+        waterfall_path : str, optional
+            If set, generate a waterfall PNG at this path and embed in report.
         """
         import os
 
@@ -520,13 +569,6 @@ class CollectionProfiler:
             return '# Profiling Report\n\nNo data collected.\n'
 
         history = list(self._history)
-
-        # Collect all timer and counter keys across rounds
-        timer_keys = sorted({k for snap in history for k in snap
-                             if k.endswith('_time') and k != 'round_total_time'})
-        counter_keys = sorted({k for snap in history for k in snap
-                               if not k.endswith('_time')
-                               and k != 'round_total_time'})
 
         def _stats(values):
             arr = np.array(values, dtype=np.float64)
@@ -554,16 +596,18 @@ class CollectionProfiler:
         # Config summary
         pop_cfg = config.get('population', {})
         algo_params = config.get('algorithm', {}).get('params', {})
+        sched_cfg = config.get('scheduler', {})
         lines.append('## Config')
         lines.append(f'- Agents: {pop_cfg.get("agents", 1)}')
         lines.append(f'- Envs: {config.get("num_envs", 8)}')
+        lines.append(f'- Scheduler: {sched_cfg.get("class", "InterleavedScheduler")}')
         lines.append(f'- rollout_steps: {algo_params.get("rollout_steps", 2048)}')
         lines.append(f'- minibatch_size: {algo_params.get("minibatch_size", "N/A")}')
         lines.append(f'- ppo_epochs: {algo_params.get("ppo_epochs", "N/A")}')
         lines.append(f'- t_window: {config.get("t_window", 8)}')
         lines.append('')
 
-        # Time breakdown table
+        # Time breakdown table — use canonical order
         lines.append('## Per-Round Time Breakdown')
         lines.append('')
         lines.append('| Category | Mean (s) | Std (s) | Mean % |')
@@ -572,9 +616,22 @@ class CollectionProfiler:
         round_totals = [s.get('round_total_time', 0) for s in history]
         rt_mean, rt_std = _stats(round_totals)
 
-        for key in timer_keys:
+        # Canonical keys first, then any extras
+        seen_keys = set()
+        all_timer_keys = list(self.TIMING_KEYS)
+        for snap in history:
+            for k in snap:
+                if k.endswith('_time') and k != 'round_total_time' \
+                        and k not in seen_keys:
+                    if k not in all_timer_keys:
+                        all_timer_keys.append(k)
+                    seen_keys.add(k)
+
+        for key in all_timer_keys:
             vals = [s.get(key, 0.0) for s in history]
             mean, std = _stats(vals)
+            if mean < 0.00005 and key in self.TIMING_KEYS:
+                continue  # skip canonical keys that are exactly zero
             pct = 100.0 * mean / rt_mean if rt_mean > 0 else 0
             label = key.replace('_time', '').replace('_', ' ')
             lines.append(f'| {label} | {mean:.4f} | {std:.4f} | {pct:.1f}% |')
@@ -582,8 +639,7 @@ class CollectionProfiler:
         lines.append(f'| **round total** | **{rt_mean:.4f}** | **{rt_std:.4f}** | **100%** |')
         lines.append('')
 
-        # Throughput — use actual transitions_collected if available,
-        # otherwise fall back to config-based estimate
+        # Throughput
         if rt_mean > 0:
             collected_vals = [s.get('transitions_collected', 0) for s in history]
             if any(c > 0 for c in collected_vals):
@@ -599,12 +655,22 @@ class CollectionProfiler:
             lines.append(f'- Projected steps/hour: {sps * 3600:,.0f}')
             lines.append('')
 
-        # Counters
+        # Counters — canonical order, then extras
         lines.append('## Transition Stats (per round)')
         lines.append('')
         lines.append('| Counter | Mean | Std |')
         lines.append('|---------|------|-----|')
-        for key in counter_keys:
+        seen_counters = set()
+        all_counter_keys = list(self.COUNTER_KEYS)
+        for snap in history:
+            for k in snap:
+                if not k.endswith('_time') and k != 'round_total_time' \
+                        and k not in seen_counters:
+                    if k not in all_counter_keys:
+                        all_counter_keys.append(k)
+                    seen_counters.add(k)
+
+        for key in all_counter_keys:
             vals = [float(s.get(key, 0)) for s in history]
             mean, std = _stats(vals)
             label = key.replace('_', ' ')
@@ -638,7 +704,98 @@ class CollectionProfiler:
                     f'| {min(vals):.3f} | {max(vals):.3f} |')
             lines.append('')
 
+        # Waterfall chart
+        if waterfall_path and self._timeline:
+            try:
+                self._render_waterfall(waterfall_path)
+                # Embed relative path in markdown
+                wf_name = Path(waterfall_path).name
+                lines.append('## Waterfall')
+                lines.append('')
+                lines.append(f'![Waterfall]({wf_name})')
+                lines.append('')
+            except Exception as e:
+                lines.append(f'## Waterfall')
+                lines.append('')
+                lines.append(f'*(generation failed: {e})*')
+                lines.append('')
+
         return '\n'.join(lines)
+
+    def _render_waterfall(self, output_path: str) -> None:
+        """Render a matplotlib waterfall chart of timeline events."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
+        events = list(self._timeline)
+        if not events:
+            return
+
+        # Normalize times to start at 0
+        t_origin = min(e[0] for e in events)
+        events = [(s - t_origin, e - t_origin, cat, thr, aid)
+                  for s, e, cat, thr, aid in events]
+
+        # Color map for categories
+        category_colors = {
+            'idle': '#cccccc',
+            'env_reset': '#8dd3c7',
+            'action_select': '#fb8072',
+            'env_step': '#80b1d3',
+            'store_transition': '#bebada',
+            'episode_tracking': '#fdb462',
+            'opponent_load': '#b3de69',
+            'metrics_drain': '#fccde5',
+            'logging': '#d9d9d9',
+            'snapshot_save': '#bc80bd',
+            'generation': '#ffed6f',
+            'checkpoint': '#ccebc5',
+            'gpu_update': '#ff7f00',
+        }
+
+        def _color(cat: str) -> str:
+            key = cat.replace('_time', '')
+            return category_colors.get(key, '#aaaaaa')
+
+        # Assign y positions: main=1, gpu=0
+        thread_y = {'main': 1.0, 'gpu': 0.0}
+
+        fig, ax = plt.subplots(figsize=(16, 3.5))
+
+        seen_cats = set()
+        for start, end, cat, thread, agent_id in events:
+            y = thread_y.get(thread, 0.5)
+            duration = max(end - start, 0.001)  # avoid zero-width bars
+            color = _color(cat)
+            label_key = cat.replace('_time', '')
+            ax.barh(y, duration, left=start, height=0.6,
+                    color=color, edgecolor='white', linewidth=0.3)
+            # Add agent label on GPU update bars
+            if thread == 'gpu' and agent_id >= 0 and duration > 0.5:
+                ax.text(start + duration / 2, y, f'a{agent_id}',
+                        ha='center', va='center', fontsize=7, color='white',
+                        fontweight='bold')
+            seen_cats.add(label_key)
+
+        ax.set_yticks([0.0, 1.0])
+        ax.set_yticklabels(['gpu', 'main'])
+        ax.set_xlabel('Time (seconds)')
+        ax.set_title('Training Round Waterfall')
+        ax.set_ylim(-0.5, 1.8)
+
+        # Legend — only show categories that appeared
+        patches = [mpatches.Patch(color=category_colors.get(c, '#aaa'), label=c)
+                   for c in sorted(seen_cats) if c in category_colors]
+        if patches:
+            ax.legend(handles=patches, loc='upper right', fontsize=7,
+                      ncol=min(len(patches), 4))
+
+        plt.tight_layout()
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
 
 # ── collect and train ───────────────────────────────────────────────────────
@@ -668,13 +825,17 @@ def collect_and_train(
     _t0 = time.perf_counter()
     while not any(a._buffer_ready.is_set() for a in agents):
         time.sleep(0.005)
+    _t1 = time.perf_counter()
     if profiler:
-        profiler.add_time('idle_time', time.perf_counter() - _t0)
+        profiler.add_time('idle_time', _t1 - _t0)
+        profiler.record_event(_t0, _t1, 'idle')
 
     _t0 = time.perf_counter()
     obs = envs.reset_all()  # (num_envs, obs_dim)
+    _t1 = time.perf_counter()
     if profiler:
-        profiler.add_time('env_reset_time', time.perf_counter() - _t0)
+        profiler.add_time('env_reset_time', _t1 - _t0)
+        profiler.record_event(_t0, _t1, 'env_reset')
 
     episode_returns = np.zeros(num_envs, dtype=np.float32)
     episode_lengths = np.zeros(num_envs, dtype=np.int64)
@@ -691,8 +852,10 @@ def collect_and_train(
             obs = envs.reset_all()
             episode_returns[:] = 0.0
             episode_lengths[:] = 0
+            _t1 = time.perf_counter()
             if profiler:
-                profiler.add_time('env_reset_time', time.perf_counter() - _t0)
+                profiler.add_time('env_reset_time', _t1 - _t0)
+                profiler.record_event(_t0, _t1, 'env_reset')
         prev_agents = current_agents
 
         # Action selection — only active agents this step
@@ -705,14 +868,18 @@ def collect_and_train(
             for local_i, wi in enumerate(worker_ids):
                 actions[wi] = result.action[local_i]
             agent_results[agent_idx] = result
+        _t1 = time.perf_counter()
         if profiler:
-            profiler.add_time('action_select_time', time.perf_counter() - _t0)
+            profiler.add_time('action_select_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'action_select')
 
         # Step all envs
         _t0 = time.perf_counter()
         next_obs, rewards, dones, infos = envs.step(actions)
+        _t1 = time.perf_counter()
         if profiler:
-            profiler.add_time('env_step_time', time.perf_counter() - _t0)
+            profiler.add_time('env_step_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'env_step')
 
         # Store transitions — skip agents whose buffer is being updated
         _t0 = time.perf_counter()
@@ -729,10 +896,13 @@ def collect_and_train(
                 dones[worker_ids], {})
             if profiler:
                 profiler.incr('transitions_collected', len(worker_ids))
+        _t1 = time.perf_counter()
         if profiler:
-            profiler.add_time('store_transition_time', time.perf_counter() - _t0)
+            profiler.add_time('store_transition_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'store_transition')
 
         # Track episodes — credit the agent controlling each worker
+        _t0 = time.perf_counter()
         for wi in range(num_envs):
             episode_returns[wi] += rewards[wi]
             episode_lengths[wi] += 1
@@ -748,6 +918,9 @@ def collect_and_train(
                 episode_lengths[wi] = 0
                 if profiler:
                     profiler.incr('episodes_completed')
+        if profiler:
+            profiler.add_time('episode_tracking_time',
+                              time.perf_counter() - _t0)
 
         obs = next_obs
         total_steps += num_envs
@@ -860,10 +1033,14 @@ def train(config: dict):
     profiling_cfg = config.get('profiling', {})
     profiling_enabled = profiling_cfg.get('enabled', False)
     profiling_report_path = profiling_cfg.get('report', None)
+    waterfall_path = profiling_cfg.get('waterfall', None)
+    waterfall_rounds = profiling_cfg.get('waterfall_rounds', 2)
+    if profiling_enabled and waterfall_path:
+        profiler._waterfall_rounds = waterfall_rounds
     all_update_times: List[tuple] = []  # (agent_id, wall_time) for report
 
     # ── main loop ───────────────────────────────────────────────────────
-    updater = AsyncUpdater()
+    updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
     total_collected = 0
     collection_round = 0
     gen_steps = pop_config.get('generation_steps', 1_000_000)
@@ -892,13 +1069,13 @@ def train(config: dict):
             steps = collect_and_train(
                 population, envs, updater, rollout_metrics, config,
                 scheduler, profiler=profiler)
-            profiler.end_round()
             total_collected += steps
             timing_metrics.add_steps(steps)
             collection_round += 1
             pbar.update(steps)
 
             # Drain update metrics and log
+            _t0 = time.perf_counter()
             update_results = updater.pop_metrics()
             for agent_id, metrics in update_results:
                 prefixed = {f'agent_{agent_id}/{k}': v for k,
@@ -907,8 +1084,12 @@ def train(config: dict):
                 if profiling_enabled and 'update_wall_time' in metrics:
                     all_update_times.append(
                         (agent_id, metrics['update_wall_time']))
+            _t1 = time.perf_counter()
+            profiler.add_time('metrics_drain_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'metrics_drain')
 
             # Periodic logging
+            _t0 = time.perf_counter()
             if collection_round % log_interval == 0:
                 custom = registry.collect()
                 logger.log(total_collected,
@@ -923,15 +1104,23 @@ def train(config: dict):
                     scored=rollout_metrics.goals_scored,
                     conceded=rollout_metrics.goals_conceded,
                 )
+            _t1 = time.perf_counter()
+            profiler.add_time('logging_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'logging')
 
             # Save snapshots to opponent pool
+            _t0 = time.perf_counter()
             if pool:
                 best_idx = population.rank_agents()[0]
                 best_agent = population.agents[best_idx]
                 if pool.should_swap(total_collected):
                     pool.save_snapshot(best_agent, total_collected)
+            _t1 = time.perf_counter()
+            profiler.add_time('snapshot_save_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'snapshot_save')
 
             # Population generation cycle — wait for all updates before mutating weights
+            _t0 = time.perf_counter()
             if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
                 for a in population.agents:
                     a._buffer_ready.wait()  # blocks until this agent's update finishes
@@ -950,12 +1139,21 @@ def train(config: dict):
                           f'best=agent_{ranked[0]}  worst=agent_{worst_idx} (reset)')
                 population.reset_scores()
                 last_gen_step = total_collected
+            _t1 = time.perf_counter()
+            profiler.add_time('generation_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'generation')
 
             # Checkpoint
+            _t0 = time.perf_counter()
             if collection_round % (log_interval * 10) == 0:
                 best_idx = population.rank_agents()[0]
                 population.agents[best_idx].save_checkpoint(
                     model_dir / 'latest')
+            _t1 = time.perf_counter()
+            profiler.add_time('checkpoint_time', _t1 - _t0)
+            profiler.record_event(_t0, _t1, 'checkpoint')
+
+            profiler.end_round()
 
     except KeyboardInterrupt:
         print('\n[train] Interrupted.')
@@ -971,7 +1169,8 @@ def train(config: dict):
         if profiling_enabled:
             report = profiler.generate_report(
                 {**config, 'device': device},
-                update_times=all_update_times or None)
+                update_times=all_update_times or None,
+                waterfall_path=waterfall_path)
             if profiling_report_path:
                 report_path = Path(profiling_report_path)
                 report_path.parent.mkdir(parents=True, exist_ok=True)
