@@ -738,21 +738,21 @@ class CollectionProfiler:
         events = [(s - t_origin, e - t_origin, cat, thr, aid)
                   for s, e, cat, thr, aid in events]
 
-        # Color map for categories
+        # Color map — high contrast, visually distinct categories
         category_colors = {
-            'idle': '#cccccc',
-            'env_reset': '#8dd3c7',
-            'action_select': '#fb8072',
-            'env_step': '#80b1d3',
-            'store_transition': '#bebada',
-            'episode_tracking': '#fdb462',
-            'opponent_load': '#b3de69',
-            'metrics_drain': '#fccde5',
-            'logging': '#d9d9d9',
-            'snapshot_save': '#bc80bd',
-            'generation': '#ffed6f',
-            'checkpoint': '#ccebc5',
-            'gpu_update': '#ff7f00',
+            'idle': '#888888',
+            'env_reset': '#17becf',
+            'action_select': '#e6194b',
+            'env_step': '#3cb44b',
+            'store_transition': '#4363d8',
+            'episode_tracking': '#f58231',
+            'opponent_load': '#911eb4',
+            'metrics_drain': '#42d4f4',
+            'logging': '#f032e6',
+            'snapshot_save': '#bfef45',
+            'generation': '#fabed4',
+            'checkpoint': '#ffe119',
+            'gpu_update': '#ff6d00',
         }
 
         def _color(cat: str) -> str:
