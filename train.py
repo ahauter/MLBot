@@ -1239,6 +1239,14 @@ def train(config: dict):
     opponent_policy.eval()
     opponent_loaded = False
 
+    # ── evaluation hook ────────────────────────────────────────────────
+    eval_hook = None
+    eval_interval = config.get('eval_interval', 0)
+    if eval_interval > 0:
+        from training.evaluation.sim_eval import SimEvaluationHook
+        eval_hook = SimEvaluationHook(config)
+        print(f'[train] Eval hook enabled: interval={eval_interval} steps')
+
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
     total_collected = 0
@@ -1337,6 +1345,13 @@ def train(config: dict):
                     scored=rollout_metrics.goals_scored,
                     conceded=rollout_metrics.goals_conceded,
                 )
+
+                # Collect completed eval results (non-blocking)
+                if eval_hook is not None:
+                    for eval_step, results in eval_hook.collect_results():
+                        eval_metrics = eval_hook.format_metrics(results)
+                        if eval_metrics:
+                            logger.log(eval_step, **eval_metrics)
             _t1 = time.perf_counter()
             profiler.add_time('logging_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'logging')
@@ -1365,6 +1380,23 @@ def train(config: dict):
             profiler.add_time('checkpoint_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'checkpoint')
 
+            # Spawn eval worker if interval elapsed
+            if eval_hook is not None and eval_hook.should_evaluate(total_collected):
+                best_idx = population.rank_agents()[0]
+                best_agent = population.agents[best_idx]
+                wandb_run_id = ''
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb_run_id = wandb.run.id
+                except Exception:
+                    pass
+                eval_hook.spawn_eval(
+                    best_agent, total_collected,
+                    run_id=wandb_run_id,
+                    intervention=config.get('intervention', ''),
+                )
+
             profiler.end_round()
 
     except KeyboardInterrupt:
@@ -1376,6 +1408,10 @@ def train(config: dict):
         best_idx = population.rank_agents()[0]
         population.agents[best_idx].save_checkpoint(model_dir / 'final')
         print(f'[train] Saved final checkpoint to {model_dir}/final')
+
+        # Wait for any running eval workers
+        if eval_hook is not None:
+            eval_hook.cleanup()
 
         # Generate profiling report if enabled
         if profiling_enabled:
