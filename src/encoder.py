@@ -175,11 +175,11 @@ def state_to_tokens(
     """
     opp_idx = car_idx ^ 1
 
-    ball = packet.game_ball.physics
-    own  = packet.game_cars[car_idx].physics
-    opp  = packet.game_cars[opp_idx].physics
+    ball = packet.balls[0].physics
+    own  = packet.players[car_idx].physics
+    opp  = packet.players[opp_idx].physics
 
-    own_boost = float(packet.game_cars[car_idx].boost)
+    own_boost = float(packet.players[car_idx].boost)
 
     ball_token = np.array([
         ball.location.x         / FIELD_X,
@@ -236,8 +236,8 @@ def state_to_tokens(
     blue_score   = float(packet.teams[0].score)
     orange_score = float(packet.teams[1].score)
     score_diff   = (blue_score - orange_score) if car_idx == 0 else (orange_score - blue_score)
-    time_rem     = float(getattr(packet.game_info, 'game_time_remaining', 0.0))
-    overtime     = float(getattr(packet.game_info, 'is_overtime', False))
+    time_rem     = float(getattr(packet.match_info, 'seconds_remaining', 0.0))
+    overtime     = float(getattr(packet.match_info, 'is_overtime', False))
 
     gs_token = np.array([
         np.clip(score_diff / MAX_SCORE, -1.0, 1.0),
