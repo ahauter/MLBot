@@ -79,6 +79,17 @@ class _FakeAlgo:
         self.policy = StochasticPolicyHead(d_model=D_MODEL)
 
 
+def _make_dummy_vecenv(config: dict):
+    """Create a small SubprocVecEnv with DummyEnv for testing."""
+    from train import SubprocVecEnv
+    return SubprocVecEnv(
+        num_envs=2,
+        t_window=config.get('t_window', 8),
+        reward_type='sparse',
+        env_class=DUMMY_ENV,
+    )
+
+
 # ── EvalConfig tests ──────────────────────────────────────────────────────
 
 
@@ -270,35 +281,52 @@ class TestSimEvaluationHook:
                 assert conv['step'] == 2000
                 assert conv['tier'] == 'Rookie'
 
-    def test_spawn_and_collect(self):
-        """Async spawn_eval() + collect_results() lifecycle."""
+    def test_evaluate_inline(self):
+        """Inline evaluation using SubprocVecEnv workers."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = _make_config(tmpdir)
             hook = SimEvaluationHook(config)
             algo = _FakeAlgo()
 
-            hook.spawn_eval(algo, step=3000)
-            assert len(hook._active) == 1
+            envs = _make_dummy_vecenv(config)
+            try:
+                results = hook.evaluate_inline(
+                    algo, envs, step=3000, device='cpu')
 
-            # Wait for the worker to finish (should be fast with 3 episodes)
-            deadline = time.monotonic() + 60
-            collected = []
-            while time.monotonic() < deadline:
-                collected = hook.collect_results()
-                if collected:
-                    break
-                time.sleep(0.5)
+                assert results['checkpoint_step'] == 3000
+                assert 'eval_wall_time' in results
+                assert 'tiers' in results
+                assert 'Rookie' in results['tiers']
 
-            assert len(collected) == 1
-            step, results = collected[0]
-            assert step == 3000
-            assert not results.get('error')
-            assert 'Rookie' in results['tiers']
-            assert len(hook._active) == 0
+                rookie = results['tiers']['Rookie']
+                assert 'win_rate' in rookie
+                assert 'loss_rate' in rookie
+                assert 'timeout_rate' in rookie
+                assert 'mean_score' in rookie
+                assert rookie['episodes'] == 3
 
-    def test_cleanup(self):
+                # Rates should sum to ~1.0
+                total = (rookie['win_rate'] + rookie['loss_rate']
+                         + rookie['timeout_rate'])
+                assert abs(total - 1.0) < 1e-6
+
+                # Should have updated _last_eval_step
+                assert hook._last_eval_step == 3000
+            finally:
+                envs.close()
+
+    def test_evaluate_inline_convergence(self):
+        """Inline eval with 0.0 threshold should report convergence."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            hook = SimEvaluationHook(_make_config(tmpdir))
-            # cleanup on empty list should be fine
-            hook.cleanup()
-            assert hook._active == []
+            config = _make_config(tmpdir)
+            hook = SimEvaluationHook(config)
+            algo = _FakeAlgo()
+
+            envs = _make_dummy_vecenv(config)
+            try:
+                results = hook.evaluate_inline(
+                    algo, envs, step=5000, device='cpu')
+                # threshold is 0.0, so any result converges
+                assert hook.check_convergence(results)
+            finally:
+                envs.close()

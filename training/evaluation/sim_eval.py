@@ -1,10 +1,11 @@
 """
 Simulation-Based Evaluation Hook
 ==================================
-Implements the EvaluationHook ABC for non-blocking evaluation.
+Implements the EvaluationHook ABC for inline evaluation.
 
-Training-side coordinator: saves eval checkpoints, spawns worker processes,
-collects results from JSON files. All W&B logging stays in the training process.
+Runs evaluation episodes on the existing SubprocVecEnv workers between
+collect_and_train() calls. The next collect_and_train() unconditionally
+resets all envs, so eval state never leaks into training data.
 
 Configured via YAML::
 
@@ -20,11 +21,10 @@ Configured via YAML::
 from __future__ import annotations
 
 import json
-import multiprocessing
-import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -35,19 +35,16 @@ from training.evaluation.eval_config import EvalConfig
 
 class SimEvaluationHook(EvaluationHook):
     """
-    Non-blocking evaluation via subprocess workers.
+    Inline evaluation using existing env workers.
 
     Usage from training loop::
 
         hook = SimEvaluationHook(config)
 
-        # In the training loop:
+        # Between collect_and_train() calls:
         if hook.should_evaluate(total_steps):
-            hook.spawn_eval(algorithm, total_steps, run_id=wandb_run_id)
-
-        # At each log interval:
-        for step, results in hook.collect_results():
-            logger.log(step, **hook.format_metrics(results))
+            results = hook.evaluate_inline(algorithm, envs, total_steps, device)
+            logger.log(total_steps, **hook.format_metrics(results))
     """
 
     @classmethod
@@ -57,12 +54,7 @@ class SimEvaluationHook(EvaluationHook):
     def __init__(self, config: dict):
         self.cfg = EvalConfig.from_config(config)
         Path(self.cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-        self._active: List[Tuple[multiprocessing.Process, int, str]] = []
         self._last_eval_step = 0
-
-        # Use 'spawn' to avoid fork issues with rlgym-sim / PyTorch
-        self._mp_ctx = multiprocessing.get_context('spawn')
 
     # ------------------------------------------------------------------
     # Training-loop API
@@ -100,60 +92,150 @@ class SimEvaluationHook(EvaluationHook):
 
         return ckpt_path
 
-    def spawn_eval(
+    def evaluate_inline(
         self,
         algorithm: Algorithm,
+        envs,
         step: int,
-        run_id: str = '',
-        axis_costs: Optional[Dict] = None,
-        intervention: str = '',
-    ) -> None:
-        """Save checkpoint and launch eval worker. Non-blocking."""
-        ckpt_path = self.save_eval_checkpoint(
-            algorithm, step, run_id, axis_costs, intervention)
-        result_path = str(ckpt_path.parent / 'eval_results.json')
-        error_log = str(Path(self.cfg.checkpoint_dir) / 'eval_errors.log')
+        device: str = 'cpu',
+    ) -> dict:
+        """Run eval episodes inline on existing SubprocVecEnv workers.
 
-        from training.evaluation.eval_worker import run_eval_worker
+        This is BLOCKING — runs between collect_and_train() calls.
+        The next collect_and_train() will call envs.reset_all(), so
+        eval state never contaminates training data.
 
-        p = self._mp_ctx.Process(
-            target=run_eval_worker,
-            args=(str(ckpt_path), result_path, error_log, asdict(self.cfg)),
-            daemon=False,
-        )
-        p.start()
-        self._active.append((p, step, result_path))
+        Parameters
+        ----------
+        algorithm : Algorithm
+            Agent with .encoder and .policy attributes.
+        envs : SubprocVecEnv
+            The same env workers used for training.
+        step : int
+            Current training step (for logging/seeding).
+        device : str
+            Torch device for inference.
+
+        Returns
+        -------
+        dict
+            Results with 'tiers', 'eval_wall_time', 'convergence_reached', etc.
+        """
+        from encoder import N_TOKENS, TOKEN_FEATURES, ENTITY_TYPE_IDS_1V1
+
+        t0 = time.monotonic()
+
+        encoder = algorithm.encoder
+        policy = algorithm.policy
+        encoder.eval()
+        policy.eval()
+        entity_ids = torch.tensor(
+            ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
+
+        # Clear opponent snapshots — eval uses random opponents only
+        envs.set_opponent_snapshot(None)
+
+        tier_results = {}
+        for tier in EvalConfig.TIER_ORDER:
+            if tier not in self.cfg.tier_opponents:
+                continue
+            tier_results[tier] = self._eval_tier_inline(
+                envs, encoder, policy, entity_ids, step, tier, device)
+
+        wall_time = time.monotonic() - t0
+
+        # Check convergence
+        target_tier = self.cfg.skill_target_tier
+        target_wr = tier_results.get(target_tier, {}).get('win_rate', 0.0)
+        converged = target_wr >= self.cfg.skill_target_win_rate
+
         self._last_eval_step = step
-        print(f'[eval] Spawned eval worker for step {step} (pid={p.pid})')
 
-    def collect_results(self) -> List[Tuple[int, dict]]:
+        results = {
+            'checkpoint_step': step,
+            'eval_wall_time': round(wall_time, 2),
+            'convergence_reached': converged,
+            'axis_costs': {},
+            'tiers': tier_results,
+        }
+
+        print(f'[eval] step={step} done in {wall_time:.1f}s '
+              f'(converged={converged})')
+        for tier, data in tier_results.items():
+            print(f'[eval]   {tier}: win_rate={data["win_rate"]:.2%}')
+
+        return results
+
+    def _eval_tier_inline(
+        self,
+        envs,
+        encoder,
+        policy,
+        entity_ids: torch.Tensor,
+        step: int,
+        tier: str,
+        device: str,
+    ) -> Dict:
+        """Evaluate against a single tier using vectorized envs.
+
+        Runs episodes_per_tier episodes across all env workers in parallel.
+        Agent inference is batched on GPU; opponents are random (no snapshot).
         """
-        Check for completed eval processes. Non-blocking.
+        from encoder import N_TOKENS, TOKEN_FEATURES
 
-        Returns list of (step, results_dict) for processes that finished
-        since the last call. Cleans up terminated processes.
-        """
-        completed = []
-        still_running = []
+        num_envs = envs.num_envs
+        episodes_needed = self.cfg.episodes_per_tier
+        t_window = self.cfg.t_window
+        timeout = self.cfg.episode_timeout_steps
 
-        for proc, step, result_path in self._active:
-            if not proc.is_alive():
-                rp = Path(result_path)
-                if rp.exists():
-                    results = json.loads(rp.read_text())
-                    completed.append((step, results))
-                else:
-                    completed.append((step, {
-                        'error': True,
-                        'exit_code': proc.exitcode,
-                        'checkpoint_step': step,
-                    }))
-                proc.join(timeout=5)
-            else:
-                still_running.append((proc, step, result_path))
+        scores = []
+        env_steps = np.zeros(num_envs, dtype=np.int64)
 
-        self._active = still_running
-        return completed
+        # Reset all envs to start eval
+        obs = envs.reset_all()  # (num_envs, obs_dim)
+
+        while len(scores) < episodes_needed:
+            # Batched GPU inference — deterministic policy
+            with torch.no_grad():
+                x = torch.tensor(obs, dtype=torch.float32, device=device)
+                tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
+                emb = encoder(tokens, entity_ids)
+                actions, _ = policy.act_deterministic(emb)
+            actions_np = actions.cpu().numpy().astype(np.float32)
+
+            # Step all envs (random opponents — no snapshot loaded)
+            next_obs, rewards, dones, infos = envs.step(actions_np)
+            env_steps += 1
+
+            # Check for completed episodes
+            for i in range(num_envs):
+                done = bool(dones[i]) or env_steps[i] >= timeout
+                if done:
+                    goal = infos[i].get('goal', 0)
+                    scores.append(goal)
+                    env_steps[i] = 0
+                    if len(scores) >= episodes_needed:
+                        break
+
+            obs = next_obs
+
+            # If any envs finished, they auto-reset via env.step() returning
+            # a fresh obs (gymnasium convention). env_steps tracks timeout.
+
+        # Trim to exact count
+        scores = scores[:episodes_needed]
+        n = len(scores)
+        wins = sum(1 for s in scores if s == 1)
+        losses = sum(1 for s in scores if s == -1)
+        timeouts = sum(1 for s in scores if s == 0)
+
+        return {
+            'win_rate': wins / n if n else 0.0,
+            'loss_rate': losses / n if n else 0.0,
+            'timeout_rate': timeouts / n if n else 0.0,
+            'mean_score': sum(scores) / n if n else 0.0,
+            'episodes': n,
+        }
 
     @staticmethod
     def format_metrics(results: dict) -> dict:
@@ -177,19 +259,6 @@ class SimEvaluationHook(EvaluationHook):
 
         return metrics
 
-    def cleanup(self, timeout: float = 30.0) -> None:
-        """Join any remaining eval processes. Call in the finally block."""
-        for proc, step, _ in self._active:
-            if proc.is_alive():
-                print(f'[eval] Waiting for eval worker step={step} '
-                      f'(pid={proc.pid})...')
-                proc.join(timeout=timeout)
-                if proc.is_alive():
-                    print(f'[eval] Eval worker step={step} did not finish, '
-                          f'terminating.')
-                    proc.terminate()
-        self._active.clear()
-
     # ------------------------------------------------------------------
     # EvaluationHook ABC
     # ------------------------------------------------------------------
@@ -198,8 +267,8 @@ class SimEvaluationHook(EvaluationHook):
         """
         Synchronous evaluation (ABC contract).
 
-        Runs the eval worker in-process. Prefer spawn_eval() + collect_results()
-        for non-blocking usage from the training loop.
+        Runs the eval worker in-process via checkpoint. Used by the CLI
+        (evaluate.py) when no SubprocVecEnv is available.
         """
         ckpt_path = self.save_eval_checkpoint(algorithm, step)
         result_path = str(ckpt_path.parent / 'eval_results.json')
