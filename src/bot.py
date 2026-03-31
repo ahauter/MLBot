@@ -15,11 +15,14 @@ import sys
 from collections import deque
 from pathlib import Path
 
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''  # prevent CUDA DLL load in bot subprocess
+
 import numpy as np
 import torch
 
-from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
-from rlbot.utils.structures.game_data_struct import GameTickPacket
+from rlbot.flat import ControllerState, GamePacket
+from rlbot.managers import Bot
 
 _SRC  = Path(__file__).parent
 _REPO = _SRC.parent
@@ -32,23 +35,22 @@ from encoder import (
     ENTITY_TYPE_IDS_1V1,
     T_WINDOW,
 )
-from policy_head import PolicyHead
+from policy_head import StochasticPolicyHead
 
 MODEL_DIR = _REPO / 'models'
 
 
-class MyBot(BaseAgent):
+class MyBot(Bot):
 
-    def __init__(self, name, team, index):
-        super().__init__(name, team, index)
-        self.index:       int                      = index
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id)
         self.encoder:     SharedTransformerEncoder = None
-        self.policy_head: PolicyHead               = None
+        self.policy_head: StochasticPolicyHead      = None
         self._obs_buffer: deque                    = None
         self._entity_type_ids: torch.Tensor        = torch.tensor(
             ENTITY_TYPE_IDS_1V1, dtype=torch.long)
 
-    def initialize_agent(self) -> None:
+    def initialize(self) -> None:
         """Load encoder and policy head from models/."""
         enc_path = MODEL_DIR / 'encoder.pt'
         if enc_path.exists():
@@ -56,7 +58,7 @@ class MyBot(BaseAgent):
         else:
             self.encoder = SharedTransformerEncoder()
 
-        self.policy_head = PolicyHead()
+        self.policy_head = StochasticPolicyHead()
         head_path = MODEL_DIR / 'policy.pt'
         if head_path.exists():
             self.policy_head.load(str(head_path))
@@ -67,7 +69,7 @@ class MyBot(BaseAgent):
         # Observation window — filled on first get_output() call
         self._obs_buffer = None
 
-    def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
+    def get_output(self, packet: GamePacket) -> ControllerState:
         tokens = state_to_tokens(packet, self.index)   # (1, N, TOKEN_FEATURES)
         frame  = tokens[0]                              # (N, TOKEN_FEATURES)
 
@@ -87,19 +89,22 @@ class MyBot(BaseAgent):
             ).numpy()   # (1, D_MODEL)
 
         if self.policy_head is not None:
-            action, _ = self.policy_head.act(embedding)
+            with torch.no_grad():
+                emb_t = torch.tensor(embedding, dtype=torch.float32)
+                action_t, _ = self.policy_head.act_deterministic(emb_t)
+                action = action_t[0].cpu().numpy().astype(np.float32)
         else:
             action = np.zeros(8, dtype=np.float32)
 
         return self.translate_controls(action)
 
-    def translate_controls(self, action: np.ndarray) -> SimpleControllerState:
+    def translate_controls(self, action: np.ndarray) -> ControllerState:
         """
-        Map an 8-float action array to a SimpleControllerState.
+        Map an 8-float action array to a ControllerState.
           [0] throttle  [1] steer  [2] pitch  [3] yaw  [4] roll
           [5] jump  [6] boost  [7] handbrake
         """
-        ctrl           = SimpleControllerState()
+        ctrl           = ControllerState()
         ctrl.throttle  = float(np.clip(action[0], -1.0, 1.0))
         ctrl.steer     = float(np.clip(action[1], -1.0, 1.0))
         ctrl.pitch     = float(np.clip(action[2], -1.0, 1.0))
@@ -109,3 +114,7 @@ class MyBot(BaseAgent):
         ctrl.boost     = bool(action[6] >= 0.5)
         ctrl.handbrake = bool(action[7] >= 0.5)
         return ctrl
+
+
+if __name__ == "__main__":
+    MyBot("austin/mlbot").run()

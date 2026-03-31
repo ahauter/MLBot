@@ -1,0 +1,17 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "MLBot"
+agent_id = "austin/mlbot"
+run_command = "..\\venv\\Scripts\\python bot.py"
+run_command_linux = "../venv/bin/python bot.py"
+loadout_file = ""
+logo_file = ""
+root_dir = ""
+
+[details]
+description = "ML-trained Rocket League bot (AWAC, sparse reward)"
+fun_fact = ""
+source_link = ""
+developer = "Austin"
+language = "Python"
+tags = ["1v1"]
