@@ -629,6 +629,7 @@ class CollectionProfiler:
         'snapshot_save_time',     # saving snapshots to opponent pool
         'generation_time',        # PBT generation cycle (wait/rank/clone/reset)
         'checkpoint_time',        # saving model checkpoints
+        'eval_time',              # inline evaluation episodes
     ]
 
     COUNTER_KEYS = [
@@ -902,6 +903,7 @@ class CollectionProfiler:
             'generation': '#fabed4',
             'checkpoint': '#ffe119',
             'gpu_update': '#ff6d00',
+            'eval': '#dcbeff',
         }
 
         def _color(cat: str) -> str:
@@ -1381,10 +1383,15 @@ def train(config: dict):
             # Next collect_and_train() resets all envs, so eval state
             # never contaminates training data.
             if eval_hook is not None and eval_hook.should_evaluate(total_collected):
+                _t0 = time.perf_counter()
                 best_idx = population.rank_agents()[0]
                 best_agent = population.agents[best_idx]
                 eval_results = eval_hook.evaluate_inline(
                     best_agent, envs, total_collected, device=device)
+                _t1 = time.perf_counter()
+                profiler.add_time('eval_time', _t1 - _t0)
+                profiler.record_event(_t0, _t1, 'eval')
+
                 eval_metrics = eval_hook.format_metrics(eval_results)
                 if eval_metrics:
                     logger.log(total_collected, **eval_metrics)
