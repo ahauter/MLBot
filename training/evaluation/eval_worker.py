@@ -9,12 +9,12 @@ to a JSON file. Never touches W&B — the training process handles logging.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
 import time
 import traceback
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -35,6 +35,18 @@ from encoder import (
 )
 from policy_head import StochasticPolicyHead
 from training.evaluation.eval_config import EvalConfig
+
+
+def _load_env_class(dotted_path: Optional[str]):
+    """Resolve a gymnasium.Env class from a dotted import path.
+
+    Returns BaselineGymEnv when *dotted_path* is None.
+    """
+    if dotted_path is None:
+        from training.environments.baseline_env import BaselineGymEnv
+        return BaselineGymEnv
+    module_path, class_name = dotted_path.rsplit('.', 1)
+    return getattr(importlib.import_module(module_path), class_name)
 
 
 def _episode_seed(step: int, tier: str, episode_idx: int) -> int:
@@ -80,11 +92,12 @@ def _eval_tier(
     episodes: int,
     timeout_steps: int,
     t_window: int,
+    env_class: Optional[str] = None,
 ) -> Dict:
     """Evaluate against a single tier. Returns metrics dict."""
-    from training.environments.baseline_env import BaselineGymEnv
+    EnvCls = _load_env_class(env_class)
 
-    env = BaselineGymEnv(
+    env = EnvCls(
         t_window=t_window,
         max_steps=timeout_steps,
         reward_type='sparse',
@@ -185,6 +198,7 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
             episodes=cfg.episodes_per_tier,
             timeout_steps=cfg.episode_timeout_steps,
             t_window=cfg.t_window,
+            env_class=cfg.env_class,
         )
         wr = tier_results[tier]['win_rate']
         print(f'[eval_worker]   {tier}: win_rate={wr:.2%}')

@@ -292,6 +292,10 @@ class EvaluationHook(ABC):
     """
     Evaluation protocol. Called periodically to assess agent performance
     and determine convergence.
+
+    Swappable via YAML config (``evaluation.class``). Implementations
+    define how episodes are run, what metrics are computed, what
+    convergence means, and optionally how a human can spectate or play.
     """
 
     @classmethod
@@ -305,3 +309,10 @@ class EvaluationHook(ABC):
     @abstractmethod
     def check_convergence(self, eval_results: dict) -> bool:
         """Should training stop based on evaluation results?"""
+
+    def run_interactive(self, algorithm: Algorithm, step: int = 0) -> None:
+        """Launch a human spectator or player session.
+
+        Default is a no-op. Implementations should load the agent into
+        the environment and run episodes with human-visible output.
+        """

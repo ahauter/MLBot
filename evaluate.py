@@ -3,32 +3,39 @@
 Evaluate a Snapshot or Checkpoint
 ==================================
 Top-level CLI for running the evaluation pipeline on an arbitrary
-snapshot/checkpoint, or launching a human-play session against it.
+snapshot/checkpoint, or launching a human spectator session.
+
+All evaluation logic is routed through the EvaluationHook abstraction,
+so swapping the eval hook class (via --eval-class or YAML config) changes
+the entire evaluation protocol without modifying this file.
 
 Usage
 -----
-    # Evaluate a training checkpoint (encoder + policy in a directory):
+    # Evaluate a training snapshot:
     python evaluate.py --snapshot models/snapshots/step_0000050000
 
-    # Evaluate an eval checkpoint file directly:
+    # Evaluate an eval checkpoint file:
     python evaluate.py --checkpoint checkpoints/step_0000050000/eval_checkpoint.pt
 
-    # Evaluate with fewer episodes (quick check):
+    # Quick check with fewer episodes:
     python evaluate.py --snapshot models/snapshots/step_0000050000 --episodes 10
 
     # Single tier:
     python evaluate.py --snapshot models/snapshots/step_0000050000 --tier Rookie
 
-    # Human play against a snapshot:
+    # Use DummyEnv (no rlgym-sim needed):
+    python evaluate.py --snapshot path --env-class training.environments.dummy_env.DummyEnv
+
+    # Watch the model play (spectator mode):
     python evaluate.py --snapshot models/snapshots/step_0000050000 --human
 """
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +55,12 @@ from encoder import (
 from policy_head import StochasticPolicyHead
 from training.evaluation.eval_config import EvalConfig
 from training.evaluation.eval_worker import _eval_tier
+
+
+def _load_class(dotted_path: str):
+    """Import a class from a dotted module path."""
+    module_path, class_name = dotted_path.rsplit('.', 1)
+    return getattr(importlib.import_module(module_path), class_name)
 
 
 def load_from_snapshot(snap_path: str) -> dict:
@@ -74,52 +87,12 @@ def load_from_checkpoint(ckpt_path: str) -> dict:
         f'Found: {list(ckpt.keys())}')
 
 
-def build_models(weights: dict):
-    """Instantiate encoder + policy and load weights."""
-    encoder = SharedTransformerEncoder(d_model=D_MODEL)
-    policy = StochasticPolicyHead(d_model=D_MODEL)
-    encoder.load_state_dict(weights['encoder'])
-    policy.load_state_dict(weights['policy'])
-    encoder.eval()
-    policy.eval()
-    return encoder, policy
+class _WeightsHolder:
+    """Lightweight stand-in for Algorithm so we can call hook.run_interactive()."""
 
-
-def run_human_play(encoder, policy, entity_ids, t_window: int):
-    """Launch a human-controlled session where a human plays against the loaded model."""
-    from training.environments.baseline_env import BaselineGymEnv
-
-    env = BaselineGymEnv(t_window=t_window, max_steps=4500, reward_type='sparse')
-    # Load the model as the opponent so the human "plays" by providing actions
-    # For now, we run the model as blue and print observations for human inspection
-    print('\n=== Human Play Mode ===')
-    print('The loaded model plays as blue. Watch it play against a random opponent.')
-    print('Press Ctrl+C to stop.\n')
-
-    try:
-        episode = 0
-        while True:
-            episode += 1
-            obs, _ = env.reset()
-            done = False
-            steps = 0
-            while not done:
-                with torch.no_grad():
-                    x = torch.tensor(obs[np.newaxis], dtype=torch.float32)
-                    tokens = x.view(1, t_window, N_TOKENS, TOKEN_FEATURES)
-                    emb = encoder(tokens, entity_ids)
-                    action, _ = policy.act_deterministic(emb)
-                action_np = action[0].cpu().numpy().astype(np.float32)
-                obs, reward, done, _, info = env.step(action_np)
-                steps += 1
-
-            goal = info.get('goal', 0)
-            outcome = {1: 'SCORED', -1: 'CONCEDED', 0: 'TIMEOUT'}[goal]
-            print(f'  Episode {episode}: {outcome} after {steps} steps')
-    except KeyboardInterrupt:
-        print(f'\nStopped after {episode} episodes.')
-    finally:
-        env.close()
+    def __init__(self, encoder, policy):
+        self.encoder = encoder
+        self.policy = policy
 
 
 def main():
@@ -150,8 +123,14 @@ def main():
         '--opponent', type=str, default=None,
         help='Path to opponent snapshot directory (default: random opponent)')
     parser.add_argument(
+        '--env-class', type=str, default=None,
+        help='Dotted path to env class (default: BaselineGymEnv)')
+    parser.add_argument(
+        '--eval-class', type=str, default=None,
+        help='Dotted path to EvaluationHook class (default: SimEvaluationHook)')
+    parser.add_argument(
         '--human', action='store_true',
-        help='Watch the model play episodes (human observation mode)')
+        help='Watch the model play episodes (spectator mode)')
     parser.add_argument(
         '--json-output', type=str, default=None,
         help='Write results to a JSON file')
@@ -166,21 +145,50 @@ def main():
         print(f'Loading checkpoint from {args.checkpoint}')
         weights = load_from_checkpoint(args.checkpoint)
 
-    encoder, policy = build_models(weights)
-    entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+    encoder = SharedTransformerEncoder(d_model=D_MODEL)
+    policy = StochasticPolicyHead(d_model=D_MODEL)
+    encoder.load_state_dict(weights['encoder'])
+    policy.load_state_dict(weights['policy'])
+    encoder.eval()
+    policy.eval()
 
+    # Build a config dict matching the YAML convention
+    config = {
+        't_window': args.t_window,
+        'env_class': args.env_class,
+        'eval_interval': 1,  # enable eval hook
+        'evaluation': {
+            'params': {
+                'episodes_per_tier': args.episodes or 100,
+                'episode_timeout_steps': args.timeout_steps,
+            },
+        },
+    }
+
+    # Resolve eval hook class
+    if args.eval_class:
+        EvalCls = _load_class(args.eval_class)
+    else:
+        from training.evaluation.sim_eval import SimEvaluationHook
+        EvalCls = SimEvaluationHook
+
+    hook = EvalCls(config)
+
+    # Interactive / spectator mode
     if args.human:
-        run_human_play(encoder, policy, entity_ids, args.t_window)
+        algo = _WeightsHolder(encoder, policy)
+        hook.run_interactive(algo)
         return
 
-    # Determine tiers to evaluate
-    episodes = args.episodes or 100
+    # Run evaluation via _eval_tier (direct, not through subprocess)
+    entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+
     if args.tier:
         tiers = {args.tier: args.opponent}
     else:
         tiers = {t: args.opponent for t in EvalConfig.TIER_ORDER}
 
-    # Run evaluation
+    episodes = args.episodes or 100
     print(f'\nEvaluating ({episodes} episodes per tier, '
           f'timeout={args.timeout_steps} steps):')
     t0 = time.monotonic()
@@ -199,6 +207,7 @@ def main():
             episodes=episodes,
             timeout_steps=args.timeout_steps,
             t_window=args.t_window,
+            env_class=args.env_class,
         )
         all_results[tier] = result
         print(f'    win_rate={result["win_rate"]:.1%}  '

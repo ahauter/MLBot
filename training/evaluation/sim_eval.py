@@ -5,17 +5,28 @@ Implements the EvaluationHook ABC for non-blocking evaluation.
 
 Training-side coordinator: saves eval checkpoints, spawns worker processes,
 collects results from JSON files. All W&B logging stays in the training process.
+
+Configured via YAML::
+
+    evaluation:
+      class: training.evaluation.sim_eval.SimEvaluationHook
+      params:
+        episodes_per_tier: 100
+        episode_timeout_steps: 3000
+        checkpoint_dir: checkpoints
+        skill_target_tier: Rookie
+        skill_target_win_rate: 0.60
 """
 from __future__ import annotations
 
 import json
 import multiprocessing
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from training.abstractions import Algorithm, EvaluationHook
@@ -180,7 +191,7 @@ class SimEvaluationHook(EvaluationHook):
         self._active.clear()
 
     # ------------------------------------------------------------------
-    # EvaluationHook ABC — synchronous fallback
+    # EvaluationHook ABC
     # ------------------------------------------------------------------
 
     def evaluate(self, algorithm: Algorithm, step: int) -> dict:
@@ -207,3 +218,63 @@ class SimEvaluationHook(EvaluationHook):
         tier = self.cfg.skill_target_tier
         tier_data = eval_results.get('tiers', {}).get(tier, {})
         return tier_data.get('win_rate', 0.0) >= self.cfg.skill_target_win_rate
+
+    def run_interactive(self, algorithm: Algorithm, step: int = 0) -> None:
+        """Launch a spectator session: watch the agent play episodes.
+
+        Loads the agent's encoder + policy and runs episodes in the
+        configured environment, printing per-episode outcomes.
+        Press Ctrl+C to stop.
+        """
+        from encoder import (
+            SharedTransformerEncoder, D_MODEL, N_TOKENS,
+            TOKEN_FEATURES, ENTITY_TYPE_IDS_1V1,
+        )
+        from policy_head import StochasticPolicyHead
+        from training.evaluation.eval_worker import _load_env_class
+
+        # Build models on CPU from algorithm weights
+        encoder = SharedTransformerEncoder(d_model=D_MODEL)
+        policy = StochasticPolicyHead(d_model=D_MODEL)
+        encoder.load_state_dict(algorithm.encoder.state_dict())
+        policy.load_state_dict(algorithm.policy.state_dict())
+        encoder.eval()
+        policy.eval()
+        entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+
+        EnvCls = _load_env_class(self.cfg.env_class)
+        env = EnvCls(
+            t_window=self.cfg.t_window,
+            max_steps=self.cfg.episode_timeout_steps,
+            reward_type='sparse',
+        )
+
+        print('\n=== Interactive Mode ===')
+        print(f'Environment: {EnvCls.__module__}.{EnvCls.__name__}')
+        print('The loaded model plays as blue. Press Ctrl+C to stop.\n')
+
+        episode = 0
+        try:
+            while True:
+                episode += 1
+                obs, _ = env.reset()
+                done = False
+                steps = 0
+                while not done:
+                    with torch.no_grad():
+                        x = torch.tensor(obs[np.newaxis], dtype=torch.float32)
+                        tokens = x.view(
+                            1, self.cfg.t_window, N_TOKENS, TOKEN_FEATURES)
+                        emb = encoder(tokens, entity_ids)
+                        action, _ = policy.act_deterministic(emb)
+                    action_np = action[0].cpu().numpy().astype(np.float32)
+                    obs, _reward, done, _, info = env.step(action_np)
+                    steps += 1
+
+                goal = info.get('goal', 0)
+                outcome = {1: 'SCORED', -1: 'CONCEDED', 0: 'TIMEOUT'}[goal]
+                print(f'  Episode {episode}: {outcome} after {steps} steps')
+        except KeyboardInterrupt:
+            print(f'\nStopped after {episode} episodes.')
+        finally:
+            env.close()

@@ -1240,12 +1240,14 @@ def train(config: dict):
     opponent_loaded = False
 
     # ── evaluation hook ────────────────────────────────────────────────
+    from training.evaluation.sim_eval import SimEvaluationHook
+    EvalCls = resolve_or_default(config, 'evaluation', SimEvaluationHook)
     eval_hook = None
     eval_interval = config.get('eval_interval', 0)
     if eval_interval > 0:
-        from training.evaluation.sim_eval import SimEvaluationHook
-        eval_hook = SimEvaluationHook(config)
-        print(f'[train] Eval hook enabled: interval={eval_interval} steps')
+        eval_hook = EvalCls(config)
+        print(f'[train] Eval hook enabled: {EvalCls.__name__}, '
+              f'interval={eval_interval} steps')
 
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
