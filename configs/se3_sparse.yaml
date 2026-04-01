@@ -1,0 +1,23 @@
+algorithm:
+  class: training.algorithms.se3_ppo.SE3PPOAlgorithm
+
+opponent_pool:
+  class: training.opponents.se3_population.SE3Population
+  params:
+    agents: 4
+    generation_steps: 1000000
+    generation_noise_scale: 0.01
+
+env_class: training.environments.se3_env.SE3GymEnv
+
+seed: 0
+total_steps: 50000000
+num_envs: 8
+envs_per_worker: 1
+eval_interval: 200000
+t_window: 1
+reward_type: sparse
+
+wandb:
+  project: se3-spectral
+  enabled: true
