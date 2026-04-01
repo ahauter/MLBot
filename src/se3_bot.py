@@ -3,8 +3,8 @@ SE3Bot — RLBot Agent using SE(3) Spectral Fields
 =================================================
 Loads SE3Encoder + SE3Policy at startup, then on every tick:
   1. Extract raw state from GamePacket (positions, velocities, Euler→quaternion)
-  2. Pack [raw_state | prev_coefficients] → 185-dim
-  3. SE3Encoder.forward → 128-dim updated coefficients
+  2. Pack [raw_state | prev_coefficients] → SE3_OBS_DIM
+  3. SE3Encoder.encode_for_policy → 82-dim physical summary
   4. SE3Policy.forward → 8-float action
   5. Translate to ControllerState
 """
@@ -33,7 +33,8 @@ from encoder import FIELD_X, FIELD_Y, CEILING_Z, MAX_VEL, MAX_ANG_VEL, MAX_BOOST
 from se3_field import (
     SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM,
     euler_to_quaternion, make_initial_coefficients, pack_observation,
-    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF, _PREV_VEL_OFF,
+    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF,
+    _PREV_VEL_OFF, _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
 )
 from se3_policy import SE3Policy
 
@@ -50,6 +51,8 @@ class SE3Bot(Bot):
         self.policy: SE3Policy = None
         self._prev_coeff: np.ndarray = None
         self._prev_ball_vel: np.ndarray = None
+        self._prev_ego_vel: np.ndarray = None
+        self._prev_opp_vel: np.ndarray = None
 
     def initialize(self) -> None:
         enc_path = MODEL_DIR / 'se3_encoder.pt'
@@ -68,6 +71,8 @@ class SE3Bot(Bot):
 
         self._prev_coeff = make_initial_coefficients()
         self._prev_ball_vel = np.zeros(3, dtype=np.float32)
+        self._prev_ego_vel = np.zeros(3, dtype=np.float32)
+        self._prev_opp_vel = np.zeros(3, dtype=np.float32)
 
     def get_output(self, packet: GamePacket) -> ControllerState:
         raw_state = self._extract_raw_state(packet)
@@ -75,16 +80,21 @@ class SE3Bot(Bot):
 
         with torch.no_grad():
             packed_t = torch.tensor(packed[np.newaxis], dtype=torch.float32)
-            coeff = self.encoder(packed_t).numpy()[0]  # (128,)
+            # encode_for_policy returns 82-dim physical summary for policy
+            embed = self.encoder.encode_for_policy(packed_t)
+            # Also get updated coefficients for persistence
+            coeff = self.encoder(packed_t).numpy()[0]
 
         self._prev_coeff = coeff.copy()
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+        self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
 
-        action, _ = self.policy.act(coeff[np.newaxis])
+        action, _ = self.policy.act(embed.numpy())
         return self._translate_controls(action)
 
     def _extract_raw_state(self, packet: GamePacket) -> np.ndarray:
-        """Extract 57-dim raw state from GamePacket."""
+        """Extract 63-dim raw state from GamePacket."""
         opp_idx = self.index ^ 1
         ball = packet.balls[0].physics
         own = packet.players[self.index].physics
@@ -151,8 +161,10 @@ class SE3Bot(Bot):
         raw[_GS_OFF + 1] = np.clip(time_rem / MAX_TIME, 0.0, 1.0)
         raw[_GS_OFF + 2] = overtime
 
-        # Previous ball velocity (for contact detection)
+        # Previous velocities (for contact detection + acceleration channel)
         raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = self._prev_ball_vel
+        raw[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = self._prev_ego_vel
+        raw[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = self._prev_opp_vel
 
         return raw
 

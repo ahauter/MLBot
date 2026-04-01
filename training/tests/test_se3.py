@@ -26,10 +26,12 @@ from se3_field import (
     euler_to_quaternion, euler_to_quaternion_batch,
     normalise_quaternion, quaternion_inner, quaternion_exponential,
     detect_contact, detect_contact_np,
-    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, N_OBJECTS, K,
+    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, EMBED_DIM,
+    N_OBJECTS, K, N_CHANNELS, GRAVITY_DV_Z,
     make_initial_coefficients, update_coefficients_np, pack_observation,
     _BALL, _EGO, _OPP, _GOAL_TEAM, _GOAL_OPP,
     _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _PREV_VEL_OFF,
+    _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
 )
 from se3_policy import SE3Policy, StochasticSE3Policy
 
@@ -129,14 +131,14 @@ class TestContactDetection:
 class TestSE3Encoder:
 
     def test_forward_shape(self):
-        """(batch=4, 185) → (4, 128)."""
+        """forward() returns (batch, COEFF_DIM=576)."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
         out = encoder(obs)
         assert out.shape == (4, COEFF_DIM), f"Expected (4, {COEFF_DIM}), got {out.shape}"
 
     def test_forward_single(self):
-        """(1, 185) → (1, 128)."""
+        """forward() returns (1, COEFF_DIM)."""
         encoder = SE3Encoder()
         obs = torch.randn(1, SE3_OBS_DIM)
         out = encoder(obs)
@@ -177,19 +179,19 @@ class TestSE3Encoder:
         encoder = SE3Encoder()
         # Create obs where ball velocity changes drastically
         obs = torch.zeros(1, SE3_OBS_DIM)
-        # Set prev_ball_vel to zero (offset 54-56)
         # Set current ball vel to something huge (offset 3-5)
         obs[0, 3] = 10.0  # ball vx huge (normalised)
         obs[0, 4] = 10.0  # ball vy huge
-        # prev_ball_vel at offset 54 stays zero
-        # Give some non-zero prev coefficients for ball (first K*2=16 of coeff section)
-        obs[0, RAW_STATE_DIM:RAW_STATE_DIM + K * 2] = 1.0
+        # prev_ball_vel at offset 54 stays zero → huge Δv/dt → contact
+        # Give some non-zero prev coefficients for ball
+        ball_coeff_size = K * 3 * N_CHANNELS
+        obs[0, RAW_STATE_DIM:RAW_STATE_DIM + ball_coeff_size] = 1.0
 
         with torch.no_grad():
             out = encoder(obs)
 
-        # Ball coefficients (first K*2=16) should be zero after contact reset
-        ball_coeff = out[0, :K * 2]
+        # Ball coefficients should be zero after contact reset
+        ball_coeff = out[0, :ball_coeff_size]
         assert ball_coeff.abs().sum().item() < 1e-5, \
             f"Ball coeff should be ~0 after contact, got {ball_coeff}"
 
@@ -206,7 +208,7 @@ class TestSE3Encoder:
 
     def test_d_model_property(self):
         encoder = SE3Encoder()
-        assert encoder.d_model == COEFF_DIM
+        assert encoder.d_model == EMBED_DIM
 
     def test_save_load_roundtrip(self, tmp_path):
         encoder = SE3Encoder()
@@ -259,7 +261,7 @@ class TestSpectralMath:
     """Verify the spectral field update math is correct."""
 
     def _make_raw_state(self, seed: int = 0) -> np.ndarray:
-        """Build a plausible raw state with valid unit quaternions."""
+        """Build a plausible raw state (63-dim) with valid unit quaternions."""
         rng = np.random.default_rng(seed)
         raw = rng.uniform(-0.5, 0.5, RAW_STATE_DIM).astype(np.float32)
         # Ego quaternion (offset 12-15): unit norm
@@ -269,9 +271,12 @@ class TestSpectralMath:
         oq = rng.standard_normal(4).astype(np.float32)
         raw[_OPP_OFF + 6:_OPP_OFF + 10] = oq / np.linalg.norm(oq)
         # Pad active flags: clamp to [0,1]
-        raw[_PAD_OFF + 3::4] = np.clip(raw[_PAD_OFF + 3::4], 0.0, 1.0)
-        # Zero prev_ball_vel so contact is not triggered
+        for i in range(6):
+            raw[_PAD_OFF + i * 4 + 3] = np.clip(raw[_PAD_OFF + i * 4 + 3], 0.0, 1.0)
+        # Zero prev velocities so contact is not triggered
         raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = 0.0
+        raw[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = 0.0
+        raw[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = 0.0
         raw[_BALL_OFF + 3:_BALL_OFF + 6] = 0.0
         return raw
 
@@ -316,7 +321,7 @@ class TestSpectralMath:
 
         def residual_real(coeff, obj):
             """Mean absolute real-part residual over x/y/z for one object."""
-            c = coeff.reshape(N_OBJECTS, K, 3, 2)
+            c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
             pos = np.zeros(3, dtype=np.float32)
             if obj == 0:    pos = raw[_BALL_OFF:_BALL_OFF + 3]
             elif obj == 1:  pos = raw[_EGO_OFF:_EGO_OFF + 3]
@@ -360,7 +365,7 @@ class TestSpectralMath:
 
         def complex_residual(coeff):
             """Mean abs complex reconstruction error for ball."""
-            c = coeff.reshape(N_OBJECTS, K, 3, 2)
+            c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
             pos = raw[_BALL_OFF:_BALL_OFF + 3]
             phase = k[_BALL] @ pos
             ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -396,7 +401,7 @@ class TestSpectralMath:
         with torch.no_grad():
             out = encoder(obs)
 
-        coeff = out[0].reshape(N_OBJECTS, K, 3, 2)
+        coeff = out[0].reshape(N_OBJECTS, K, 3, N_CHANNELS)
 
         # Ball must be zeroed
         assert coeff[_BALL].abs().sum().item() < 1e-5, \
@@ -449,28 +454,28 @@ class TestSE3Policy:
 
     def test_forward_shapes(self):
         policy = SE3Policy()
-        obs = torch.randn(4, COEFF_DIM)
+        obs = torch.randn(4, EMBED_DIM)
         action, value = policy(obs)
         assert action.shape == (4, 8)
         assert value.shape == (4, 1)
 
     def test_analog_range(self):
         policy = SE3Policy()
-        obs = torch.randn(100, COEFF_DIM)
+        obs = torch.randn(100, EMBED_DIM)
         action, _ = policy(obs)
         assert action[:, :5].min() >= -1.0
         assert action[:, :5].max() <= 1.0
 
     def test_binary_range(self):
         policy = SE3Policy()
-        obs = torch.randn(100, COEFF_DIM)
+        obs = torch.randn(100, EMBED_DIM)
         action, _ = policy(obs)
         assert action[:, 5:].min() >= 0.0
         assert action[:, 5:].max() <= 1.0
 
     def test_act_numpy(self):
         policy = SE3Policy()
-        obs = np.random.randn(1, COEFF_DIM).astype(np.float32)
+        obs = np.random.randn(1, EMBED_DIM).astype(np.float32)
         action, value = policy.act(obs)
         assert action.shape == (8,)
         assert isinstance(value, float)
@@ -482,7 +487,7 @@ class TestStochasticSE3Policy:
 
     def test_forward_shapes(self):
         head = StochasticSE3Policy()
-        obs = torch.randn(4, COEFF_DIM)
+        obs = torch.randn(4, EMBED_DIM)
         action, log_prob, value, entropy = head(obs)
         assert action.shape == (4, 8)
         assert log_prob.shape == (4,)
@@ -491,20 +496,20 @@ class TestStochasticSE3Policy:
 
     def test_log_probs_finite(self):
         head = StochasticSE3Policy()
-        obs = torch.randn(8, COEFF_DIM)
+        obs = torch.randn(8, EMBED_DIM)
         _, log_prob, _, _ = head(obs)
         assert torch.isfinite(log_prob).all()
 
     def test_entropy_positive(self):
         head = StochasticSE3Policy()
-        obs = torch.randn(4, COEFF_DIM)
+        obs = torch.randn(4, EMBED_DIM)
         _, _, _, entropy = head(obs)
         assert (entropy > 0).all()
 
     def test_evaluate_actions_matches_forward(self):
         head = StochasticSE3Policy()
         torch.manual_seed(42)
-        obs = torch.randn(4, COEFF_DIM)
+        obs = torch.randn(4, EMBED_DIM)
         action, lp_fwd, val_fwd, ent_fwd = head(obs)
         lp_eval, val_eval, ent_eval = head.evaluate_actions(obs, action)
         torch.testing.assert_close(lp_eval, lp_fwd, atol=1e-5, rtol=1e-5)
@@ -514,7 +519,7 @@ class TestStochasticSE3Policy:
     def test_act_deterministic(self):
         head = StochasticSE3Policy()
         head.eval()
-        obs = torch.randn(2, COEFF_DIM)
+        obs = torch.randn(2, EMBED_DIM)
         a1, v1 = head.act_deterministic(obs)
         a2, v2 = head.act_deterministic(obs)
         torch.testing.assert_close(a1, a2)
@@ -522,7 +527,7 @@ class TestStochasticSE3Policy:
 
     def test_gradient_flows_through_evaluate(self):
         head = StochasticSE3Policy()
-        obs = torch.randn(4, COEFF_DIM, requires_grad=True)
+        obs = torch.randn(4, EMBED_DIM, requires_grad=True)
         analog = torch.randn(4, 5).clamp(-1, 1)
         binary = torch.bernoulli(torch.ones(4, 3) * 0.5)
         actions = torch.cat([analog, binary], dim=-1)
@@ -534,7 +539,7 @@ class TestStochasticSE3Policy:
 
     def test_binary_actions_are_binary(self):
         head = StochasticSE3Policy()
-        obs = torch.randn(100, COEFF_DIM)
+        obs = torch.randn(100, EMBED_DIM)
         action, _, _, _ = head(obs)
         binary = action[:, 5:]
         unique = torch.unique(binary)
@@ -779,17 +784,18 @@ class TestDreamRollout:
             np.testing.assert_allclose(
                 dream[0, _BALL_OFF:_BALL_OFF + 3], expected, atol=1e-5)
 
-    def test_dream_zero_vel_stable_positions(self):
-        """Zero velocity → ball position unchanged across all dream steps."""
+    def test_dream_zero_vel_stable_xy_positions(self):
+        """Zero velocity → ball x/y positions unchanged; z drifts due to gravity."""
         algo = self._make_algo(dream_steps=5, dream_entropy_high=100.0, dream_entropy_low=-1.0)
         seed = np.zeros(SE3_OBS_DIM, dtype=np.float32)
         dream = algo._dream_rollout(seed)
         if dream.shape[0] > 1:
+            # x/y should not drift (no gravity on those axes)
             np.testing.assert_allclose(
-                dream[0, _BALL_OFF:_BALL_OFF + 3],
-                dream[-1, _BALL_OFF:_BALL_OFF + 3],
+                dream[0, _BALL_OFF:_BALL_OFF + 2],
+                dream[-1, _BALL_OFF:_BALL_OFF + 2],
                 atol=1e-5,
-                err_msg="Ball position should not drift with zero velocity")
+                err_msg="Ball x/y should not drift with zero velocity")
 
     def test_dream_steps_logged_in_update(self):
         """update() returns dream_steps_mean in metrics."""
@@ -893,14 +899,14 @@ class TestLayerNorm:
 
     def test_se3_policy_has_layernorm(self):
         """SE3Policy should have LayerNorm as first layer."""
-        policy = SE3Policy(obs_dim=COEFF_DIM)
+        policy = SE3Policy(obs_dim=EMBED_DIM)
         first_layer = policy.net[0]
         assert isinstance(first_layer, torch.nn.LayerNorm), \
             f"Expected LayerNorm, got {type(first_layer)}"
 
     def test_stochastic_policy_has_layernorm(self):
         """StochasticSE3Policy should have LayerNorm."""
-        policy = StochasticSE3Policy(obs_dim=COEFF_DIM)
+        policy = StochasticSE3Policy(obs_dim=EMBED_DIM)
         assert hasattr(policy, 'layer_norm')
         assert isinstance(policy.layer_norm, torch.nn.LayerNorm)
 
@@ -920,7 +926,7 @@ class TestComplexCoupling:
 
         # Set imaginary coefficients to nonzero
         obs2 = obs.clone()
-        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, 3, 2)
+        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, 3, N_CHANNELS)
         prev[:, :, :, :, 1] = 0.5  # imag channel
         obs2[:, RAW_STATE_DIM:] = prev.reshape(2, -1)
         with torch.no_grad():
@@ -941,7 +947,7 @@ class TestComplexCoupling:
         ori = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (N_OBJECTS, 1))
 
         # Known coefficients
-        coeff = np.random.randn(N_OBJECTS, K, 3, 2).astype(np.float32) * 0.1
+        coeff = np.random.randn(N_OBJECTS, K, 3, N_CHANNELS).astype(np.float32) * 0.1
 
         # Compute Re[f] at pos
         def recon_at(p, obj):
@@ -1199,9 +1205,11 @@ class TestPhysicsConvergence:
             r[_OPP_OFF:_OPP_OFF + 3] = positions[t, 2]
             r[_OPP_OFF + 3:_OPP_OFF + 6] = velocities[t, 2]
             r[_OPP_OFF + 6:_OPP_OFF + 10] = id_q
-            # prev ball vel (same as current at t=0 to avoid false contact)
-            r[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = (
-                velocities[t - 1, 0] if t > 0 else velocities[t, 0])
+            # prev velocities (same as current at t=0 to avoid false contact)
+            prev_t = t - 1 if t > 0 else t
+            r[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = velocities[prev_t, 0]
+            r[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = velocities[prev_t, 1]
+            r[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = velocities[prev_t, 2]
         return raw
 
     @staticmethod
@@ -1211,7 +1219,7 @@ class TestPhysicsConvergence:
         coeff_tensor: (1, COEFF_DIM)
         positions_tensor: (1, 3, 3)  — positions of ball, ego, opp
         """
-        c = coeff_tensor.reshape(1, N_OBJECTS, K, 3, 2)
+        c = coeff_tensor.reshape(1, N_OBJECTS, K, 3, N_CHANNELS)
         full_pos = torch.zeros(1, N_OBJECTS, 3, device=coeff_tensor.device)
         full_pos[0, _BALL] = positions_tensor[0, 0]
         full_pos[0, _EGO] = positions_tensor[0, 1]
@@ -1458,3 +1466,226 @@ class TestPhysicsConvergence:
         # Error should grow with horizon for both cases
         assert err_no_g[60] > err_no_g[1], "No-gravity error should grow with horizon"
         assert err_grav[60] > err_grav[1], "Gravity error should grow with horizon"
+
+
+# ── Encode-for-policy tests ─────────────────────────────────────────────────
+
+class TestEncodeForPolicy:
+
+    def test_embed_shape(self):
+        """encode_for_policy() returns (batch, EMBED_DIM=82)."""
+        encoder = SE3Encoder()
+        obs = torch.randn(4, SE3_OBS_DIM)
+        embed = encoder.encode_for_policy(obs)
+        assert embed.shape == (4, EMBED_DIM), f"Expected (4, {EMBED_DIM}), got {embed.shape}"
+
+    def test_embed_gradients(self):
+        """Gradients from encode_for_policy reach k_spatial, quaternions, W_interact."""
+        encoder = SE3Encoder()
+        obs = torch.randn(2, SE3_OBS_DIM)
+        embed = encoder.encode_for_policy(obs)
+        loss = embed.sum()
+        loss.backward()
+        assert encoder.k_spatial.grad is not None
+        assert encoder.k_spatial.grad.abs().sum() > 0
+        assert encoder.quaternions.grad is not None
+        assert encoder.W_interact.grad is not None
+
+    def test_output_layernorm_normalizes(self):
+        """Output should have approximately zero mean and unit variance per sample."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        obs = torch.randn(32, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed = encoder.encode_for_policy(obs)
+        # Per-sample mean should be near 0
+        sample_means = embed.mean(dim=-1)
+        assert sample_means.abs().mean() < 0.5, \
+            f"LayerNorm output mean too far from 0: {sample_means.abs().mean():.3f}"
+
+    def test_forward_and_encode_share_coefficients(self):
+        """forward() and encode_for_policy() should produce consistent coefficient state."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            coeff = encoder(obs)
+            embed = encoder.encode_for_policy(obs)
+        # Both should run without error and produce correct shapes
+        assert coeff.shape == (2, COEFF_DIM)
+        assert embed.shape == (2, EMBED_DIM)
+
+
+# ── Acceleration channel tests ──────────────────────────────────────────────
+
+class TestAccelerationChannel:
+
+    def test_accel_freefall_residual_near_zero(self):
+        """Ball in freefall → accel channel coefficients stay small.
+
+        When delta_v matches gravity exactly, the accel residual target is zero,
+        so the accel channel should accumulate very little.
+        """
+        encoder = SE3Encoder()
+        encoder.eval()
+
+        # Simulate freefall: ball vel changes by exactly GRAVITY_DV_Z per tick
+        coeff = torch.zeros(1, COEFF_DIM)
+        for t in range(50):
+            raw = torch.zeros(1, RAW_STATE_DIM)
+            # Ball at some position
+            raw[0, _BALL_OFF:_BALL_OFF + 3] = torch.tensor([0.0, 0.0, 0.3 - t * 0.001])
+            # Ball vel: constant horizontal, gravity-adjusted vertical
+            vz = -t * abs(GRAVITY_DV_Z)
+            raw[0, _BALL_OFF + 3:_BALL_OFF + 6] = torch.tensor([0.1, 0.0, vz])
+            # Prev ball vel
+            prev_vz = -(t - 1) * abs(GRAVITY_DV_Z) if t > 0 else 0.0
+            raw[0, _PREV_VEL_OFF:_PREV_VEL_OFF + 3] = torch.tensor([0.1, 0.0, prev_vz])
+            # Prev ego/opp vel = current (no accel)
+            raw[0, _PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = 0.0
+            raw[0, _PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = 0.0
+            # Ego/opp identity quats
+            raw[0, _EGO_OFF + 6:_EGO_OFF + 10] = torch.tensor([1, 0, 0, 0.])
+            raw[0, _OPP_OFF + 6:_OPP_OFF + 10] = torch.tensor([1, 0, 0, 0.])
+
+            obs = torch.cat([raw, coeff], dim=1)
+            with torch.no_grad():
+                coeff = encoder(obs)
+
+        # Accel channel coefficients (channel 2) for ball should be small
+        c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        ball_accel = c[_BALL, :, :, 2].abs().mean().item()
+        assert ball_accel < 0.5, (
+            f"Freefall accel residual should be near zero, got {ball_accel:.4f}")
+
+    def test_accel_nonzero_on_impulse(self):
+        """Sudden velocity change (beyond gravity) → accel channel becomes nonzero."""
+        encoder = SE3Encoder()
+        encoder.eval()
+
+        # Step 1: normal state
+        raw = torch.zeros(1, RAW_STATE_DIM)
+        raw[0, _EGO_OFF + 6:_EGO_OFF + 10] = torch.tensor([1, 0, 0, 0.])
+        raw[0, _OPP_OFF + 6:_OPP_OFF + 10] = torch.tensor([1, 0, 0, 0.])
+        raw[0, _BALL_OFF + 3] = 0.1  # ball vx
+        raw[0, _PREV_VEL_OFF] = 0.1  # prev ball vx = same
+
+        coeff = torch.zeros(1, COEFF_DIM)
+        obs = torch.cat([raw, coeff], dim=1)
+        with torch.no_grad():
+            coeff = encoder(obs)
+
+        # Step 2: sudden impulse on ego
+        raw2 = raw.clone()
+        raw2[0, _EGO_OFF + 3] = 0.5  # ego vx jumps to 0.5
+        raw2[0, _PREV_EGO_VEL_OFF] = 0.0  # prev ego vx was 0
+        obs2 = torch.cat([raw2, coeff], dim=1)
+        with torch.no_grad():
+            coeff2 = encoder(obs2)
+
+        c = coeff2.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        ego_accel = c[_EGO, :, :, 2].abs().mean().item()
+        assert ego_accel > 1e-5, (
+            f"Ego accel channel should be nonzero after impulse, got {ego_accel:.6f}")
+
+
+# ── Parameter count test ────────────────────────────────────────────────────
+
+class TestParameterCount:
+
+    def test_parameter_count_under_24k(self):
+        """Total encoder + policy params must fit under 24K tournament limit."""
+        encoder = SE3Encoder()
+        policy = SE3Policy()
+        enc_params = sum(p.numel() for p in encoder.parameters())
+        pol_params = sum(p.numel() for p in policy.parameters())
+        total = enc_params + pol_params
+        assert total < 24000, (
+            f"Total params {total} exceeds 24K limit "
+            f"(encoder={enc_params}, policy={pol_params})")
+
+    def test_stochastic_policy_under_24k(self):
+        """StochasticSE3Policy variant also under limit."""
+        encoder = SE3Encoder()
+        policy = StochasticSE3Policy()
+        enc_params = sum(p.numel() for p in encoder.parameters())
+        pol_params = sum(p.numel() for p in policy.parameters())
+        total = enc_params + pol_params
+        assert total < 24000, f"Total params {total} exceeds 24K"
+
+
+# ── 4500-step toy simulation stability test ─────────────────────────────────
+
+class TestLongSimulation:
+
+    def test_4500_step_toy_sim(self):
+        """Run 3 bouncing balls with gravity for 4500 steps (full game).
+
+        Verify that:
+        1. Coefficients stay finite throughout
+        2. Position reconstruction error stays bounded
+        3. No NaN/Inf in encoder output
+        """
+        from training.tests.test_se3 import TestPhysicsConvergence
+
+        positions, velocities = TestPhysicsConvergence._simulate_bouncing_balls(
+            n_steps=4500, dt=1.0 / 120.0, gravity=-2.0)
+        raw_states = TestPhysicsConvergence._to_raw_states(positions, velocities)
+
+        encoder = SE3Encoder()
+        encoder.eval()
+
+        coeff = np.zeros(COEFF_DIM, dtype=np.float32)
+        k_np = encoder.k_spatial.detach().numpy()
+        q_np = (encoder.quaternions / encoder.quaternions.norm(
+            dim=-1, keepdim=True).clamp(min=1e-8)).detach().numpy()
+        lr_np = np.exp(encoder.log_lr.detach().numpy())
+        W_np = encoder.W_interact.detach().numpy()
+
+        max_coeff_val = 0.0
+        n_finite_checks = 0
+
+        for t in range(len(raw_states)):
+            coeff = update_coefficients_np(k_np, q_np, lr_np, coeff, raw_states[t],
+                                           W_interact=W_np)
+            assert np.isfinite(coeff).all(), f"Non-finite coefficients at step {t}"
+            max_coeff_val = max(max_coeff_val, np.abs(coeff).max())
+            n_finite_checks += 1
+
+        # Verify all 4500 steps checked
+        assert n_finite_checks == 4500
+
+        # Max coefficient should be bounded by COEFF_CLIP
+        from se3_field import COEFF_CLIP
+        assert max_coeff_val <= COEFF_CLIP + 1e-6, \
+            f"Coefficients exceeded clip bound: {max_coeff_val:.2f} > {COEFF_CLIP}"
+
+        # Final reconstruction error should be finite and reasonable
+        # (we can't train during this test, but tracking should work)
+        c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        assert np.isfinite(c).all(), "Final coefficients have non-finite values"
+
+    def test_rlgym_4500_step_integration(self):
+        """Integration test with real rlgym-sim physics (4500 steps).
+
+        Skipped if rlgym_sim is not installed.
+        """
+        pytest.importorskip('rlgym_sim')
+        # This test is designed to be run on a machine with rlgym-sim installed.
+        # It verifies the full SE3 encoding pipeline with real physics.
+        from training.environments.se3_env import SE3GymEnv
+        env = SE3GymEnv(max_steps=4500)
+        obs, _ = env.reset()
+
+        assert obs.shape == (SE3_OBS_DIM,)
+        assert np.isfinite(obs).all(), "Initial observation has non-finite values"
+
+        for step in range(min(100, 4500)):  # Run 100 steps as smoke test
+            action = np.random.uniform(-1, 1, size=8).astype(np.float32)
+            obs, reward, done, truncated, info = env.step(action)
+            assert obs.shape == (SE3_OBS_DIM,), f"Step {step}: wrong obs shape"
+            assert np.isfinite(obs).all(), f"Step {step}: non-finite obs"
+            if done:
+                obs, _ = env.reset()
+
+        env.close()

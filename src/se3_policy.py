@@ -3,11 +3,11 @@ SE3 Policy Heads
 ================
 MLP policy + value heads for the SE(3) spectral field representation.
 
-Takes 128-dim coefficient observation from SE3Encoder and outputs:
+Takes 82-dim physical summary from SE3Encoder.encode_for_policy() and outputs:
   policy  (batch, 8)  — 5 analog [-1,1] + 3 binary [0,1]
   value   (batch, 1)  — state-value estimate
 
-Hidden dim = 64 (~13K total params).
+Hidden dim = 64 (~10K total params).
 
 Action layout (same as PolicyHead):
   [0] throttle    tanh  [-1,  1]
@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from se3_field import COEFF_DIM
+from se3_field import EMBED_DIM
 
 _HIDDEN = 64
 _ANALOG_DIM = 5
@@ -40,7 +40,7 @@ _ACTION_DIM = 8
 class SE3Policy(nn.Module):
     """Deterministic policy for bot inference."""
 
-    def __init__(self, obs_dim: int = COEFF_DIM, hidden: int = _HIDDEN):
+    def __init__(self, obs_dim: int = EMBED_DIM, hidden: int = _HIDDEN):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(obs_dim),
@@ -57,7 +57,7 @@ class SE3Policy(nn.Module):
         self, obs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        obs: (batch, 128)
+        obs: (batch, EMBED_DIM)
         returns: policy (batch, 8), value (batch, 1)
         """
         h = self.net(obs)
@@ -68,7 +68,7 @@ class SE3Policy(nn.Module):
         return policy, value
 
     def act(self, obs: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Deterministic action for runtime. obs: (1, 128) numpy."""
+        """Deterministic action for runtime. obs: (1, EMBED_DIM) numpy."""
         self.eval()
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -94,7 +94,7 @@ class StochasticSE3Policy(nn.Module):
     BINARY_DIM = _BINARY_DIM
     ACTION_DIM = _ACTION_DIM
 
-    def __init__(self, obs_dim: int = COEFF_DIM, hidden: int = _HIDDEN):
+    def __init__(self, obs_dim: int = EMBED_DIM, hidden: int = _HIDDEN):
         super().__init__()
         self.layer_norm = nn.LayerNorm(obs_dim)
         self.hidden1 = nn.Linear(obs_dim, hidden)
@@ -115,7 +115,7 @@ class StochasticSE3Policy(nn.Module):
         """
         Sample actions, return (action, log_prob, value, entropy).
 
-        obs: (batch, 128)
+        obs: (batch, EMBED_DIM)
         """
         h = self._features(obs)
 

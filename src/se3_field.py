@@ -14,11 +14,20 @@ conversion enforces w >= 0 for consistent sign from game observations.
 
 Architecture
 ------------
-    Env: raw_state (57) + prev_coefficients (128) = 185-dim obs
+    Env: raw_state (63) + prev_coefficients (576) = 639-dim obs
          ↓
     SE3Encoder.forward(packed_obs)       ← k_spatial, quaternions are nn.Parameters
          ↓
-    128-dim updated coefficients         (differentiable w.r.t. field geometry)
+    576-dim updated coefficients         (internal, for env persistence)
+
+    SE3Encoder.encode_for_policy(packed_obs)
+         ↓
+    82-dim physical summary              (pos/vel/accel + context, LayerNorm'd)
+
+Coefficient layout (internal, 3 channels per spectral component):
+    channel 0: position real (cosine)
+    channel 1: position imaginary (sine)
+    channel 2: acceleration residual (observed_accel - gravity)
 """
 
 from __future__ import annotations
@@ -49,10 +58,16 @@ OBJECTS: List[str] = [
 
 K = 8                              # spectral components per field
 N_OBJECTS = len(OBJECTS)            # 8
-COEFF_DIM = N_OBJECTS * K * 3 * 2  # 384  (x/y/z × real/imag per component)
-RAW_STATE_DIM = 57                 # see layout table in plan
-SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 441
+N_CHANNELS = 3                     # real, imaginary, acceleration residual
+COEFF_DIM = N_OBJECTS * K * 3 * N_CHANNELS  # 576
+RAW_STATE_DIM = 63                 # 57 base + prev ego vel(3) + prev opp vel(3)
+EMBED_DIM = 82                     # physical summary for policy
+SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 639
 COEFF_CLIP = 10.0                  # clamp coefficients to [-CLIP, CLIP]
+
+# Gravity: normalised per-tick velocity change on z-axis
+# Rocket League gravity ≈ 650 uu/s², MAX_VEL=2300, tick=1/120
+GRAVITY_DV_Z = -650.0 / (2300.0 * 120.0)  # ≈ -0.002355 per tick
 
 # Object indices in OBJECTS list
 _BALL = 0
@@ -71,6 +86,8 @@ _OPP_OFF = 17    # pos(3) + vel(3) + quat(4) = 10
 _PAD_OFF = 27    # 6 pads × (pos(3) + active(1)) = 24
 _GS_OFF = 51     # score_diff + time_rem + overtime = 3
 _PREV_VEL_OFF = 54  # prev ball vel(3)
+_PREV_EGO_VEL_OFF = 57  # prev ego vel(3)
+_PREV_OPP_VEL_OFF = 60  # prev opp vel(3)
 
 # Identity quaternion (w, x, y, z)
 _QUAT_IDENTITY = torch.tensor([1.0, 0.0, 0.0, 0.0])
@@ -177,15 +194,17 @@ class SE3Encoder(nn.Module):
     Parameters (learned via backprop):
         k_spatial:   [N_OBJECTS, K, 3]  spatial frequency vectors
         quaternions: [N_OBJECTS, K, 4]  orientation basis (unit quaternions)
-        update_lr:   [N_OBJECTS]        per-object coefficient update rate
+        log_lr:      [N_OBJECTS]        per-object coefficient update rate
+        W_interact:  [N_OBJECTS, N_OBJECTS]  pairwise coupling
+        output_norm: LayerNorm(EMBED_DIM)  normalises physical summary
 
-    Forward pass:
-        Input:  (batch, 185) = [raw_state (57) | prev_coefficients (128)]
-        Output: (batch, 128) = updated coefficients (differentiable w.r.t. params)
+    forward(packed_obs):
+        Input:  (batch, SE3_OBS_DIM=639)
+        Output: (batch, COEFF_DIM=576) updated coefficients (for env persistence)
 
-    The coefficient update is a single-step residual rule, providing a
-    gradient path from the policy loss to the field geometry via truncated
-    BPTT (depth 1).
+    encode_for_policy(packed_obs):
+        Input:  (batch, SE3_OBS_DIM=639)
+        Output: (batch, EMBED_DIM=82) normalised physical summary
     """
 
     def __init__(self):
@@ -206,23 +225,29 @@ class SE3Encoder(nn.Module):
         # Learned pairwise interaction weights (zero-init = no coupling at start)
         self.W_interact = nn.Parameter(torch.zeros(N_OBJECTS, N_OBJECTS))
 
+        # LayerNorm on physical summary output
+        self.output_norm = nn.LayerNorm(EMBED_DIM)
+
     @property
     def d_model(self) -> int:
-        """Output dimensionality (for interface compatibility)."""
-        return COEFF_DIM
+        """Output dimensionality for policy (EMBED_DIM)."""
+        return EMBED_DIM
 
-    def forward(self, packed_obs: torch.Tensor) -> torch.Tensor:
-        """
-        packed_obs: (batch, 185)
-        returns:    (batch, 128) updated coefficients
+    def _update_coefficients(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Core coefficient update. Returns (new_coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d).
+
+        new_coeff_flat: (batch, COEFF_DIM=576) for env persistence
+        basis_cos/sin:  (batch, N_OBJECTS, K, 1) for reconstruction
+        raw:            (batch, RAW_STATE_DIM) parsed raw state
+        new_coeff_5d:   (batch, N_OBJECTS, K, 3, 3) structured coefficients
         """
         batch = packed_obs.shape[0]
         device = packed_obs.device
 
         # Split raw state and previous coefficients
-        raw = packed_obs[:, :RAW_STATE_DIM]               # (batch, 57)
-        prev_coeff = packed_obs[:, RAW_STATE_DIM:]         # (batch, 384)
-        prev_coeff = prev_coeff.reshape(batch, N_OBJECTS, K, 3, 2)
+        raw = packed_obs[:, :RAW_STATE_DIM]                # (batch, 63)
+        prev_coeff = packed_obs[:, RAW_STATE_DIM:]          # (batch, 576)
+        prev_coeff = prev_coeff.reshape(batch, N_OBJECTS, K, 3, N_CHANNELS)
 
         # Effective learning rates (positive via exp)
         lr = torch.exp(self.log_lr).unsqueeze(0)           # (1, N_OBJECTS)
@@ -235,16 +260,17 @@ class SE3Encoder(nn.Module):
         ball_pos = raw[:, _BALL_OFF:_BALL_OFF + 3]         # (batch, 3)
         ball_vel = raw[:, _BALL_OFF + 3:_BALL_OFF + 6]     # (batch, 3)
         ego_pos = raw[:, _EGO_OFF:_EGO_OFF + 3]
+        ego_vel = raw[:, _EGO_OFF + 3:_EGO_OFF + 6]
         ego_quat = raw[:, _EGO_OFF + 6:_EGO_OFF + 10]     # (batch, 4)
         opp_pos = raw[:, _OPP_OFF:_OPP_OFF + 3]
+        opp_vel = raw[:, _OPP_OFF + 3:_OPP_OFF + 6]
         opp_quat = raw[:, _OPP_OFF + 6:_OPP_OFF + 10]
         prev_ball_vel = raw[:, _PREV_VEL_OFF:_PREV_VEL_OFF + 3]
+        prev_ego_vel = raw[:, _PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3]
+        prev_opp_vel = raw[:, _PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3]
 
         # Identity quaternion for objects without orientation
         id_q = _QUAT_IDENTITY.to(device).unsqueeze(0).expand(batch, 4)
-
-        # Assemble per-object positions and quaternions via torch.cat
-        # (no in-place indexed assignment — preserves autograd graph)
 
         # Boost: mean position of active pads
         pad_data = raw[:, _PAD_OFF:_PAD_OFF + 24].reshape(batch, 6, 4)
@@ -286,70 +312,138 @@ class SE3Encoder(nn.Module):
         # ── contact detection (ball) ─────────────────────────────────────
         contact = detect_contact(prev_ball_vel, ball_vel)   # (batch,)
 
-        # ── spectral field update (batched, differentiable) ──────────────
-        # Spatial components: cos (real) and sin (imaginary)
-        # k_spatial: (N_OBJECTS, K, 3), positions: (batch, N_OBJECTS, 3)
-        # -> phase, spatial_cos, spatial_sin: (batch, N_OBJECTS, K)
+        # ── spectral basis computation ───────────────────────────────────
         phase = torch.einsum('okd,bod->bok', self.k_spatial, positions)
         spatial_cos = torch.cos(phase)
         spatial_sin = torch.sin(phase)
-
-        # Orientation component: quaternion inner product
-        # q_basis: (N_OBJECTS, K, 4), orientations: (batch, N_OBJECTS, 4)
-        # -> orient: (batch, N_OBJECTS, K)
         orient = torch.einsum('okd,bod->bok', q_basis, orientations)
 
-        # Target: full 3D position vector (batch, N_OBJECTS, 3)
-        target = positions
-
-        # ── Complex spectral field reconstruction ────────────────────────
-        # Re[f(x)] = Σ_k (a_k·cos(k·x)·q - b_k·sin(k·x)·q)
-        # where a_k = coeff_real, b_k = coeff_imag
         basis_cos = (spatial_cos * orient).unsqueeze(-1)   # (batch, N_OBJECTS, K, 1)
         basis_sin = (spatial_sin * orient).unsqueeze(-1)
+
+        # ── Position channels (0=real, 1=imag): complex LMS ─────────────
+        target = positions                                  # (batch, N_OBJECTS, 3)
         coeff_a = prev_coeff[:, :, :, :, 0]                # (batch, N_OBJECTS, K, 3)
         coeff_b = prev_coeff[:, :, :, :, 1]
         predicted = (basis_cos * coeff_a - basis_sin * coeff_b).sum(dim=2)
-        # predicted: (batch, N_OBJECTS, 3)
 
         residual = target - predicted                       # (batch, N_OBJECTS, 3)
 
-        # ── Cross-object coupling: mix residuals via W_interact ──────────
+        # Cross-object coupling on position residuals
         W_eff = torch.eye(N_OBJECTS, device=device) + self.W_interact
         residual = torch.einsum('ij,bjd->bid', W_eff, residual)
 
-        # ── Complex LMS coefficient update ───────────────────────────────
-        # ∂Re[f]/∂a_k = cos·q  →  delta_a = lr × residual × cos·q
-        # ∂Re[f]/∂b_k = -sin·q →  delta_b = -lr × residual × sin·q
-        scaled_res = (lr.unsqueeze(-1) * residual).unsqueeze(2)  # (batch, N_OBJECTS, 1, 3)
-        delta_real = scaled_res * basis_cos                  # (batch, N_OBJECTS, K, 3)
+        # LMS update for position channels
+        scaled_res = (lr.unsqueeze(-1) * residual).unsqueeze(2)
+        delta_real = scaled_res * basis_cos
         delta_imag = -scaled_res * basis_sin
 
-        new_coeff_real = coeff_a + delta_real                # (batch, N_OBJECTS, K, 3)
+        new_coeff_real = coeff_a + delta_real
         new_coeff_imag = coeff_b + delta_imag
 
-        # Reset ball coefficients on contact (mask multiply, no in-place)
-        # contact_keep: 0.0 if contact, 1.0 if no contact → (batch, 1)
-        contact_keep = (1.0 - contact.float()).unsqueeze(-1)
+        # ── Acceleration channel (2): gravity-residual LMS ───────────────
+        # Compute per-tick delta_v for moveable objects, subtract gravity
+        gravity_vec = torch.tensor([0.0, 0.0, GRAVITY_DV_Z], device=device)
+        # delta_v = vel[t] - vel[t-1]
+        ball_dv = ball_vel - prev_ball_vel - gravity_vec
+        ego_dv = ego_vel - prev_ego_vel - gravity_vec
+        opp_dv = opp_vel - prev_opp_vel - gravity_vec
 
-        # obj_keep: (batch, N_OBJECTS, 1) — ball uses contact_keep, others 1
+        # Build per-object accel target: (batch, N_OBJECTS, 3)
+        # Static objects get zero accel target
+        accel_target = torch.zeros(batch, N_OBJECTS, 3, device=device)
+        # Use torch.cat approach for autograd safety
+        accel_list = [
+            ball_dv.unsqueeze(1),   # _BALL
+            ego_dv.unsqueeze(1),    # _EGO
+            ego_dv.unsqueeze(1),    # _TEAM = ego in 1v1
+            opp_dv.unsqueeze(1),    # _OPP
+            zeros3.unsqueeze(1),    # _STADIUM
+            zeros3.unsqueeze(1),    # _GOAL_TEAM
+            zeros3.unsqueeze(1),    # _GOAL_OPP
+            zeros3.unsqueeze(1),    # _BOOST
+        ]
+        accel_target = torch.cat(accel_list, dim=1)  # (batch, 8, 3)
+
+        coeff_c = prev_coeff[:, :, :, :, 2]           # (batch, N_OBJECTS, K, 3)
+        accel_predicted = (basis_cos * coeff_c).sum(dim=2)  # (batch, N_OBJECTS, 3)
+        accel_residual = accel_target - accel_predicted
+
+        # Cross-object coupling on accel residuals (same W_interact)
+        accel_residual = torch.einsum('ij,bjd->bid', W_eff, accel_residual)
+
+        scaled_accel_res = (lr.unsqueeze(-1) * accel_residual).unsqueeze(2)
+        delta_accel = scaled_accel_res * basis_cos
+        new_coeff_accel = coeff_c + delta_accel
+
+        # ── Contact reset: zero all channels for ball ────────────────────
+        contact_keep = (1.0 - contact.float()).unsqueeze(-1)
         obj_keep_list = [
             contact_keep.unsqueeze(1) if i == _BALL
             else torch.ones(batch, 1, 1, device=device)
             for i in range(N_OBJECTS)
         ]
-        obj_keep = torch.cat(obj_keep_list, dim=1)  # (batch, N_OBJECTS, 1)
-
-        # obj_keep: (batch, N_OBJECTS, 1) → broadcast over K and 3 axes
-        obj_keep = obj_keep.unsqueeze(-1)                  # (batch, N_OBJECTS, 1, 1)
+        obj_keep = torch.cat(obj_keep_list, dim=1).unsqueeze(-1)  # (batch, N_OBJECTS, 1, 1)
         new_coeff_real = new_coeff_real * obj_keep
         new_coeff_imag = new_coeff_imag * obj_keep
+        new_coeff_accel = new_coeff_accel * obj_keep
 
-        # Stack and flatten: (batch, N_OBJECTS, K, 3, 2) → (batch, 384)
-        new_coeff = torch.stack([new_coeff_real, new_coeff_imag], dim=-1)
-        # Clamp to prevent unbounded growth over long episodes
+        # Stack all 3 channels: (batch, N_OBJECTS, K, 3, 3) → (batch, 576)
+        new_coeff = torch.stack([new_coeff_real, new_coeff_imag, new_coeff_accel], dim=-1)
         new_coeff = torch.clamp(new_coeff, -COEFF_CLIP, COEFF_CLIP)
-        return new_coeff.reshape(batch, COEFF_DIM)
+
+        return new_coeff.reshape(batch, COEFF_DIM), basis_cos, basis_sin, raw, new_coeff
+
+    def forward(self, packed_obs: torch.Tensor) -> torch.Tensor:
+        """Update coefficients (for env persistence / buffer storage).
+
+        packed_obs: (batch, SE3_OBS_DIM=639)
+        returns:    (batch, COEFF_DIM=576) updated coefficients
+        """
+        coeff_flat, _, _, _, _ = self._update_coefficients(packed_obs)
+        return coeff_flat
+
+    def encode_for_policy(self, packed_obs: torch.Tensor) -> torch.Tensor:
+        """Update coefficients and return physical summary for policy.
+
+        packed_obs: (batch, SE3_OBS_DIM=639)
+        returns:    (batch, EMBED_DIM=82) normalised physical summary
+        """
+        coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d = self._update_coefficients(packed_obs)
+        batch = packed_obs.shape[0]
+        device = packed_obs.device
+
+        # new_coeff_5d: (batch, N_OBJECTS, K, 3, 3)
+        ca = new_coeff_5d[:, :, :, :, 0]   # real
+        cb = new_coeff_5d[:, :, :, :, 1]   # imag
+        cc = new_coeff_5d[:, :, :, :, 2]   # accel
+
+        # Reconstruct position: Re[f] = Σ_k (a·cos - b·sin)
+        pos_recon = (basis_cos * ca - basis_sin * cb).sum(dim=2)   # (batch, 8, 3)
+        # Reconstruct velocity: Im[f] = Σ_k (a·sin + b·cos)
+        vel_recon = (basis_sin * ca + basis_cos * cb).sum(dim=2)   # (batch, 8, 3)
+        # Reconstruct accel residual: Σ_k (c·cos)
+        accel_recon = (basis_cos * cc).sum(dim=2)                  # (batch, 8, 3)
+
+        # Game context from raw state
+        boost = raw[:, _EGO_OFF + 10:_EGO_OFF + 11]   # (batch, 1)
+        game_state = raw[:, _GS_OFF:_GS_OFF + 3]      # (batch, 3) score_diff, time, overtime
+
+        # Pad active flags
+        pad_data = raw[:, _PAD_OFF:_PAD_OFF + 24].reshape(batch, 6, 4)
+        pad_active = pad_data[:, :, 3]                 # (batch, 6)
+
+        # Assemble: 24 + 24 + 24 + 1 + 3 + 6 = 82
+        embed = torch.cat([
+            pos_recon.reshape(batch, -1),     # 24
+            vel_recon.reshape(batch, -1),     # 24
+            accel_recon.reshape(batch, -1),   # 24
+            boost,                             # 1
+            game_state,                        # 3
+            pad_active,                        # 6
+        ], dim=-1)                             # (batch, 82)
+
+        return self.output_norm(embed)
 
     @torch.no_grad()
     def normalise_quaternions_(self) -> None:
@@ -381,25 +475,30 @@ def update_coefficients_np(
     k_spatial: np.ndarray,      # (N_OBJECTS, K, 3)
     quaternions: np.ndarray,    # (N_OBJECTS, K, 4) unit
     lr: np.ndarray,             # (N_OBJECTS,)
-    prev_coeff: np.ndarray,     # (COEFF_DIM,) = 384
-    raw_state: np.ndarray,      # (RAW_STATE_DIM,) = 57
+    prev_coeff: np.ndarray,     # (COEFF_DIM,) = 576
+    raw_state: np.ndarray,      # (RAW_STATE_DIM,) = 63
     W_interact: Optional[np.ndarray] = None,  # (N_OBJECTS, N_OBJECTS) or None
 ) -> np.ndarray:
     """Non-differentiable coefficient update for env stepping.
 
-    Mirrors SE3Encoder.forward logic (complex field + W_interact) in numpy.
-    Returns updated coefficients (384,).
+    Mirrors SE3Encoder._update_coefficients logic in numpy.
+    3 channels: real (pos cos), imag (pos sin), accel residual.
+    Returns updated coefficients (576,).
     """
-    coeff = prev_coeff.reshape(N_OBJECTS, K, 3, 2).copy()
+    coeff = prev_coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS).copy()
 
     # Parse raw state
     ball_pos = raw_state[_BALL_OFF:_BALL_OFF + 3]
     ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6]
     ego_pos = raw_state[_EGO_OFF:_EGO_OFF + 3]
+    ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6]
     ego_quat = raw_state[_EGO_OFF + 6:_EGO_OFF + 10]
     opp_pos = raw_state[_OPP_OFF:_OPP_OFF + 3]
+    opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6]
     opp_quat = raw_state[_OPP_OFF + 6:_OPP_OFF + 10]
     prev_ball_vel = raw_state[_PREV_VEL_OFF:_PREV_VEL_OFF + 3]
+    prev_ego_vel = raw_state[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3]
+    prev_opp_vel = raw_state[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3]
 
     id_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -427,11 +526,19 @@ def update_coefficients_np(
     # Contact detection
     contact = detect_contact_np(prev_ball_vel, ball_vel)
 
+    # ── Acceleration targets (gravity residual) ──────────────────────
+    gravity_vec = np.array([0.0, 0.0, GRAVITY_DV_Z], dtype=np.float32)
+    accel_targets = np.zeros((N_OBJECTS, 3), dtype=np.float32)
+    accel_targets[_BALL] = ball_vel - prev_ball_vel - gravity_vec
+    accel_targets[_EGO] = ego_vel - prev_ego_vel - gravity_vec
+    accel_targets[_TEAM] = ego_vel - prev_ego_vel - gravity_vec
+    accel_targets[_OPP] = opp_vel - prev_opp_vel - gravity_vec
+
     # ── Pre-pass: compute per-object bases and residuals ─────────────
-    # Store per-object basis and residual for W_interact mixing
     all_basis_cos = np.zeros((N_OBJECTS, K), dtype=np.float32)
     all_basis_sin = np.zeros((N_OBJECTS, K), dtype=np.float32)
-    all_residuals = np.zeros((N_OBJECTS, 3), dtype=np.float32)
+    all_pos_residuals = np.zeros((N_OBJECTS, 3), dtype=np.float32)
+    all_accel_residuals = np.zeros((N_OBJECTS, 3), dtype=np.float32)
 
     for obj in range(N_OBJECTS):
         pos = positions[obj]
@@ -448,28 +555,34 @@ def update_coefficients_np(
         all_basis_cos[obj] = basis_cos
         all_basis_sin[obj] = basis_sin
 
-        # Complex reconstruction: Re[f] = Σ_k (a_k·cos·q - b_k·sin·q)
+        # Position residual: Re[f] = Σ_k (a_k·cos·q - b_k·sin·q)
         predicted = (basis_cos @ coeff[obj, :, :, 0]
                      - basis_sin @ coeff[obj, :, :, 1])  # (3,)
-        all_residuals[obj] = pos - predicted
+        all_pos_residuals[obj] = pos - predicted
+
+        # Accel residual: Σ_k (c_k·cos·q)
+        accel_pred = basis_cos @ coeff[obj, :, :, 2]     # (3,)
+        all_accel_residuals[obj] = accel_targets[obj] - accel_pred
 
     # ── Cross-object coupling ────────────────────────────────────────
     if W_interact is not None:
         W_eff = np.eye(N_OBJECTS, dtype=np.float32) + W_interact
-        all_residuals = W_eff @ all_residuals            # (N_OBJECTS, 3)
+        all_pos_residuals = W_eff @ all_pos_residuals    # (N_OBJECTS, 3)
+        all_accel_residuals = W_eff @ all_accel_residuals
 
-    # ── Complex LMS update ───────────────────────────────────────────
+    # ── LMS update (all 3 channels) ─────────────────────────────────
     for obj in range(N_OBJECTS):
-        residual = all_residuals[obj]                    # (3,)
-        basis_cos = all_basis_cos[obj]                   # (K,)
-        basis_sin = all_basis_sin[obj]
+        bc = all_basis_cos[obj]                          # (K,)
+        bs = all_basis_sin[obj]
 
-        # delta_a = lr × residual × cos_basis  (∂Re[f]/∂a = cos)
-        coeff[obj, :, :, 0] += np.outer(lr[obj] * basis_cos, residual)
-        # delta_b = -lr × residual × sin_basis (∂Re[f]/∂b = -sin)
-        coeff[obj, :, :, 1] -= np.outer(lr[obj] * basis_sin, residual)
+        # Position: real channel
+        coeff[obj, :, :, 0] += np.outer(lr[obj] * bc, all_pos_residuals[obj])
+        # Position: imag channel
+        coeff[obj, :, :, 1] -= np.outer(lr[obj] * bs, all_pos_residuals[obj])
+        # Acceleration channel
+        coeff[obj, :, :, 2] += np.outer(lr[obj] * bc, all_accel_residuals[obj])
 
-    # Reset ball on contact
+    # Reset ball on contact (all channels)
     if contact:
         coeff[_BALL] = 0.0
 
@@ -480,5 +593,5 @@ def update_coefficients_np(
 
 
 def pack_observation(raw_state: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
-    """Pack raw state and coefficients into the 185-dim observation."""
+    """Pack raw state and coefficients into SE3_OBS_DIM observation."""
     return np.concatenate([raw_state, coefficients]).astype(np.float32)

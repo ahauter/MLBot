@@ -4,13 +4,13 @@ SE3 Gymnasium Environment
 Wraps rlgym-sim as a gymnasium.Env for SE(3) spectral field training.
 
 The env maintains SE3 field state (coefficients) internally and produces
-185-dim observations: [raw_state (57) | coefficients (128)].
+SE3_OBS_DIM-dim observations: [raw_state (63) | coefficients (576)].
 
 The SE3Encoder in the algorithm recomputes the coefficient update
 differentiably during training.  The env's numpy update is used only
 during rollout collection (no grad needed).
 
-Observation: (185,) float32
+Observation: (639,) float32
 Action:      (8,)   float32 — 5 analog [-1,1] + 3 binary (threshold 0.5)
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ from se3_field import (
     make_initial_coefficients, update_coefficients_np,
     pack_observation, euler_to_quaternion_batch,
     _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF, _PREV_VEL_OFF,
+    _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
 )
 
 _GOAL_Y = 5124.0
@@ -85,10 +86,14 @@ class SE3GymEnv(gym.Env):
         # SE3 field state (blue / agent perspective)
         self._coefficients: np.ndarray = make_initial_coefficients()
         self._prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._prev_ego_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._prev_opp_vel: np.ndarray = np.zeros(3, dtype=np.float32)
 
         # SE3 field state (orange / opponent perspective)
         self._orange_coefficients: np.ndarray = make_initial_coefficients()
         self._orange_prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ego_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._orange_prev_opp_vel: np.ndarray = np.zeros(3, dtype=np.float32)
         self._last_orange_obs: np.ndarray = np.zeros(SE3_OBS_DIM, dtype=np.float32)
 
         # Encoder params (numpy, synced from algorithm)
@@ -126,17 +131,24 @@ class SE3GymEnv(gym.Env):
         # Reset field state
         self._coefficients = make_initial_coefficients()
         self._prev_ball_vel = np.zeros(3, dtype=np.float32)
+        self._prev_ego_vel = np.zeros(3, dtype=np.float32)
+        self._prev_opp_vel = np.zeros(3, dtype=np.float32)
 
         # Reset orange field state
         self._orange_coefficients = make_initial_coefficients()
         self._orange_prev_ball_vel = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ego_vel = np.zeros(3, dtype=np.float32)
+        self._orange_prev_opp_vel = np.zeros(3, dtype=np.float32)
 
         # Build raw state from rlgym obs
-        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
+        raw_state = self._token_obs_to_raw_state(
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
         obs = pack_observation(raw_state, self._coefficients)
 
         # Cache orange obs
-        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        orange_raw = self._token_obs_to_raw_state(
+            orange_obs, self._orange_prev_ball_vel,
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         return obs, {}
@@ -153,24 +165,31 @@ class SE3GymEnv(gym.Env):
         self._step_count += 1
 
         # Build raw state from rlgym tokens
-        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
+        raw_state = self._token_obs_to_raw_state(
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
 
         # Update coefficients (numpy, no grad)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._coefficients, raw_state, W_interact=self._W_interact)
 
-        # Update prev ball vel for next step's contact detection
+        # Cache prev velocities for next step
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+        self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
 
         obs = pack_observation(raw_state, self._coefficients)
 
         # Update orange perspective
-        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        orange_raw = self._token_obs_to_raw_state(
+            orange_obs, self._orange_prev_ball_vel,
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._orange_coefficients, orange_raw, W_interact=self._W_interact)
         self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._orange_prev_ego_vel = orange_raw[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+        self._orange_prev_opp_vel = orange_raw[_OPP_OFF + 3:_OPP_OFF + 6].copy()
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         blue_reward = float(rewards[0])
@@ -208,18 +227,25 @@ class SE3GymEnv(gym.Env):
         blue_obs, orange_obs = self._parse_obs(obs_list)
         self._step_count += 1
 
-        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
+        raw_state = self._token_obs_to_raw_state(
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._coefficients, raw_state, W_interact=self._W_interact)
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+        self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
         obs = pack_observation(raw_state, self._coefficients)
 
-        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        orange_raw = self._token_obs_to_raw_state(
+            orange_obs, self._orange_prev_ball_vel,
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._orange_coefficients, orange_raw, W_interact=self._W_interact)
         self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._orange_prev_ego_vel = orange_raw[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+        self._orange_prev_opp_vel = orange_raw[_OPP_OFF + 3:_OPP_OFF + 6].copy()
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         blue_reward = float(rewards[0])
@@ -304,8 +330,13 @@ class SE3GymEnv(gym.Env):
             return obs_result[0], obs_result[1]
         raise ValueError(f'Unexpected obs format: {type(obs_result)}')
 
-    def _token_obs_to_raw_state(self, flat_obs: np.ndarray, prev_ball_vel: np.ndarray) -> np.ndarray:
-        """Convert TokenObsBuilder output (100,) to SE3 raw state (57,).
+    def _token_obs_to_raw_state(
+        self, flat_obs: np.ndarray,
+        prev_ball_vel: np.ndarray,
+        prev_ego_vel: np.ndarray,
+        prev_opp_vel: np.ndarray,
+    ) -> np.ndarray:
+        """Convert TokenObsBuilder output (100,) to SE3 raw state (63,).
 
         TokenObsBuilder format (10 tokens × 10 features):
           token 0: ball   [x,y,z, vx,vy,vz, avx,avy,avz, 0]
@@ -355,7 +386,9 @@ class SE3GymEnv(gym.Env):
         # Game state
         raw[_GS_OFF:_GS_OFF + 3] = tokens[9, :3]
 
-        # Previous ball velocity (for contact detection)
+        # Previous velocities (for contact detection + acceleration channel)
         raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = prev_ball_vel
+        raw[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = prev_ego_vel
+        raw[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = prev_opp_vel
 
         return raw
