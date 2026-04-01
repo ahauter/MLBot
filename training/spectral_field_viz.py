@@ -5,16 +5,19 @@ Demonstrates the SE(3) spectral field mechanism from src/se3_field.py in a
 simplified 1D setting.  A ball bounces between two walls, with the bounce
 emerging entirely from the wall spectral fields — no hardcoded collision logic.
 
-1D simplification:
-  - Cosine basis only (drop imaginary/sine channel)
+1D simplification of se3_field.py (lines 290-343):
+  - K=8 spectral components (matching the real field)
+  - Cosine + sine basis (real + imaginary channels)
   - Scalar positions instead of 3D vectors
   - No quaternion/orientation component
-  - Same coefficient update rule as se3_field.py lines 290-343
+  - Same coefficient update rule
 
 Interaction mechanism:
-  Each wall's converged spectral field F_wall(x) = sum_j c_j * cos(k_j * x)
-  creates a potential landscape.  The ball experiences force from the gradient:
-      force = alpha * sum_walls sum_j c_wall_j * k_j * sin(k_j * x_ball)
+  Each wall's converged spectral field F_wall(x) = sum_j [c_j*cos(k_j*x) + s_j*sin(k_j*x)]
+  creates a potential landscape.  The ball experiences force:
+      force = -alpha * sum_walls F_wall(x_ball)
+  The sine components provide the odd-function asymmetry that distinguishes
+  left from right, creating a restoring force toward the center.
   Removing the walls = ball flies away freely.
 
 Usage:
@@ -51,43 +54,62 @@ TITLE_COLOR = 'white'
 # ── SpectralField1D ─────────────────────────────────────────────────────────
 
 class SpectralField1D:
-    """1D cosine-only spectral field (simplified from SE3Encoder)."""
+    """1D spectral field with cos+sin basis (simplified from SE3Encoder).
+
+    Basis: [cos(k_0*x), ..., cos(k_{K-1}*x), sin(k_0*x), ..., sin(k_{K-1}*x)]
+    This mirrors the real/imaginary channels in se3_field.py.
+    """
 
     def __init__(self, K: int, frequencies: np.ndarray, lr: float):
         self.K = K
         self.k = np.asarray(frequencies, dtype=np.float64)  # (K,)
         self.lr = lr
-        self.c = np.zeros(K, dtype=np.float64)               # coefficients
+        self.c = np.zeros(2 * K, dtype=np.float64)          # [cos_coeffs | sin_coeffs]
+
+    def _basis(self, x: float) -> np.ndarray:
+        """Evaluate basis functions at a single point."""
+        return np.concatenate([np.cos(self.k * x), np.sin(self.k * x)])
+
+    def _basis_domain(self, x_domain: np.ndarray) -> np.ndarray:
+        """Evaluate basis functions across a domain. Returns (N, 2K)."""
+        cos_b = np.cos(self.k[None, :] * x_domain[:, None])  # (N, K)
+        sin_b = np.sin(self.k[None, :] * x_domain[:, None])  # (N, K)
+        return np.concatenate([cos_b, sin_b], axis=1)         # (N, 2K)
 
     def evaluate(self, x_domain: np.ndarray) -> np.ndarray:
-        """Field value across a spatial domain.  F(x) = sum_j c_j * cos(k_j * x)."""
-        # x_domain: (N,), returns (N,)
-        basis = np.cos(self.k[None, :] * x_domain[:, None])  # (N, K)
-        return basis @ self.c                                  # (N,)
+        """Field value across a spatial domain."""
+        return self._basis_domain(x_domain) @ self.c  # (N,)
 
     def predict(self, x: float) -> float:
         """Field value at a single point."""
-        return float(np.sum(self.c * np.cos(self.k * x)))
+        return float(self.c @ self._basis(x))
 
     def gradient(self, x: float) -> float:
-        """dF/dx = -sum_j c_j * k_j * sin(k_j * x)."""
-        return float(-np.sum(self.c * self.k * np.sin(self.k * x)))
+        """dF/dx at a single point."""
+        dcos = -self.k * np.sin(self.k * x)
+        dsin = self.k * np.cos(self.k * x)
+        dbasis = np.concatenate([dcos, dsin])
+        return float(self.c @ dbasis)
 
     def update(self, x: float) -> None:
         """One step of the coefficient update rule (mirrors se3_field.py)."""
-        basis = np.cos(self.k * x)               # (K,)
-        predicted = float(np.sum(self.c * basis))
-        residual = x - predicted
+        basis = self._basis(x)
+        residual = x - float(self.c @ basis)
         self.c += self.lr * basis * residual
         np.clip(self.c, -COEFF_CLIP, COEFF_CLIP, out=self.c)
 
     def reset(self) -> None:
-        """Zero all coefficients (contact reset)."""
+        """Zero all coefficients (contact reset, mirrors se3_field.py line 446)."""
         self.c[:] = 0.0
 
     def get_basis_curves(self, x_domain: np.ndarray) -> list[np.ndarray]:
-        """Individual weighted cosine curves: c_j * cos(k_j * x)."""
-        return [self.c[j] * np.cos(self.k[j] * x_domain) for j in range(self.K)]
+        """Individual weighted basis curves."""
+        curves = []
+        for j in range(self.K):
+            curves.append(self.c[j] * np.cos(self.k[j] * x_domain))
+        for j in range(self.K):
+            curves.append(self.c[self.K + j] * np.sin(self.k[j] * x_domain))
+        return curves
 
 
 # ── simulation ───────────────────────────────────────────────────────────────
@@ -100,8 +122,14 @@ def run_simulation(n_frames: int, K: int, frequencies: np.ndarray,
                    wall_warmup: int):
     """Pre-compute entire simulation trajectory.
 
-    Returns dict of arrays, each of length n_frames.
+    The ball's dynamics are entirely field-mediated:
+      force = -alpha * (F_left(x_ball) + F_right(x_ball))
+
+    The wall fields create a potential landscape; the ball oscillates within it.
+    No position-based collision checks — bouncing emerges from the spectral fields.
     """
+    n_coeffs = 2 * K  # cos + sin coefficients
+
     left_field = SpectralField1D(K, frequencies, wall_lr)
     right_field = SpectralField1D(K, frequencies, wall_lr)
     ball_field = SpectralField1D(K, frequencies, ball_lr)
@@ -121,9 +149,9 @@ def run_simulation(n_frames: int, K: int, frequencies: np.ndarray,
     resets = np.zeros(n_frames, dtype=bool)
 
     # Snapshot field coefficients at each frame for plotting
-    ball_coeffs = np.zeros((n_frames, K))
-    left_coeffs = np.zeros((n_frames, K))
-    right_coeffs = np.zeros((n_frames, K))
+    ball_coeffs = np.zeros((n_frames, n_coeffs))
+    left_coeffs = np.zeros((n_frames, n_coeffs))
+    right_coeffs = np.zeros((n_frames, n_coeffs))
 
     for i in range(n_frames):
         # Record state
@@ -134,8 +162,10 @@ def run_simulation(n_frames: int, K: int, frequencies: np.ndarray,
         left_coeffs[i] = left_field.c.copy()
         right_coeffs[i] = right_field.c.copy()
 
-        # Force on ball from wall field gradients
-        force = -alpha * (left_field.gradient(ball_x) + right_field.gradient(ball_x))
+        # Force on ball: field value acts as potential
+        # Positive F_right near right wall pushes ball left (-alpha * positive = negative)
+        # Negative F_left near left wall pushes ball right (-alpha * negative = positive)
+        force = -alpha * (left_field.predict(ball_x) + right_field.predict(ball_x))
 
         # Update ball dynamics
         prev_v = ball_v
@@ -160,25 +190,24 @@ def run_simulation(n_frames: int, K: int, frequencies: np.ndarray,
         'ball_coeffs': ball_coeffs,
         'left_coeffs': left_coeffs,
         'right_coeffs': right_coeffs,
-        'left_field': left_field,
-        'right_field': right_field,
-        'ball_field': ball_field,
         'frequencies': frequencies,
         'wall_left': wall_left,
         'wall_right': wall_right,
+        'K': K,
     }
 
 
 # ── animation ────────────────────────────────────────────────────────────────
 
-def create_animation(sim: dict, K: int, frequencies: np.ndarray,
-                     ball_lr: float, wall_lr: float, interval: int):
+def create_animation(sim: dict, interval: int):
     """Build the FuncAnimation from pre-computed simulation data."""
 
     x_domain = np.linspace(-6, 6, 500)
     n_frames = len(sim['ball_x'])
     wall_left = sim['wall_left']
     wall_right = sim['wall_right']
+    frequencies = sim['frequencies']
+    K = sim['K']
 
     fig, (ax_field, ax_track) = plt.subplots(
         2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [2, 1]})
@@ -223,9 +252,9 @@ def create_animation(sim: dict, K: int, frequencies: np.ndarray,
                                   markeredgecolor='white', markeredgewidth=1)
 
     # Equation annotation
-    eq_text = (r'$F(x) = \sum_j\, c_j \cos(k_j\, x)$'
+    eq_text = (r'$F(x) = \sum_j\, c_j \cos(k_j x) + s_j \sin(k_j x)$'
                '\n'
-               r'$c_j \mathrel{+}= \alpha\, \cos(k_j\, x)\,(x - \hat{x})$')
+               r'$\mathrm{force} = -\alpha \sum_{\mathrm{walls}} F_w(x_{\mathrm{ball}})$')
     ax_field.text(0.02, 0.97, eq_text, transform=ax_field.transAxes,
                   color='#ccc', fontsize=9, verticalalignment='top',
                   bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -235,7 +264,7 @@ def create_animation(sim: dict, K: int, frequencies: np.ndarray,
                     edgecolor='#333', labelcolor='#ccc')
 
     # ── bottom panel setup ───────────────────────────────────────────────
-    window = min(200, n_frames)
+    window = min(300, n_frames)
     ax_track.set_xlim(0, window)
     ax_track.set_ylim(wall_left - 1, wall_right + 1)
     ax_track.set_xlabel('Timestep', color=LABEL_COLOR, fontsize=9)
@@ -263,10 +292,13 @@ def create_animation(sim: dict, K: int, frequencies: np.ndarray,
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
-    # Helper: reconstruct field from saved coefficients
-    def eval_field(coeffs, freqs, x_dom):
-        basis = np.cos(freqs[None, :] * x_dom[:, None])
-        return basis @ coeffs
+    # Pre-compute basis matrix for the domain (doesn't change per frame)
+    cos_basis = np.cos(frequencies[None, :] * x_domain[:, None])  # (N, K)
+    sin_basis = np.sin(frequencies[None, :] * x_domain[:, None])  # (N, K)
+    full_basis = np.concatenate([cos_basis, sin_basis], axis=1)   # (N, 2K)
+
+    def eval_field(coeffs):
+        return full_basis @ coeffs
 
     def init():
         line_ball_field.set_data([], [])
@@ -284,13 +316,9 @@ def create_animation(sim: dict, K: int, frequencies: np.ndarray,
 
     def update(frame):
         # Top panel: field curves
-        bc = sim['ball_coeffs'][frame]
-        lc = sim['left_coeffs'][frame]
-        rc = sim['right_coeffs'][frame]
-
-        line_ball_field.set_data(x_domain, eval_field(bc, frequencies, x_domain))
-        line_left_field.set_data(x_domain, eval_field(lc, frequencies, x_domain))
-        line_right_field.set_data(x_domain, eval_field(rc, frequencies, x_domain))
+        line_ball_field.set_data(x_domain, eval_field(sim['ball_coeffs'][frame]))
+        line_left_field.set_data(x_domain, eval_field(sim['left_coeffs'][frame]))
+        line_right_field.set_data(x_domain, eval_field(sim['right_coeffs'][frame]))
 
         bx = sim['ball_x'][frame]
         bp = sim['ball_pred'][frame]
@@ -333,45 +361,44 @@ def main():
         description='1D Spectral Field Visualization — Bouncing Ball')
     parser.add_argument('--save', type=str, default=None,
                         help='Save animation to file (e.g. out.gif)')
-    parser.add_argument('--K', type=int, default=4,
-                        help='Number of spectral components (default: 4)')
-    parser.add_argument('--lr', type=float, default=0.3,
-                        help='Ball coefficient learning rate (default: 0.3)')
-    parser.add_argument('--alpha', type=float, default=0.8,
-                        help='Force coupling strength (default: 0.8)')
-    parser.add_argument('--frames', type=int, default=400,
-                        help='Number of animation frames (default: 400)')
+    parser.add_argument('--K', type=int, default=8,
+                        help='Number of spectral components (default: 8)')
+    parser.add_argument('--alpha', type=float, default=0.12,
+                        help='Force coupling strength (default: 0.12)')
+    parser.add_argument('--frames', type=int, default=600,
+                        help='Number of animation frames (default: 600)')
     args = parser.parse_args()
 
     K = args.K
-    # Hand-picked frequencies for visual variety
-    if K == 4:
+    # Hand-picked frequencies for visual variety and good field behavior
+    if K == 8:
+        frequencies = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
+    elif K == 4:
         frequencies = np.array([0.3, 0.7, 1.5, 2.5])
     else:
-        frequencies = np.linspace(0.3, 2.5, K)
+        frequencies = np.linspace(0.3, 3.7, K)
 
     # Use non-interactive backend when saving
     if args.save:
         matplotlib.use('Agg')
 
+    # Wall lr=0.15 ensures convergence: lr * K < 2 for cos+sin basis
     sim = run_simulation(
         n_frames=args.frames,
         K=K,
         frequencies=frequencies,
-        ball_lr=args.lr,
-        wall_lr=0.5,
+        ball_lr=0.15,
+        wall_lr=0.15,
         alpha=args.alpha,
-        dt=0.1,
+        dt=0.05,
         wall_left=-4.0,
         wall_right=4.0,
         ball_x0=0.0,
-        ball_v0=0.5,
-        wall_warmup=100,
+        ball_v0=0.8,
+        wall_warmup=300,
     )
 
-    fig, anim = create_animation(
-        sim, K, frequencies,
-        ball_lr=args.lr, wall_lr=0.5, interval=50)
+    fig, anim = create_animation(sim, interval=50)
 
     if args.save:
         save_path = Path(args.save)
