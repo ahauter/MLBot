@@ -10,15 +10,22 @@ emerging entirely from the wall spectral field — no hardcoded collision logic.
   - Cosine + sine basis (real + imaginary channels)
   - Scalar positions instead of 3D vectors
   - No quaternion/orientation component
-  - Same coefficient update rule
 
-Interaction mechanism:
-  A single wall field is updated at both wall positions each step, creating
-  a field with two peaks: F_wall(-4) = -4, F_wall(4) = +4.
-  The ball experiences force:
-      force = -alpha * F_wall(x_ball)
-  The field's odd symmetry creates a restoring force toward the center.
-  Removing the wall field = ball flies away freely.
+Key idea — coefficient-space dynamics:
+  The ball's position is never tracked externally.  Instead, the ball field's
+  COEFFICIENTS carry momentum (a velocity vector in coefficient space).  Each
+  step, the wall field is evaluated at the ball's predicted position to compute
+  a force, which is projected into coefficient space and applied as acceleration.
+
+  Ball position at time t = F_ball(REF), where REF is a fixed reference point.
+  The ball's entire state (position + velocity) lives in the field coefficients.
+
+  force_position  = -alpha * F_wall(F_ball(REF))
+  c_acceleration  = force_position * basis(REF) / ||basis(REF)||^2
+  c_velocity     += c_acceleration * dt
+  c_ball         += c_velocity * dt
+
+  Removing the wall field = ball flies away.  The bouncing is field-mediated.
 
 Usage:
     python training/spectral_field_viz.py              # runs until window closed
@@ -40,6 +47,7 @@ from matplotlib.animation import FuncAnimation
 # ── constants ────────────────────────────────────────────────────────────────
 
 COEFF_CLIP = 10.0  # matches se3_field.py
+REF = 1.0          # fixed reference point for ball field evaluation
 
 # Style (matching training/scenario_visualizer.py)
 BG_COLOR = '#12121f'
@@ -103,21 +111,29 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     x_domain = np.linspace(-6, 6, 500)
     window = 300  # rolling time-series window
 
-    # ── simulation state (mutated in-place by update closure) ────────────
+    # ── simulation state ─────────────────────────────────────────────────
     wall_field = SpectralField1D(K, frequencies, 0.15)
     ball_field = SpectralField1D(K, frequencies, 0.15)
 
-    # Warm up wall field at both positions
+    # Warm up wall field at both positions (single field, two peaks)
     for _ in range(wall_warmup):
         wall_field.update(wall_left)
         wall_field.update(wall_right)
 
-    state = {'x': 0.0, 'v': ball_v0, 't': 0}
+    # Reference basis vector and its squared norm (constant)
+    b_ref = ball_field._basis(REF)
+    b_norm2 = np.dot(b_ref, b_ref)  # = K for cos+sin basis
+
+    # Seed ball: position=0 via coefficients, velocity=v0 via coefficient velocity
+    ball_field.c = 0.0 * b_ref / b_norm2  # F_ball(REF) = 0
+    c_vel = ball_v0 * b_ref / b_norm2     # dF_ball(REF)/dt = v0
+
+    state = {'t': 0}
     history_x = deque(maxlen=window)
     history_pred = deque(maxlen=window)
     history_t = deque(maxlen=window)
 
-    # Pre-compute basis matrix for field evaluation (doesn't change)
+    # Pre-compute basis matrix for field curve evaluation
     cos_basis = np.cos(frequencies[None, :] * x_domain[:, None])
     sin_basis = np.sin(frequencies[None, :] * x_domain[:, None])
     full_basis = np.concatenate([cos_basis, sin_basis], axis=1)
@@ -159,9 +175,10 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                   markersize=8, zorder=4, alpha=0.8,
                                   markeredgecolor='white', markeredgewidth=1)
 
-    eq_text = (r'$F(x) = \sum_j\, c_j \cos(k_j x) + s_j \sin(k_j x)$'
+    eq_text = (r'$x_{ball} = F_{ball}(ref)$'
                '\n'
-               r'$\mathrm{force} = -\alpha\, F_{\mathrm{wall}}(x_{\mathrm{ball}})$')
+               r'$\dot{c} \leftarrow \dot{c} - \alpha\, F_{wall}(x_{ball})'
+               r'\cdot \phi / \|\phi\|^2$')
     ax_field.text(0.02, 0.97, eq_text, transform=ax_field.transAxes,
                   color='#ccc', fontsize=9, verticalalignment='top',
                   bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -180,9 +197,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
 
     line_actual, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
-                                  label='Actual position')
+                                  label='Ball position (from field)')
     line_pred, = ax_track.plot([], [], color=BALL_PRED_COLOR, lw=1.2,
-                                ls='--', alpha=0.7, label='Field prediction')
+                                ls='--', alpha=0.7, label='Wall field at ball')
 
     ax_track.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
@@ -207,38 +224,41 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                 line_actual, line_pred, frame_text)
 
     def step(_frame):
-        # ── simulate one step ────────────────────────────────────────
-        bx = state['x']
-        bv = state['v']
+        nonlocal c_vel
         t = state['t']
 
-        pred = ball_field.predict(bx)
-        history_x.append(bx)
-        history_pred.append(pred)
+        # ── ball position comes from field prediction ────────────
+        x_ball = ball_field.predict(REF)
+        wall_at_ball = wall_field.predict(x_ball)
+
+        history_x.append(x_ball)
+        history_pred.append(wall_at_ball)
         history_t.append(t)
 
-        # Force from wall field
-        force = -alpha * wall_field.predict(bx)
-        bv += force * dt
-        bx += bv * dt
+        # ── coefficient-space dynamics (no external position tracking) ──
+        # Force in position space → project into coefficient space
+        force = -alpha * wall_at_ball
+        c_accel = force * b_ref / b_norm2
 
-        # Update fields (no reset)
-        ball_field.update(bx)
+        # Leapfrog integration in coefficient space
+        c_vel += c_accel * dt
+        ball_field.c += c_vel * dt
+        np.clip(ball_field.c, -COEFF_CLIP, COEFF_CLIP, out=ball_field.c)
+
+        # Wall field continues to be reinforced
         wall_field.update(wall_left)
         wall_field.update(wall_right)
 
-        state['x'] = bx
-        state['v'] = bv
         state['t'] = t + 1
 
-        # ── draw top panel ───────────────────────────────────────────
+        # ── draw top panel ───────────────────────────────────────
         line_wall_field.set_data(x_domain, full_basis @ wall_field.c)
         line_ball_field.set_data(x_domain, full_basis @ ball_field.c)
-        ball_dot.set_data([bx], [0])
-        pred_marker.set_data([bx], [pred])
+        ball_dot.set_data([x_ball], [0])
+        pred_marker.set_data([x_ball], [ball_field.predict(REF)])
         frame_text.set_text(f't={t}')
 
-        # ── draw bottom panel ────────────────────────────────────────
+        # ── draw bottom panel ────────────────────────────────────
         ts = np.array(history_t)
         line_actual.set_data(ts, np.array(history_x))
         line_pred.set_data(ts, np.array(history_pred))
