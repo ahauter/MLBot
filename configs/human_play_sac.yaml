@@ -1,0 +1,57 @@
+# Live-Play SAC Training
+# ======================
+# Train SAC by playing real Rocket League games against the bot.
+#
+# How to use:
+#   1. Start training:  python train.py --config configs/human_play_sac.yaml
+#   2. Launch RLBot match: MLBot vs HumanProxyBot (you do this separately)
+#   3. Play a game — both bots write transcripts to training/transcripts/
+#   4. train.py automatically loads new transcripts each round and trains
+#   5. Updated weights are saved to models/ — bot reloads them next game
+#
+# The DummyEnv keeps the training loop alive between games.
+# Real learning data comes from the TranscriptReplayProvider.
+
+algorithm:
+  class: training.algorithms.sac.SACAlgorithm
+  params:
+    lr: 3e-4
+    critic_lr: 3e-4
+    alpha_lr: 3e-4
+    gamma: 0.99
+    tau: 0.005
+    batch_size: 256
+    buffer_capacity: 500000
+    min_buffer_size: 256
+    updates_per_step: 1
+    # rollout_steps controls how often the loop checks for new transcripts
+    rollout_steps: 64
+
+replay:
+  class: training.data.transcript_provider.TranscriptReplayProvider
+  params:
+    transcript_dir: training/transcripts
+
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 1
+    snapshot_interval: 50000
+
+# DummyEnv keeps the loop running between games.
+# Transcript data is the primary learning signal.
+env_class: training.environments.dummy_env.DummyEnv
+
+seed: 0
+total_steps: 50000000
+num_envs: 2
+envs_per_worker: 1
+eval_interval: 0
+log_interval: 5
+t_window: 4
+model_dir: models/sac_live
+
+logger:
+  class: training.loggers.wandb.WandbLogger
+  params:
+    enabled: false

@@ -203,6 +203,13 @@ class ReplayProvider(ABC):
     def seed_algorithm(self, algorithm: Algorithm, demonstrations: list) -> None:
         """Pre-fill algorithm's buffer or warm-start its weights from demonstrations."""
 
+    def on_round(self, agents: list, step: int) -> None:
+        """Called each collection round.  Check for new data and load it.
+
+        Default is a no-op.  Override in providers that watch for data
+        arriving mid-training (e.g. live-play transcripts).
+        """
+
     def get_metrics(self) -> dict:
         """Track Axis 2 cost: replays loaded, bytes processed, etc."""
         return {}

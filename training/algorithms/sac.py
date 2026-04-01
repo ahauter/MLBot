@@ -136,6 +136,16 @@ class ReplayBuffer:
         }
 
     def reset(self) -> None:
+        """No-op for off-policy buffer.
+
+        The AsyncUpdater calls buffer.reset() after each update.
+        For on-policy (PPO), that clears the rollout.  For off-policy
+        (SAC), we keep all data — the circular buffer handles eviction.
+        """
+        pass
+
+    def clear(self) -> None:
+        """Actually clear the buffer (for testing or explicit reset)."""
         self.pos = 0
         self.size = 0
 

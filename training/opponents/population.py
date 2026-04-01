@@ -96,14 +96,17 @@ class Population(OpponentPool):
         else:
             envs_per_agent_map = {i: envs_per_agent for i in range(num_agents)}
 
-        # Lazy import to avoid circular dependency (ppo.py no longer imports this module)
-        from training.algorithms.ppo import PPOAlgorithm
+        # Resolve algorithm class from config, defaulting to PPO
+        AlgoCls = config.get('algorithm', {}).get('cls', None)
+        if AlgoCls is None:
+            from training.algorithms.ppo import PPOAlgorithm
+            AlgoCls = PPOAlgorithm
 
         # Create agents, each with buffer sized for its env count
-        self._agents: List[PPOAlgorithm] = []
+        self._agents: List = []
         for i in range(num_agents):
             agent_config = {**config, 'num_envs': envs_per_agent_map[i]}
-            self._agents.append(PPOAlgorithm(agent_config))
+            self._agents.append(AlgoCls(agent_config))
 
         # Score tracking per agent
         self.scores: List[List[float]] = [[] for _ in range(num_agents)]

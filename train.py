@@ -157,10 +157,16 @@ def _deep_merge(base: dict, override: dict) -> dict:
 class NullReplayProvider:
     """No expert data. Axis 2 cost = 0."""
 
+    def __init__(self, **kwargs):
+        pass
+
     def load_demonstrations(self):
         return None
 
     def seed_algorithm(self, algo, demos):
+        pass
+
+    def on_round(self, agents, step):
         pass
 
     def get_metrics(self):
@@ -169,6 +175,9 @@ class NullReplayProvider:
 
 class NullFeedbackProvider:
     """No human feedback. Axis 3 cost = 0."""
+
+    def __init__(self, **kwargs):
+        pass
 
     def get_feedback_reward(self, *args):
         return None
@@ -1220,9 +1229,11 @@ def train(config: dict):
 
     # ── resolve replay / feedback providers ─────────────────────────────
     ReplayCls = resolve_or_default(config, 'replay', NullReplayProvider)
-    replay_provider = ReplayCls()
+    replay_params = config.get('replay', {}).get('params', {})
+    replay_provider = ReplayCls(**replay_params)
     FeedbackCls = resolve_or_default(config, 'feedback', NullFeedbackProvider)
-    feedback_provider = FeedbackCls()
+    feedback_params = config.get('feedback', {}).get('params', {})
+    feedback_provider = FeedbackCls(**feedback_params)
 
     # ── resolve collection scheduler ───────────────────────────────────
     from training.schedulers import InterleavedScheduler
@@ -1387,6 +1398,9 @@ def train(config: dict):
             timing_metrics.add_steps(steps)
             collection_round += 1
             pbar.update(steps)
+
+            # Let replay provider inject new data (e.g. live-play transcripts)
+            replay_provider.on_round(population.agents, total_collected)
 
             # Drain update metrics and log
             _t0 = time.perf_counter()
