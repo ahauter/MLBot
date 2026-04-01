@@ -92,7 +92,7 @@ class SE3GymEnv(gym.Env):
         self._last_orange_obs: np.ndarray = np.zeros(SE3_OBS_DIM, dtype=np.float32)
 
         # Encoder params (numpy, synced from algorithm)
-        self._k_spatial: np.ndarray = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 0.1
+        self._k_spatial: np.ndarray = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
         self._quaternions: np.ndarray = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         norms = np.linalg.norm(self._quaternions, axis=-1, keepdims=True)
         self._quaternions /= np.maximum(norms, 1e-8)
