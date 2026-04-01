@@ -755,3 +755,112 @@ class TestTuneIntegration:
             assert result['algorithm']['params']['lr'] == 1e-4
             assert result['algorithm']['params']['clip_epsilon'] == 0.15
             assert 'search_space' not in result
+
+
+# ── Training resume/recovery ──────────────────────────────────────────────
+
+class TestTrainingResume:
+    """Test checkpoint save/load and training resume."""
+
+    def test_save_and_load_training_state(self, tmp_path):
+        from train import save_training_state, load_training_state, RolloutMetricsProvider
+
+        config = _small_config(num_envs=2, rollout_steps=32)
+        pop = Population(num_agents=2, num_workers=2, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
+        rollout_metrics = RolloutMetricsProvider()
+        rollout_metrics.goals_scored = 5
+        rollout_metrics.goals_conceded = 3
+
+        model_dir = tmp_path / 'models'
+        save_training_state(
+            model_dir, pop,
+            total_collected=10000,
+            collection_round=42,
+            last_gen_step=5000,
+            generation_pending=True,
+            rollout_metrics=rollout_metrics,
+            label='latest')
+
+        # Verify files exist
+        assert (model_dir / 'latest' / 'training_state.json').exists()
+        assert (model_dir / 'latest' / 'agent_0' / 'checkpoint.pt').exists()
+        assert (model_dir / 'latest' / 'agent_1' / 'checkpoint.pt').exists()
+
+        # Load and verify state
+        state = load_training_state(model_dir, label='latest')
+        assert state is not None
+        assert state['total_collected'] == 10000
+        assert state['collection_round'] == 42
+        assert state['last_gen_step'] == 5000
+        assert state['generation_pending'] is True
+        assert state['goals_scored'] == 5
+        assert state['goals_conceded'] == 3
+        assert state['num_agents'] == 2
+
+    def test_load_nonexistent_returns_none(self, tmp_path):
+        from train import load_training_state
+        assert load_training_state(tmp_path / 'nonexistent') is None
+
+    def test_resume_restores_agent_weights(self, tmp_path):
+        from train import save_training_state, resume_training, RolloutMetricsProvider
+
+        config = _small_config(num_envs=1, rollout_steps=32)
+        pop1 = Population(num_agents=1, num_workers=1, config=config,
+                          snapshot_dir=tmp_path / 'snaps1')
+
+        # Modify weights so they're non-default
+        with torch.no_grad():
+            for p in pop1.agents[0].encoder.parameters():
+                p.fill_(0.42)
+
+        rollout_metrics = RolloutMetricsProvider()
+        rollout_metrics.goals_scored = 7
+
+        model_dir = tmp_path / 'models'
+        save_training_state(model_dir, pop1, total_collected=5000,
+                            collection_round=10, last_gen_step=2000,
+                            generation_pending=False,
+                            rollout_metrics=rollout_metrics)
+
+        # Create a fresh population and resume
+        pop2 = Population(num_agents=1, num_workers=1, config=config,
+                          snapshot_dir=tmp_path / 'snaps2')
+        rollout_metrics2 = RolloutMetricsProvider()
+
+        state = resume_training(model_dir, pop2, rollout_metrics2)
+        assert state is not None
+        assert state['total_collected'] == 5000
+        assert rollout_metrics2.goals_scored == 7
+
+        # Check weights were restored
+        for p1, p2 in zip(pop1.agents[0].encoder.parameters(),
+                          pop2.agents[0].encoder.parameters()):
+            assert torch.allclose(p1, p2)
+
+    def test_atomic_write_no_corruption(self, tmp_path):
+        """Verify that training_state.json is written atomically."""
+        from train import save_training_state, load_training_state, RolloutMetricsProvider
+
+        config = _small_config(num_envs=1, rollout_steps=32)
+        pop = Population(num_agents=1, num_workers=1, config=config,
+                         snapshot_dir=tmp_path / 'snaps')
+        rollout_metrics = RolloutMetricsProvider()
+        model_dir = tmp_path / 'models'
+
+        # Save twice — second should overwrite cleanly
+        save_training_state(model_dir, pop, total_collected=100,
+                            collection_round=1, last_gen_step=0,
+                            generation_pending=False,
+                            rollout_metrics=rollout_metrics)
+        save_training_state(model_dir, pop, total_collected=200,
+                            collection_round=2, last_gen_step=100,
+                            generation_pending=True,
+                            rollout_metrics=rollout_metrics)
+
+        state = load_training_state(model_dir)
+        assert state['total_collected'] == 200
+        assert state['collection_round'] == 2
+
+        # No .tmp file should remain
+        assert not (model_dir / 'latest' / 'training_state.tmp').exists()

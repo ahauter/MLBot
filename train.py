@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import multiprocessing
 import multiprocessing.connection
 import random
@@ -1126,6 +1127,90 @@ def collect_and_train(
     return total_steps
 
 
+# ── training state persistence ─────────────────────────────────────────────
+
+def save_training_state(model_dir: Path, population, total_collected: int,
+                        collection_round: int, last_gen_step: int,
+                        generation_pending: bool, rollout_metrics,
+                        label: str = 'latest') -> None:
+    """Save full training loop state for resume capability.
+
+    Saves all agent checkpoints and a JSON file with loop state.
+    """
+    state_dir = model_dir / label
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save all agents (not just best) so we can resume the full population
+    for i, agent in enumerate(population.agents):
+        agent.save_checkpoint(state_dir / f'agent_{i}')
+
+    # Save loop state as JSON
+    loop_state = {
+        'total_collected': total_collected,
+        'collection_round': collection_round,
+        'last_gen_step': last_gen_step,
+        'generation_pending': generation_pending,
+        'generation': population.generation,
+        'goals_scored': rollout_metrics.goals_scored,
+        'goals_conceded': rollout_metrics.goals_conceded,
+        'num_agents': population.num_agents,
+    }
+    state_path = state_dir / 'training_state.json'
+    # Write atomically to avoid corruption on crash during write
+    tmp_path = state_path.with_suffix('.tmp')
+    tmp_path.write_text(json.dumps(loop_state, indent=2))
+    tmp_path.replace(state_path)
+
+
+def load_training_state(model_dir: Path, label: str = 'latest') -> Optional[dict]:
+    """Load training state from a checkpoint directory.
+
+    Returns the loop state dict, or None if no checkpoint exists.
+    """
+    state_dir = model_dir / label
+    state_path = state_dir / 'training_state.json'
+    if not state_path.exists():
+        return None
+    return json.loads(state_path.read_text())
+
+
+def resume_training(model_dir: Path, population, rollout_metrics,
+                    label: str = 'latest') -> Optional[dict]:
+    """Attempt to resume training from a checkpoint.
+
+    Loads agent weights and loop state. Returns loop state dict or None.
+    """
+    state = load_training_state(model_dir, label)
+    if state is None:
+        return None
+
+    state_dir = model_dir / label
+    loaded_count = 0
+    for i, agent in enumerate(population.agents):
+        agent_dir = state_dir / f'agent_{i}'
+        if (agent_dir / 'checkpoint.pt').exists():
+            agent.load_checkpoint(agent_dir)
+            loaded_count += 1
+
+    if loaded_count == 0:
+        return None
+
+    # Restore rollout metrics
+    rollout_metrics.goals_scored = state.get('goals_scored', 0)
+    rollout_metrics.goals_conceded = state.get('goals_conceded', 0)
+
+    # Restore population generation counter
+    target_gen = state.get('generation', 0)
+    while population.generation < target_gen:
+        population.reset_scores()
+
+    print(f'[train] Resumed from checkpoint: '
+          f'step={state["total_collected"]:,}, '
+          f'round={state["collection_round"]}, '
+          f'agents={loaded_count}/{state.get("num_agents", "?")}')
+    return state
+
+
 # ── main training loop ──────────────────────────────────────────────────────
 
 def train(config: dict):
@@ -1220,6 +1305,24 @@ def train(config: dict):
     registry.register('perf', profiler.get_metrics)
     registry.register('population', population.get_metrics)
 
+    # ── resume from checkpoint ─────────────────────────────────────────
+    total_collected = 0
+    collection_round = 0
+    gen_steps = pool_params.get('generation_steps', 1_000_000)
+    noise_scale = pool_params.get('generation_noise_scale', 0.01)
+    last_gen_step = 0
+    generation_pending = False
+
+    if config.get('resume', False):
+        resumed = resume_training(model_dir, population, rollout_metrics)
+        if resumed is not None:
+            total_collected = resumed['total_collected']
+            collection_round = resumed['collection_round']
+            last_gen_step = resumed.get('last_gen_step', 0)
+            generation_pending = resumed.get('generation_pending', False)
+        else:
+            print('[train] No checkpoint found, starting fresh.')
+
     # ── profiling config ──────────────────────────────────────────────
     profiling_cfg = config.get('profiling', {})
     profiling_enabled = profiling_cfg.get('enabled', False)
@@ -1253,18 +1356,13 @@ def train(config: dict):
 
     # ── main loop ───────────────────────────────────────────────────────
     updater = AsyncUpdater(profiler=profiler if profiling_enabled else None)
-    total_collected = 0
-    collection_round = 0
-    gen_steps = pool_params.get('generation_steps', 1_000_000)
-    noise_scale = pool_params.get('generation_noise_scale', 0.01)
-    last_gen_step = 0
-    generation_pending = False
 
     print(f'[train] {num_agents} agent(s), {num_envs} envs, '
           f'rollout_steps={config.get("algorithm", {}).get("params", {}).get("rollout_steps", 2048)}')
 
     from tqdm import tqdm
-    pbar = tqdm(total=total_steps, unit='step', dynamic_ncols=True)
+    pbar = tqdm(total=total_steps, initial=total_collected,
+                unit='step', dynamic_ncols=True)
     try:
         while total_collected < total_steps:
             profiler.start_round()
@@ -1369,12 +1467,13 @@ def train(config: dict):
             if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
                 generation_pending = True
 
-            # Checkpoint
+            # Checkpoint (full resumable state)
             _t0 = time.perf_counter()
             if collection_round % (log_interval * 10) == 0:
-                best_idx = population.rank_agents()[0]
-                population.agents[best_idx].save_checkpoint(
-                    model_dir / 'latest')
+                save_training_state(
+                    model_dir, population, total_collected, collection_round,
+                    last_gen_step, generation_pending, rollout_metrics,
+                    label='latest')
             _t1 = time.perf_counter()
             profiler.add_time('checkpoint_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'checkpoint')
@@ -1404,13 +1503,33 @@ def train(config: dict):
 
     except KeyboardInterrupt:
         print('\n[train] Interrupted.')
+    except Exception as e:
+        print(f'\n[train] Error: {e}', file=sys.stderr)
+        raise
     finally:
         pbar.close()
         updater.stop()
-        # Save final checkpoint
-        best_idx = population.rank_agents()[0]
-        population.agents[best_idx].save_checkpoint(model_dir / 'final')
-        print(f'[train] Saved final checkpoint to {model_dir}/final')
+
+        # Save resumable checkpoint (all agents + loop state)
+        try:
+            save_training_state(
+                model_dir, population, total_collected, collection_round,
+                last_gen_step, generation_pending, rollout_metrics,
+                label='latest')
+            print(f'[train] Saved resumable checkpoint to '
+                  f'{model_dir}/latest (step {total_collected:,})')
+        except Exception as save_err:
+            print(f'[train] WARNING: Failed to save checkpoint: {save_err}',
+                  file=sys.stderr)
+
+        # Also save best agent as 'final' for inference use
+        try:
+            best_idx = population.rank_agents()[0]
+            population.agents[best_idx].save_checkpoint(model_dir / 'final')
+            print(f'[train] Saved best agent to {model_dir}/final')
+        except Exception as save_err:
+            print(f'[train] WARNING: Failed to save final model: {save_err}',
+                  file=sys.stderr)
 
         # Generate profiling report if enabled
         if profiling_enabled:
@@ -1441,6 +1560,8 @@ def main():
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--total-steps', type=int, default=None)
     parser.add_argument('--num-envs', type=int, default=None)
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from latest checkpoint')
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable W&B logging')
     args = parser.parse_args()
@@ -1480,6 +1601,9 @@ def main():
 
     if args.no_wandb:
         config.setdefault('logger', {})['params'] = {'enabled': False}
+
+    if args.resume:
+        config['resume'] = True
 
     train(config)
 
