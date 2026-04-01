@@ -1124,30 +1124,37 @@ class TestPhysicsConvergence:
     """Verify the encoder can learn to track and predict interacting objects."""
 
     @staticmethod
-    def _simulate_bouncing_balls(n_steps=200, dt=1.0 / 120.0):
+    def _simulate_bouncing_balls(n_steps=200, dt=1.0 / 120.0, gravity=0.0):
         """3 balls bouncing in a box with elastic collisions.
 
-        Large radius ensures frequent collisions so W_interact has signal.
+        Parameters
+        ----------
+        gravity : float
+            Downward acceleration on z-axis (negative = down). 0 = no gravity.
+            Rocket League-scale in normalised coords: ~-2.0 gives visible arcs.
+
         Returns positions (n_steps, 3, 3) and velocities (n_steps, 3, 3),
         all normalised to roughly [-0.5, 0.5].
         """
         rng = np.random.RandomState(42)
         # Start balls close together so they interact quickly
         pos = np.array([
-            [-0.1, 0.0, 0.0],
-            [0.1, 0.0, 0.0],
+            [-0.1, 0.0, 0.1],
+            [0.1, 0.0, 0.2],
             [0.0, 0.15, 0.0],
         ], dtype=np.float32)
         vel = np.array([
-            [0.8, 0.3, 0.0],
-            [-0.6, 0.4, 0.0],
-            [0.2, -0.7, 0.0],
+            [0.8, 0.3, 0.2],
+            [-0.6, 0.4, -0.1],
+            [0.2, -0.7, 0.3],
         ], dtype=np.float32)
         radius = 0.08
         box = 0.5
 
         all_pos, all_vel = [pos.copy()], [vel.copy()]
         for _ in range(n_steps - 1):
+            # Apply gravity (acceleration on z-axis)
+            vel[:, 2] += gravity * dt
             pos = pos + vel * dt
             # Wall reflection
             for i in range(3):
@@ -1327,3 +1334,127 @@ class TestPhysicsConvergence:
             f"W_interact should learn nonzero coupling between colliding objects, "
             f"max coupling={max_coupling:.6f}"
         )
+
+    def _train_encoder(self, positions, velocities, n_epochs=30):
+        """Train an encoder on a trajectory, return the trained encoder."""
+        raw_states = self._to_raw_states(positions, velocities)
+        encoder = SE3Encoder()
+        optimiser = torch.optim.Adam(encoder.parameters(), lr=3e-3)
+
+        for _ in range(n_epochs):
+            coeff = torch.zeros(1, COEFF_DIM)
+            total_loss = torch.tensor(0.0)
+            n_pred = 0
+            for t in range(len(raw_states)):
+                if t % 8 == 0 and t > 0:
+                    coeff = coeff.detach()
+                raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
+                obs = torch.cat([raw_t, coeff], dim=1)
+                coeff = encoder(obs)
+                if t < len(raw_states) - 1:
+                    pos_next = torch.from_numpy(positions[t + 1]).unsqueeze(0)
+                    total_loss = total_loss + self._reconstruction_mse(
+                        encoder, coeff, pos_next)
+                    n_pred += 1
+            optimiser.zero_grad()
+            (total_loss / n_pred).backward()
+            optimiser.step()
+            encoder.normalise_quaternions_()
+
+        return encoder
+
+    def _measure_horizon_errors(self, encoder, positions, velocities, horizons):
+        """Measure prediction error at multiple horizons.
+
+        At each sample point t, run the encoder up to t (with LMS tracking),
+        then freeze coefficients and measure reconstruction error at t+h
+        WITHOUT any further LMS updates. This isolates how well the field
+        state at time t predicts future positions.
+
+        Returns dict {horizon: mean_mse}.
+        """
+        raw_states = self._to_raw_states(positions, velocities)
+        max_h = max(horizons)
+        n_samples = len(raw_states) - max_h
+        if n_samples < 10:
+            raise ValueError("Trajectory too short for requested horizons")
+
+        # Roll encoder forward, saving coefficients at each step
+        all_coeff = []
+        coeff = torch.zeros(1, COEFF_DIM)
+        with torch.no_grad():
+            for t in range(len(raw_states)):
+                raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
+                obs = torch.cat([raw_t, coeff], dim=1)
+                coeff = encoder(obs)
+                all_coeff.append(coeff.clone())
+
+        # Measure reconstruction error at each horizon
+        errors = {}
+        for h in horizons:
+            mse_sum = 0.0
+            count = 0
+            with torch.no_grad():
+                for t in range(20, n_samples):  # skip warmup
+                    frozen_coeff = all_coeff[t]
+                    future_pos = torch.from_numpy(positions[t + h]).unsqueeze(0)
+                    mse = self._reconstruction_mse(encoder, frozen_coeff, future_pos)
+                    mse_sum += mse.item()
+                    count += 1
+            errors[h] = mse_sum / count
+        return errors
+
+    def test_prediction_horizon_gravity_divergence(self):
+        """Compare prediction degradation at increasing horizons: no-gravity vs gravity.
+
+        Without gravity, the field's velocity channel (Im[f]) provides a decent
+        linear extrapolation — error grows slowly. With gravity, the missing
+        acceleration term causes quadratic divergence at longer horizons.
+
+        At 1-step horizon, both should be similar (gravity is negligible per tick).
+        At 60-step horizon (~0.5s), gravity case should be substantially worse.
+        """
+        n_steps = 300
+        horizons = [1, 5, 15, 30, 60]
+
+        # Generate trajectories
+        pos_no_g, vel_no_g = self._simulate_bouncing_balls(
+            n_steps=n_steps, gravity=0.0)
+        pos_grav, vel_grav = self._simulate_bouncing_balls(
+            n_steps=n_steps, gravity=-2.0)
+
+        # Train encoders
+        enc_no_g = self._train_encoder(pos_no_g, vel_no_g, n_epochs=25)
+        enc_grav = self._train_encoder(pos_grav, vel_grav, n_epochs=25)
+
+        # Measure prediction errors at each horizon
+        err_no_g = self._measure_horizon_errors(
+            enc_no_g, pos_no_g, vel_no_g, horizons)
+        err_grav = self._measure_horizon_errors(
+            enc_grav, pos_grav, vel_grav, horizons)
+
+        # Print results for diagnostic visibility
+        print("\n--- Prediction horizon experiment ---")
+        print(f"{'Horizon':>8} {'No-gravity MSE':>16} {'Gravity MSE':>16} {'Ratio (g/no-g)':>16}")
+        for h in horizons:
+            ratio = err_grav[h] / max(err_no_g[h], 1e-10)
+            print(f"{h:>8} {err_no_g[h]:>16.6f} {err_grav[h]:>16.6f} {ratio:>16.2f}x")
+
+        # At short horizon, both should be similar (within 5x)
+        ratio_short = err_grav[1] / max(err_no_g[1], 1e-10)
+        assert ratio_short < 5.0, (
+            f"At horizon=1, gravity shouldn't matter much: "
+            f"ratio={ratio_short:.2f}x"
+        )
+
+        # At long horizon, gravity case should diverge more
+        # The ratio of (gravity error / no-gravity error) should increase with horizon
+        ratio_long = err_grav[60] / max(err_no_g[60], 1e-10)
+        assert ratio_long > ratio_short, (
+            f"Gravity prediction should degrade faster at longer horizons: "
+            f"ratio@1={ratio_short:.2f}x, ratio@60={ratio_long:.2f}x"
+        )
+
+        # Error should grow with horizon for both cases
+        assert err_no_g[60] > err_no_g[1], "No-gravity error should grow with horizon"
+        assert err_grav[60] > err_grav[1], "Gravity error should grow with horizon"
