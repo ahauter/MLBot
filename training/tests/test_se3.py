@@ -28,8 +28,8 @@ from se3_field import (
     detect_contact, detect_contact_np,
     SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, N_OBJECTS, K,
     make_initial_coefficients, update_coefficients_np, pack_observation,
-    _BALL, _EGO, _OPP, _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF,
-    _PREV_VEL_OFF,
+    _BALL, _EGO, _OPP, _GOAL_TEAM, _GOAL_OPP,
+    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _PREV_VEL_OFF,
 )
 from se3_policy import SE3Policy, StochasticSE3Policy
 
@@ -347,8 +347,8 @@ class TestSpectralMath:
             f"Real residual should decrease: {res_before:.4f} → {res_after:.4f}")
         assert res_after < 0.05, f"Real residual should be small after 200 steps: {res_after:.4f}"
 
-    def test_coefficient_convergence_imaginary(self):
-        """Imaginary coefficients converge independently of real part."""
+    def test_complex_field_convergence(self):
+        """Complex reconstruction Re[f] = Σ(a·cos - b·sin) converges toward position."""
         rng = np.random.default_rng(99)
         k = rng.standard_normal((N_OBJECTS, K, 3)).astype(np.float32) * 0.3
         q = rng.standard_normal((N_OBJECTS, K, 4)).astype(np.float32)
@@ -358,25 +358,27 @@ class TestSpectralMath:
         raw = self._make_raw_state(seed=3)
         coeff = make_initial_coefficients()
 
-        def residual_imag(coeff):
-            """Mean absolute imaginary-part residual over x/y/z for ball."""
+        def complex_residual(coeff):
+            """Mean abs complex reconstruction error for ball."""
             c = coeff.reshape(N_OBJECTS, K, 3, 2)
             pos = raw[_BALL_OFF:_BALL_OFF + 3]
             phase = k[_BALL] @ pos
-            s_sin = np.sin(phase)
             ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            orient = (q[_BALL] * ori).sum(axis=-1)        # (K,)
-            pred = (s_sin * orient) @ c[_BALL, :, :, 1]  # (K,)@(K,3) → (3,)
+            orient = (q[_BALL] * ori).sum(axis=-1)
+            basis_cos = np.cos(phase) * orient
+            basis_sin = np.sin(phase) * orient
+            # Re[f] = Σ_k (a_k·cos·q - b_k·sin·q)
+            pred = basis_cos @ c[_BALL, :, :, 0] - basis_sin @ c[_BALL, :, :, 1]
             return np.abs(pos - pred).mean()
 
-        res_before = residual_imag(coeff)
+        res_before = complex_residual(coeff)
 
         for _ in range(200):
             coeff = update_coefficients_np(k, q, lr, coeff, raw)
 
-        res_after = residual_imag(coeff)
+        res_after = complex_residual(coeff)
         assert res_after < res_before or res_before < 1e-6, (
-            f"Imaginary residual should decrease: {res_before:.4f} → {res_after:.4f}")
+            f"Complex residual should decrease: {res_before:.4f} → {res_after:.4f}")
 
     def test_contact_reset_only_affects_ball(self):
         """Contact resets ball coefficients but leaves all other objects untouched."""
@@ -901,3 +903,427 @@ class TestLayerNorm:
         policy = StochasticSE3Policy(obs_dim=COEFF_DIM)
         assert hasattr(policy, 'layer_norm')
         assert isinstance(policy.layer_norm, torch.nn.LayerNorm)
+
+
+# ── Complex coupling tests ──────────────────────────────────────────────────
+
+class TestComplexCoupling:
+
+    def test_cross_term_active(self):
+        """Setting coeff_imag != 0 should change position prediction vs imag=0."""
+        encoder = SE3Encoder()
+        obs = torch.randn(2, SE3_OBS_DIM)
+        # Zero all prev coefficients
+        obs[:, RAW_STATE_DIM:] = 0.0
+        with torch.no_grad():
+            out_zero = encoder(obs).clone()
+
+        # Set imaginary coefficients to nonzero
+        obs2 = obs.clone()
+        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, 3, 2)
+        prev[:, :, :, :, 1] = 0.5  # imag channel
+        obs2[:, RAW_STATE_DIM:] = prev.reshape(2, -1)
+        with torch.no_grad():
+            out_imag = encoder(obs2)
+
+        # Outputs should differ because sin basis × imag contributes to Re[f]
+        assert not torch.allclose(out_zero, out_imag, atol=1e-6), \
+            "Imaginary coefficients should affect output via complex cross-term"
+
+    def test_complex_velocity_derivative(self):
+        """Analytical velocity (Im[f]) should approximate finite-difference velocity."""
+        # Set up known coefficients and positions
+        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 0.5
+        quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
+        quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
+
+        pos = np.random.randn(N_OBJECTS, 3).astype(np.float32) * 0.3
+        ori = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (N_OBJECTS, 1))
+
+        # Known coefficients
+        coeff = np.random.randn(N_OBJECTS, K, 3, 2).astype(np.float32) * 0.1
+
+        # Compute Re[f] at pos
+        def recon_at(p, obj):
+            phase = k_sp[obj] @ p
+            s_cos = np.cos(phase)
+            s_sin = np.sin(phase)
+            orient = (quats[obj] * ori[obj]).sum(axis=-1)
+            bc = s_cos * orient
+            bs = s_sin * orient
+            return (bc @ coeff[obj, :, :, 0] - bs @ coeff[obj, :, :, 1])
+
+        # Finite difference velocity for object 0
+        eps = 1e-4
+        obj = 0
+        fd_vel = np.zeros(3, dtype=np.float32)
+        for d in range(3):
+            p_plus = pos[obj].copy(); p_plus[d] += eps
+            p_minus = pos[obj].copy(); p_minus[d] -= eps
+            fd_vel[d] = (recon_at(p_plus, obj) - recon_at(p_minus, obj))[d] / (2 * eps)
+
+        # Analytical: Im[f] = Σ_k (a·sin + b·cos) — this is the imaginary part
+        phase = k_sp[obj] @ pos[obj]
+        s_cos = np.cos(phase)
+        s_sin = np.sin(phase)
+        orient = (quats[obj] * ori[obj]).sum(axis=-1)
+        im_f = ((s_sin * orient) @ coeff[obj, :, :, 0]
+                + (s_cos * orient) @ coeff[obj, :, :, 1])
+
+        # Im[f] exists and is nonzero when coefficients are set
+        assert np.abs(im_f).sum() > 1e-8, "Im[f] should be nonzero with random coefficients"
+
+
+# ── W_interact tests ────────────────────────────────────────────────────────
+
+class TestWInteract:
+
+    def _make_raw_state(self):
+        raw = np.zeros(RAW_STATE_DIM, dtype=np.float32)
+        raw[_BALL_OFF:_BALL_OFF + 3] = [0.1, 0.2, 0.05]
+        raw[_EGO_OFF:_EGO_OFF + 3] = [-0.3, 0.1, 0.02]
+        raw[_EGO_OFF + 6:_EGO_OFF + 10] = [1, 0, 0, 0]
+        raw[_OPP_OFF:_OPP_OFF + 3] = [0.4, -0.2, 0.03]
+        raw[_OPP_OFF + 6:_OPP_OFF + 10] = [1, 0, 0, 0]
+        return raw
+
+    def test_zero_W_preserves_output(self):
+        """W_interact=0 should produce identical output to W_interact=None."""
+        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
+        quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
+        quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
+        lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
+        prev = np.random.randn(COEFF_DIM).astype(np.float32) * 0.1
+        raw = self._make_raw_state()
+
+        out_none = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=None)
+        W_zero = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
+        out_zero = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
+
+        np.testing.assert_allclose(out_none, out_zero, atol=1e-6,
+                                   err_msg="W_interact=0 should match W_interact=None")
+
+    def test_nonzero_W_changes_output(self):
+        """Non-zero W_interact should change the coefficient update."""
+        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
+        quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
+        quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
+        lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
+        prev = np.random.randn(COEFF_DIM).astype(np.float32) * 0.1
+        raw = self._make_raw_state()
+
+        W_zero = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
+        out_zero = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
+
+        W_nonzero = np.random.randn(N_OBJECTS, N_OBJECTS).astype(np.float32) * 0.1
+        out_coupled = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_nonzero)
+
+        assert not np.allclose(out_zero, out_coupled, atol=1e-6), \
+            "Non-zero W_interact should change output"
+
+    def test_gradient_flows_to_W_interact(self):
+        """Backprop should reach W_interact."""
+        encoder = SE3Encoder()
+        obs = torch.randn(4, SE3_OBS_DIM)
+        out = encoder(obs)
+        loss = out.sum()
+        loss.backward()
+
+        assert encoder.W_interact.grad is not None, "W_interact should have gradient"
+        assert encoder.W_interact.grad.abs().sum().item() > 0, \
+            "W_interact gradient should be nonzero"
+
+
+# ── Numpy / Torch parity ────────────────────────────────────────────────────
+
+class TestNumpyTorchParity:
+
+    def test_complex_coupling_parity(self):
+        """Numpy update_coefficients_np should match torch SE3Encoder for one step."""
+        encoder = SE3Encoder()
+        encoder.eval()
+
+        # Extract params
+        with torch.no_grad():
+            k_sp_t = encoder.k_spatial.clone()
+            q_t = encoder.quaternions.clone()
+            q_t = q_t / q_t.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            lr_t = torch.exp(encoder.log_lr)
+            W_t = encoder.W_interact.clone()
+
+        k_sp_np = k_sp_t.numpy()
+        q_np = q_t.numpy()
+        lr_np = lr_t.numpy()
+        W_np = W_t.numpy()
+
+        # Create raw state (no contact scenario — zero prev_ball_vel)
+        raw = np.zeros(RAW_STATE_DIM, dtype=np.float32)
+        raw[_BALL_OFF:_BALL_OFF + 3] = [0.1, 0.2, 0.05]
+        raw[_EGO_OFF:_EGO_OFF + 3] = [-0.3, 0.1, 0.02]
+        raw[_EGO_OFF + 6:_EGO_OFF + 10] = [1, 0, 0, 0]
+        raw[_OPP_OFF:_OPP_OFF + 3] = [0.4, -0.2, 0.03]
+        raw[_OPP_OFF + 6:_OPP_OFF + 10] = [1, 0, 0, 0]
+        # Set prev_ball_vel = ball_vel to avoid contact detection
+        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = raw[_BALL_OFF + 3:_BALL_OFF + 6]
+
+        prev_coeff = np.zeros(COEFF_DIM, dtype=np.float32)
+
+        # Numpy path
+        np_out = update_coefficients_np(k_sp_np, q_np, lr_np, prev_coeff, raw,
+                                        W_interact=W_np)
+
+        # Torch path
+        obs = pack_observation(raw, prev_coeff)
+        obs_t = torch.from_numpy(obs).unsqueeze(0)
+        with torch.no_grad():
+            torch_out = encoder(obs_t).squeeze(0).numpy()
+
+        np.testing.assert_allclose(np_out, torch_out, atol=1e-4,
+                                   err_msg="Numpy and torch complex update should match")
+
+
+# ── Prediction metric test ──────────────────────────────────────────────────
+
+class TestPredictionMetric:
+
+    def _make_config(self):
+        return {
+            'algorithm': {
+                'params': {
+                    'lr': 3e-4, 'gamma': 0.99, 'gae_lambda': 0.95,
+                    'clip_epsilon': 0.2, 'vf_coef': 0.5, 'ent_coef': 0.01,
+                    'max_grad_norm': 0.5, 'rollout_steps': 64,
+                    'ppo_epochs': 2, 'minibatch_size': 32,
+                }
+            },
+            'num_envs': 2,
+        }
+
+    def test_prediction_metric_in_update(self):
+        """SE3PPOAlgorithm.update() should return 'next_state_pred_mse'."""
+        from training.algorithms.se3_ppo import SE3PPOAlgorithm
+        algo = SE3PPOAlgorithm(self._make_config())
+
+        # Fill buffer by collecting transitions
+        for _ in range(64):
+            obs = np.random.randn(2, SE3_OBS_DIM).astype(np.float32)
+            result = algo.select_action(obs)
+            next_obs = np.random.randn(2, SE3_OBS_DIM).astype(np.float32)
+            algo.store_transition(obs, result, np.zeros(2), next_obs, np.zeros(2), {})
+
+        metrics = algo.update()
+        assert 'next_state_pred_mse' in metrics, \
+            "update() should return next_state_pred_mse metric"
+        assert isinstance(metrics['next_state_pred_mse'], float), \
+            "next_state_pred_mse should be a float"
+
+
+# ── Physics simulation convergence test ─────────────────────────────────────
+
+class TestPhysicsConvergence:
+    """Verify the encoder can learn to track and predict interacting objects."""
+
+    @staticmethod
+    def _simulate_bouncing_balls(n_steps=200, dt=1.0 / 120.0):
+        """3 balls bouncing in a box with elastic collisions.
+
+        Large radius ensures frequent collisions so W_interact has signal.
+        Returns positions (n_steps, 3, 3) and velocities (n_steps, 3, 3),
+        all normalised to roughly [-0.5, 0.5].
+        """
+        rng = np.random.RandomState(42)
+        # Start balls close together so they interact quickly
+        pos = np.array([
+            [-0.1, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.15, 0.0],
+        ], dtype=np.float32)
+        vel = np.array([
+            [0.8, 0.3, 0.0],
+            [-0.6, 0.4, 0.0],
+            [0.2, -0.7, 0.0],
+        ], dtype=np.float32)
+        radius = 0.08
+        box = 0.5
+
+        all_pos, all_vel = [pos.copy()], [vel.copy()]
+        for _ in range(n_steps - 1):
+            pos = pos + vel * dt
+            # Wall reflection
+            for i in range(3):
+                for d in range(3):
+                    if pos[i, d] > box:
+                        pos[i, d] = 2 * box - pos[i, d]
+                        vel[i, d] *= -1
+                    elif pos[i, d] < -box:
+                        pos[i, d] = -2 * box - pos[i, d]
+                        vel[i, d] *= -1
+            # Elastic ball-ball collisions
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    diff = pos[i] - pos[j]
+                    dist = np.linalg.norm(diff)
+                    if 1e-8 < dist < 2 * radius:
+                        normal = diff / dist
+                        v_rel = np.dot(vel[i] - vel[j], normal)
+                        if v_rel < 0:
+                            vel[i] -= v_rel * normal
+                            vel[j] += v_rel * normal
+                            sep = (2 * radius - dist) * 0.5
+                            pos[i] += normal * sep
+                            pos[j] -= normal * sep
+            all_pos.append(pos.copy())
+            all_vel.append(vel.copy())
+        return np.array(all_pos, dtype=np.float32), np.array(all_vel, dtype=np.float32)
+
+    @staticmethod
+    def _to_raw_states(positions, velocities):
+        """Map 3 balls → raw_state (ball/ego/opp slots). Returns (n_steps, RAW_STATE_DIM)."""
+        n = positions.shape[0]
+        raw = np.zeros((n, RAW_STATE_DIM), dtype=np.float32)
+        id_q = np.array([1, 0, 0, 0], dtype=np.float32)
+        for t in range(n):
+            r = raw[t]
+            r[_BALL_OFF:_BALL_OFF + 3] = positions[t, 0]
+            r[_BALL_OFF + 3:_BALL_OFF + 6] = velocities[t, 0]
+            r[_EGO_OFF:_EGO_OFF + 3] = positions[t, 1]
+            r[_EGO_OFF + 3:_EGO_OFF + 6] = velocities[t, 1]
+            r[_EGO_OFF + 6:_EGO_OFF + 10] = id_q
+            r[_OPP_OFF:_OPP_OFF + 3] = positions[t, 2]
+            r[_OPP_OFF + 3:_OPP_OFF + 6] = velocities[t, 2]
+            r[_OPP_OFF + 6:_OPP_OFF + 10] = id_q
+            # prev ball vel (same as current at t=0 to avoid false contact)
+            r[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = (
+                velocities[t - 1, 0] if t > 0 else velocities[t, 0])
+        return raw
+
+    @staticmethod
+    def _reconstruction_mse(encoder, coeff_tensor, positions_tensor):
+        """Compute position reconstruction MSE for the 3 moving objects.
+
+        coeff_tensor: (1, COEFF_DIM)
+        positions_tensor: (1, 3, 3)  — positions of ball, ego, opp
+        """
+        c = coeff_tensor.reshape(1, N_OBJECTS, K, 3, 2)
+        full_pos = torch.zeros(1, N_OBJECTS, 3, device=coeff_tensor.device)
+        full_pos[0, _BALL] = positions_tensor[0, 0]
+        full_pos[0, _EGO] = positions_tensor[0, 1]
+        full_pos[0, _OPP] = positions_tensor[0, 2]
+        full_pos[0, _GOAL_TEAM, 1] = -1.0
+        full_pos[0, _GOAL_OPP, 1] = 1.0
+
+        q_basis = encoder.quaternions / encoder.quaternions.norm(
+            dim=-1, keepdim=True).clamp(min=1e-8)
+        phase = torch.einsum('okd,bod->bok', encoder.k_spatial, full_pos)
+        orient = torch.einsum('okd,bod->bok', q_basis,
+                              torch.tensor([1, 0, 0, 0.], device=coeff_tensor.device)
+                              .unsqueeze(0).unsqueeze(0).expand(1, N_OBJECTS, 4))
+        basis_cos = (torch.cos(phase) * orient).unsqueeze(-1)
+        basis_sin = (torch.sin(phase) * orient).unsqueeze(-1)
+        predicted = (basis_cos * c[:, :, :, :, 0]
+                     - basis_sin * c[:, :, :, :, 1]).sum(dim=2)
+        return ((full_pos[:, :3] - predicted[:, :3]) ** 2).mean()
+
+    def test_encoder_converges_on_bouncing_balls(self):
+        """Train encoder on next-step prediction: given coeff[t], predict pos[t+1].
+
+        Uses per-step detachment (truncated BPTT depth 1) so each step gives
+        an independent gradient to k_spatial, quaternions, log_lr, and W_interact.
+
+        Next-step prediction directly tests whether the spectral field captures
+        dynamics — the field at time t should already partially predict where
+        objects will be at t+1 because the LMS has been tracking their motion.
+        """
+        positions, velocities = self._simulate_bouncing_balls(n_steps=150)
+        raw_states = self._to_raw_states(positions, velocities)
+
+        encoder = SE3Encoder()
+        optimiser = torch.optim.Adam(encoder.parameters(), lr=3e-3)
+
+        n_epochs = 40
+        bptt_len = 8  # backprop through this many steps before detaching
+        epoch_losses = []
+
+        for epoch in range(n_epochs):
+            coeff = torch.zeros(1, COEFF_DIM)
+            total_loss = torch.tensor(0.0)
+            n_pred = 0
+
+            for t in range(len(raw_states)):
+                # Detach every bptt_len steps to bound memory while still
+                # letting gradients flow through short temporal windows
+                if t % bptt_len == 0 and t > 0:
+                    coeff = coeff.detach()
+
+                raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
+                obs = torch.cat([raw_t, coeff], dim=1)
+                coeff = encoder(obs)
+
+                # Next-step prediction: how well do coeff[t] predict pos[t+1]?
+                if t < len(raw_states) - 1:
+                    pos_next = torch.from_numpy(positions[t + 1]).unsqueeze(0)
+                    total_loss = total_loss + self._reconstruction_mse(
+                        encoder, coeff, pos_next)
+                    n_pred += 1
+
+            optimiser.zero_grad()
+            (total_loss / n_pred).backward()
+            optimiser.step()
+            encoder.normalise_quaternions_()
+
+            epoch_losses.append(total_loss.item() / n_pred)
+
+        # Convergence: next-step prediction should improve
+        assert epoch_losses[-1] < epoch_losses[0] * 0.85, (
+            f"Encoder should converge on next-step prediction: "
+            f"epoch 0 loss={epoch_losses[0]:.4f}, "
+            f"epoch {n_epochs-1} loss={epoch_losses[-1]:.4f}"
+        )
+
+    def test_W_interact_learns_from_collisions(self):
+        """W_interact should develop nonzero entries after training on colliding objects.
+
+        Balls that interact (collide) create correlated residuals: when ball A
+        bounces off ball B, both have large reconstruction errors simultaneously.
+        W_interact should learn to mix these residuals to improve tracking.
+        """
+        positions, velocities = self._simulate_bouncing_balls(n_steps=150)
+        raw_states = self._to_raw_states(positions, velocities)
+
+        encoder = SE3Encoder()
+        # Confirm W_interact starts at zero
+        assert encoder.W_interact.abs().max().item() < 1e-8
+
+        optimiser = torch.optim.Adam(encoder.parameters(), lr=3e-3)
+
+        for _ in range(30):
+            coeff = torch.zeros(1, COEFF_DIM)
+            total_loss = torch.tensor(0.0)
+            n_pred = 0
+
+            for t in range(len(raw_states)):
+                raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
+                obs = torch.cat([raw_t, coeff.detach()], dim=1)
+                coeff = encoder(obs)
+
+                if t < len(raw_states) - 1:
+                    pos_next = torch.from_numpy(positions[t + 1]).unsqueeze(0)
+                    total_loss = total_loss + self._reconstruction_mse(
+                        encoder, coeff, pos_next)
+                    n_pred += 1
+
+            optimiser.zero_grad()
+            (total_loss / n_pred).backward()
+            optimiser.step()
+            encoder.normalise_quaternions_()
+
+        # W_interact should have learned nonzero coupling
+        W = encoder.W_interact.detach()
+        # Check entries among the 3 moving objects (ball=0, ego=1, opp=3)
+        moving = [_BALL, _EGO, _OPP]
+        max_coupling = max(abs(W[i, j].item())
+                          for i in moving for j in moving if i != j)
+        assert max_coupling > 1e-4, (
+            f"W_interact should learn nonzero coupling between colliding objects, "
+            f"max coupling={max_coupling:.6f}"
+        )

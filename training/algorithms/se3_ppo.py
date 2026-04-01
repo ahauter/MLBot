@@ -244,6 +244,38 @@ class SE3PPOAlgorithm(Algorithm):
 
         self.buffer.compute_gae(last_values)
 
+        # ── Next-state prediction diagnostic (no grad) ───────────────────
+        # Measures how well the encoder's coefficient update tracks actual
+        # state changes. Compares encoder output at t to raw state at t+1.
+        buf_pos = self.buffer.pos
+        prediction_mse = 0.0
+        if buf_pos >= 2:
+            with torch.no_grad():
+                # Sample a subset to avoid OOM on large buffers
+                _max_diag = min(512, (buf_pos - 1) * self.num_envs)
+                _total = (buf_pos - 1) * self.num_envs
+                _idx = np.random.choice(_total, _max_diag, replace=False)
+
+                flat_obs_t = self.buffer.obs[:buf_pos - 1].reshape(_total, SE3_OBS_DIM)
+                flat_obs_tp1 = self.buffer.obs[1:buf_pos].reshape(_total, SE3_OBS_DIM)
+                flat_dones = self.buffer.dones[:buf_pos - 1].reshape(_total)
+
+                obs_t = torch.tensor(flat_obs_t[_idx], dtype=torch.float32, device=self.device)
+                obs_tp1 = torch.tensor(flat_obs_tp1[_idx], dtype=torch.float32, device=self.device)
+                not_done = torch.tensor(1.0 - flat_dones[_idx], dtype=torch.float32, device=self.device)
+
+                # Encoder output at t: these are the coefficients the policy sees
+                coeff_t = self.encoder(obs_t)  # (N, 384)
+
+                # Actual next-step coefficients (computed by the env's numpy mirror)
+                coeff_tp1_actual = obs_tp1[:, RAW_STATE_DIM:]  # (N, 384)
+
+                # Encoder prediction: if we fed obs_tp1's raw state + coeff_t as prev,
+                # how close would it be? This measures tracking quality.
+                # MSE between encoder's output and what the env actually computed next
+                err = (coeff_t - coeff_tp1_actual).pow(2).mean(dim=-1)  # (N,)
+                prediction_mse = (err * not_done).sum().item() / max(not_done.sum().item(), 1.0)
+
         # Generate dream observations from the last real observation
         dream_obs_np = self._dream_rollout(last_obs[0])
         self.encoder.train()   # _dream_rollout leaves encoder in eval; restore
@@ -363,6 +395,7 @@ class SE3PPOAlgorithm(Algorithm):
             'spectral_H_intra': total_H_intra / n_updates,
             'spectral_H_inter': total_H_inter / n_updates,
             'dream_steps_mean': dream_steps_total,
+            'next_state_pred_mse': prediction_mse,
         }
 
     def save_checkpoint(self, path: Path) -> None:

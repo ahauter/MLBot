@@ -97,13 +97,17 @@ class SE3GymEnv(gym.Env):
         norms = np.linalg.norm(self._quaternions, axis=-1, keepdims=True)
         self._quaternions /= np.maximum(norms, 1e-8)
         self._lr: np.ndarray = np.full(N_OBJECTS, 0.05, dtype=np.float32)
+        self._W_interact: np.ndarray = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
 
     def set_encoder_params(self, k_spatial: np.ndarray, quaternions: np.ndarray,
-                           lr: np.ndarray) -> None:
+                           lr: np.ndarray,
+                           W_interact: Optional[np.ndarray] = None) -> None:
         """Sync encoder parameters from the algorithm (called periodically)."""
         self._k_spatial = k_spatial.copy()
         self._quaternions = quaternions.copy()
         self._lr = lr.copy()
+        if W_interact is not None:
+            self._W_interact = W_interact.copy()
 
     def reset(
         self,
@@ -154,7 +158,7 @@ class SE3GymEnv(gym.Env):
         # Update coefficients (numpy, no grad)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._coefficients, raw_state)
+            self._coefficients, raw_state, W_interact=self._W_interact)
 
         # Update prev ball vel for next step's contact detection
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
@@ -165,7 +169,7 @@ class SE3GymEnv(gym.Env):
         orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._orange_coefficients, orange_raw)
+            self._orange_coefficients, orange_raw, W_interact=self._W_interact)
         self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
@@ -207,14 +211,14 @@ class SE3GymEnv(gym.Env):
         raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._coefficients, raw_state)
+            self._coefficients, raw_state, W_interact=self._W_interact)
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
         obs = pack_observation(raw_state, self._coefficients)
 
         orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._orange_coefficients, orange_raw)
+            self._orange_coefficients, orange_raw, W_interact=self._W_interact)
         self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 

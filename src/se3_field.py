@@ -203,6 +203,9 @@ class SE3Encoder(nn.Module):
         # Learned per-object update rate (log-space for positivity)
         self.log_lr = nn.Parameter(torch.full((N_OBJECTS,), math.log(0.05)))
 
+        # Learned pairwise interaction weights (zero-init = no coupling at start)
+        self.W_interact = nn.Parameter(torch.zeros(N_OBJECTS, N_OBJECTS))
+
     @property
     def d_model(self) -> int:
         """Output dimensionality (for interface compatibility)."""
@@ -299,25 +302,31 @@ class SE3Encoder(nn.Module):
         # Target: full 3D position vector (batch, N_OBJECTS, 3)
         target = positions
 
-        # Field evaluation: sum over K components → (batch, N_OBJECTS, 3)
-        # basis: (batch, N_OBJECTS, K) unsqueeze(-1) → (batch, N_OBJECTS, K, 1)
-        # prev_coeff[..., 0]: (batch, N_OBJECTS, K, 3)
+        # ── Complex spectral field reconstruction ────────────────────────
+        # Re[f(x)] = Σ_k (a_k·cos(k·x)·q - b_k·sin(k·x)·q)
+        # where a_k = coeff_real, b_k = coeff_imag
         basis_cos = (spatial_cos * orient).unsqueeze(-1)   # (batch, N_OBJECTS, K, 1)
         basis_sin = (spatial_sin * orient).unsqueeze(-1)
-        predicted_real = (basis_cos * prev_coeff[:, :, :, :, 0]).sum(dim=2)  # (batch, N_OBJECTS, 3)
-        predicted_imag = (basis_sin * prev_coeff[:, :, :, :, 1]).sum(dim=2)
-        residual_real = target - predicted_real            # (batch, N_OBJECTS, 3)
-        residual_imag = target - predicted_imag
+        coeff_a = prev_coeff[:, :, :, :, 0]                # (batch, N_OBJECTS, K, 3)
+        coeff_b = prev_coeff[:, :, :, :, 1]
+        predicted = (basis_cos * coeff_a - basis_sin * coeff_b).sum(dim=2)
+        # predicted: (batch, N_OBJECTS, 3)
 
-        # Delta: outer product of basis (K) × residual (3) → (batch, N_OBJECTS, K, 3)
-        # lr: (1, N_OBJECTS) → (1, N_OBJECTS, 1, 1) after two unsqueezes
-        scaled_res_real = (lr.unsqueeze(-1) * residual_real).unsqueeze(2)  # (batch, N_OBJECTS, 1, 3)
-        scaled_res_imag = (lr.unsqueeze(-1) * residual_imag).unsqueeze(2)
-        delta_real = scaled_res_real * (spatial_cos * orient).unsqueeze(-1)  # (batch, N_OBJECTS, K, 3)
-        delta_imag = scaled_res_imag * (spatial_sin * orient).unsqueeze(-1)
+        residual = target - predicted                       # (batch, N_OBJECTS, 3)
 
-        new_coeff_real = prev_coeff[:, :, :, :, 0] + delta_real   # (batch, N_OBJECTS, K, 3)
-        new_coeff_imag = prev_coeff[:, :, :, :, 1] + delta_imag
+        # ── Cross-object coupling: mix residuals via W_interact ──────────
+        W_eff = torch.eye(N_OBJECTS, device=device) + self.W_interact
+        residual = torch.einsum('ij,bjd->bid', W_eff, residual)
+
+        # ── Complex LMS coefficient update ───────────────────────────────
+        # ∂Re[f]/∂a_k = cos·q  →  delta_a = lr × residual × cos·q
+        # ∂Re[f]/∂b_k = -sin·q →  delta_b = -lr × residual × sin·q
+        scaled_res = (lr.unsqueeze(-1) * residual).unsqueeze(2)  # (batch, N_OBJECTS, 1, 3)
+        delta_real = scaled_res * basis_cos                  # (batch, N_OBJECTS, K, 3)
+        delta_imag = -scaled_res * basis_sin
+
+        new_coeff_real = coeff_a + delta_real                # (batch, N_OBJECTS, K, 3)
+        new_coeff_imag = coeff_b + delta_imag
 
         # Reset ball coefficients on contact (mask multiply, no in-place)
         # contact_keep: 0.0 if contact, 1.0 if no contact → (batch, 1)
@@ -372,13 +381,14 @@ def update_coefficients_np(
     k_spatial: np.ndarray,      # (N_OBJECTS, K, 3)
     quaternions: np.ndarray,    # (N_OBJECTS, K, 4) unit
     lr: np.ndarray,             # (N_OBJECTS,)
-    prev_coeff: np.ndarray,     # (COEFF_DIM,) = 128
+    prev_coeff: np.ndarray,     # (COEFF_DIM,) = 384
     raw_state: np.ndarray,      # (RAW_STATE_DIM,) = 57
+    W_interact: Optional[np.ndarray] = None,  # (N_OBJECTS, N_OBJECTS) or None
 ) -> np.ndarray:
     """Non-differentiable coefficient update for env stepping.
 
-    Mirrors SE3Encoder.forward logic but in numpy for subprocess envs.
-    Returns updated coefficients (128,).
+    Mirrors SE3Encoder.forward logic (complex field + W_interact) in numpy.
+    Returns updated coefficients (384,).
     """
     coeff = prev_coeff.reshape(N_OBJECTS, K, 3, 2).copy()
 
@@ -417,30 +427,47 @@ def update_coefficients_np(
     # Contact detection
     contact = detect_contact_np(prev_ball_vel, ball_vel)
 
-    # Update each object
+    # ── Pre-pass: compute per-object bases and residuals ─────────────
+    # Store per-object basis and residual for W_interact mixing
+    all_basis_cos = np.zeros((N_OBJECTS, K), dtype=np.float32)
+    all_basis_sin = np.zeros((N_OBJECTS, K), dtype=np.float32)
+    all_residuals = np.zeros((N_OBJECTS, 3), dtype=np.float32)
+
     for obj in range(N_OBJECTS):
         pos = positions[obj]
         ori = orientations[obj]
 
-        # Spatial: cos (real) and sin (imaginary) bases
-        phase = k_spatial[obj] @ pos          # (K,)
-        spatial_cos = np.cos(phase)
-        spatial_sin = np.sin(phase)
+        phase = k_spatial[obj] @ pos                     # (K,)
+        s_cos = np.cos(phase)
+        s_sin = np.sin(phase)
+        orient = (quaternions[obj] * ori).sum(axis=-1)   # (K,)
 
-        # Orientation: dot product  shape (K,)
-        orient = (quaternions[obj] * ori).sum(axis=-1)
+        basis_cos = s_cos * orient                       # (K,)
+        basis_sin = s_sin * orient
 
-        target = pos                                     # (3,) — x, y, z
+        all_basis_cos[obj] = basis_cos
+        all_basis_sin[obj] = basis_sin
 
-        # Real update: (K,) @ (K, 3) → (3,); outer (K,) × (3,) → (K, 3)
-        predicted_real = (spatial_cos * orient) @ coeff[obj, :, :, 0]
-        residual_real = target - predicted_real
-        coeff[obj, :, :, 0] += np.outer(lr[obj] * spatial_cos * orient, residual_real)
+        # Complex reconstruction: Re[f] = Σ_k (a_k·cos·q - b_k·sin·q)
+        predicted = (basis_cos @ coeff[obj, :, :, 0]
+                     - basis_sin @ coeff[obj, :, :, 1])  # (3,)
+        all_residuals[obj] = pos - predicted
 
-        # Imaginary update
-        predicted_imag = (spatial_sin * orient) @ coeff[obj, :, :, 1]
-        residual_imag = target - predicted_imag
-        coeff[obj, :, :, 1] += np.outer(lr[obj] * spatial_sin * orient, residual_imag)
+    # ── Cross-object coupling ────────────────────────────────────────
+    if W_interact is not None:
+        W_eff = np.eye(N_OBJECTS, dtype=np.float32) + W_interact
+        all_residuals = W_eff @ all_residuals            # (N_OBJECTS, 3)
+
+    # ── Complex LMS update ───────────────────────────────────────────
+    for obj in range(N_OBJECTS):
+        residual = all_residuals[obj]                    # (3,)
+        basis_cos = all_basis_cos[obj]                   # (K,)
+        basis_sin = all_basis_sin[obj]
+
+        # delta_a = lr × residual × cos_basis  (∂Re[f]/∂a = cos)
+        coeff[obj, :, :, 0] += np.outer(lr[obj] * basis_cos, residual)
+        # delta_b = -lr × residual × sin_basis (∂Re[f]/∂b = -sin)
+        coeff[obj, :, :, 1] -= np.outer(lr[obj] * basis_sin, residual)
 
     # Reset ball on contact
     if contact:
