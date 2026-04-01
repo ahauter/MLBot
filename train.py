@@ -1397,8 +1397,7 @@ def train(config: dict):
                     logger.log(total_collected, **eval_metrics)
                 if eval_hook.check_convergence(eval_results):
                     print(f'[train] Convergence reached at step '
-                          f'{total_collected:,}!')
-                    break
+                          f'{total_collected:,}! Training continues.')
 
             profiler.end_round()
 
