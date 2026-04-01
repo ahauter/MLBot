@@ -26,6 +26,9 @@ pyarrow
 
 gymnasium
 
+# Low-latency gamepad input for HumanProxyBot (Linux /dev/input/ direct access)
+evdev
+
 # Experiment tracking and hyperparameter tuning
 wandb
 optuna

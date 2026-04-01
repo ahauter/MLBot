@@ -36,6 +36,7 @@ from encoder import (
     T_WINDOW,
 )
 from policy_head import StochasticPolicyHead
+from transcriber import GameTranscriber
 
 MODEL_DIR = _REPO / 'models'
 
@@ -49,6 +50,7 @@ class MyBot(Bot):
         self._obs_buffer: deque                    = None
         self._entity_type_ids: torch.Tensor        = torch.tensor(
             ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+        self.transcriber: GameTranscriber          = None
 
     def initialize(self) -> None:
         """Load encoder and policy head from models/."""
@@ -68,6 +70,9 @@ class MyBot(Bot):
 
         # Observation window — filled on first get_output() call
         self._obs_buffer = None
+
+        # Game transcription for live-play SAC training
+        self.transcriber = GameTranscriber('mlbot')
 
     def get_output(self, packet: GamePacket) -> ControllerState:
         tokens = state_to_tokens(packet, self.index)   # (1, N, TOKEN_FEATURES)
@@ -96,7 +101,13 @@ class MyBot(Bot):
         else:
             action = np.zeros(8, dtype=np.float32)
 
+        self.transcriber.record_tick(packet, self.index, action)
         return self.translate_controls(action)
+
+    def retire(self) -> None:
+        """Called by RLBot when the bot is shutting down."""
+        if self.transcriber is not None:
+            self.transcriber.save()
 
     def translate_controls(self, action: np.ndarray) -> ControllerState:
         """
