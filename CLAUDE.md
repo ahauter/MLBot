@@ -62,6 +62,11 @@ python training/train.py --algo SAC
 # Short test run
 python training/train.py --total-steps 10000 --eval-interval 5000
 
+# End-to-end test with DummyEnv (no rlgym-sim/RocketSim needed)
+python train.py --config configs/test_resume.yaml --total-steps 5000
+# Resume from checkpoint
+python train.py --config configs/test_resume.yaml --total-steps 10000 --resume
+
 # Evaluate a saved model
 python training/evaluate.py --model-dir models/baseline/seed_0
 
