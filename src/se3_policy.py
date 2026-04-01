@@ -43,6 +43,7 @@ class SE3Policy(nn.Module):
     def __init__(self, obs_dim: int = COEFF_DIM, hidden: int = _HIDDEN):
         super().__init__()
         self.net = nn.Sequential(
+            nn.LayerNorm(obs_dim),
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
@@ -95,6 +96,7 @@ class StochasticSE3Policy(nn.Module):
 
     def __init__(self, obs_dim: int = COEFF_DIM, hidden: int = _HIDDEN):
         super().__init__()
+        self.layer_norm = nn.LayerNorm(obs_dim)
         self.hidden1 = nn.Linear(obs_dim, hidden)
         self.hidden2 = nn.Linear(hidden, hidden)
         self.analog_mean = nn.Linear(hidden, _ANALOG_DIM)
@@ -103,7 +105,8 @@ class StochasticSE3Policy(nn.Module):
         self.value_head = nn.Linear(hidden, 1)
 
     def _features(self, obs: torch.Tensor) -> torch.Tensor:
-        h = F.relu(self.hidden1(obs))
+        x = self.layer_norm(obs)
+        h = F.relu(self.hidden1(x))
         return F.relu(self.hidden2(h))
 
     def forward(

@@ -321,7 +321,7 @@ class SE3PPOAlgorithm(Algorithm):
                 loss = (policy_loss
                         + self.vf_coef * value_loss
                         - self.ent_coef * entropy.mean()
-                        + self.spectral_ent_coef_intra * H_intra
+                        - self.spectral_ent_coef_intra * H_intra
                         - self.spectral_ent_coef_inter * H_inter
                         + self.dream_ratio * dream_policy_loss)
 

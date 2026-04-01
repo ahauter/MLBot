@@ -4,7 +4,7 @@ algorithm:
     dream_steps: 5
     dream_entropy_high: 2.0
     dream_entropy_low: 0.1
-    dream_ratio: 0.25
+    dream_ratio: 0.0
 
 reward:
   class: training.rewards.dense.DenseRewardFunction

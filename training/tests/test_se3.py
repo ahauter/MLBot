@@ -842,3 +842,62 @@ class TestSE3Population:
         pop.add_score(2, 3.0)
         ranking = pop.rank_agents()
         assert ranking == [1, 2, 0]
+
+
+# ── Coefficient clipping tests ──────────────────────────────────────────────
+
+class TestCoefficientClipping:
+
+    def test_torch_clipping(self):
+        """SE3Encoder output stays within [-COEFF_CLIP, COEFF_CLIP]."""
+        from se3_field import COEFF_CLIP
+        encoder = SE3Encoder()
+        # Feed large prev-coefficients to trigger clipping
+        obs = torch.randn(2, SE3_OBS_DIM)
+        obs[:, RAW_STATE_DIM:] = 50.0  # way above clip bound
+        with torch.no_grad():
+            out = encoder(obs)
+        assert out.max().item() <= COEFF_CLIP + 1e-6
+        assert out.min().item() >= -COEFF_CLIP - 1e-6
+
+    def test_numpy_clipping(self):
+        """update_coefficients_np output stays within [-COEFF_CLIP, COEFF_CLIP]."""
+        from se3_field import COEFF_CLIP
+        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32)
+        quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
+        quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
+        lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
+        # Large prev coefficients
+        prev_coeff = np.full(COEFF_DIM, 50.0, dtype=np.float32)
+        raw = np.random.randn(RAW_STATE_DIM).astype(np.float32) * 0.5
+        out = update_coefficients_np(k_sp, quats, lr, prev_coeff, raw)
+        assert out.max() <= COEFF_CLIP + 1e-6
+        assert out.min() >= -COEFF_CLIP - 1e-6
+
+    def test_clipping_preserves_gradients(self):
+        """Gradients flow through clamp for in-range values."""
+        encoder = SE3Encoder()
+        obs = torch.randn(2, SE3_OBS_DIM, requires_grad=False)
+        out = encoder(obs)
+        loss = out.sum()
+        loss.backward()
+        assert encoder.k_spatial.grad is not None
+        assert encoder.k_spatial.grad.abs().sum().item() > 0
+
+
+# ── LayerNorm tests ─────────────────────────────────────────────────────────
+
+class TestLayerNorm:
+
+    def test_se3_policy_has_layernorm(self):
+        """SE3Policy should have LayerNorm as first layer."""
+        policy = SE3Policy(obs_dim=COEFF_DIM)
+        first_layer = policy.net[0]
+        assert isinstance(first_layer, torch.nn.LayerNorm), \
+            f"Expected LayerNorm, got {type(first_layer)}"
+
+    def test_stochastic_policy_has_layernorm(self):
+        """StochasticSE3Policy should have LayerNorm."""
+        policy = StochasticSE3Policy(obs_dim=COEFF_DIM)
+        assert hasattr(policy, 'layer_norm')
+        assert isinstance(policy.layer_norm, torch.nn.LayerNorm)

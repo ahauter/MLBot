@@ -52,6 +52,7 @@ N_OBJECTS = len(OBJECTS)            # 8
 COEFF_DIM = N_OBJECTS * K * 3 * 2  # 384  (x/y/z × real/imag per component)
 RAW_STATE_DIM = 57                 # see layout table in plan
 SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 441
+COEFF_CLIP = 10.0                  # clamp coefficients to [-CLIP, CLIP]
 
 # Object indices in OBJECTS list
 _BALL = 0
@@ -190,9 +191,9 @@ class SE3Encoder(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Learned spatial frequencies — initialised small (low frequency)
+        # Learned spatial frequencies — unit-scale so cos/sin have real variance
         self.k_spatial = nn.Parameter(
-            torch.randn(N_OBJECTS, K, 3) * 0.1)
+            torch.randn(N_OBJECTS, K, 3) * 1.0)
 
         # Learned quaternion basis — normalised after each optimiser step
         _q = torch.randn(N_OBJECTS, K, 4)
@@ -337,6 +338,8 @@ class SE3Encoder(nn.Module):
 
         # Stack and flatten: (batch, N_OBJECTS, K, 3, 2) → (batch, 384)
         new_coeff = torch.stack([new_coeff_real, new_coeff_imag], dim=-1)
+        # Clamp to prevent unbounded growth over long episodes
+        new_coeff = torch.clamp(new_coeff, -COEFF_CLIP, COEFF_CLIP)
         return new_coeff.reshape(batch, COEFF_DIM)
 
     @torch.no_grad()
@@ -442,6 +445,9 @@ def update_coefficients_np(
     # Reset ball on contact
     if contact:
         coeff[_BALL] = 0.0
+
+    # Clamp to prevent unbounded growth
+    np.clip(coeff, -COEFF_CLIP, COEFF_CLIP, out=coeff)
 
     return coeff.ravel()
 
