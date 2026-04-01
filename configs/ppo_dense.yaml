@@ -11,16 +11,16 @@ opponent_pool:
   class: training.opponents.population.Population
   params:
     agents: 4
-    generation_steps: 1e5
+    generation_steps: 1e6
 
 seed: 0
-total_steps: 5e7
+total_steps: 5e8
 num_envs: 8
-envs_per_worker: 16
-eval_interval: 1e5
+envs_per_worker: 32
+eval_interval: 1e6
 t_window: 8
 log_interval: 100
 
 wandb:
-  project: ppo-pop-0
+  project: ppo-long-run
   enabled: true

@@ -82,9 +82,14 @@ class SE3GymEnv(gym.Env):
         self._env = None
         self._step_count = 0
 
-        # SE3 field state
+        # SE3 field state (blue / agent perspective)
         self._coefficients: np.ndarray = make_initial_coefficients()
         self._prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+
+        # SE3 field state (orange / opponent perspective)
+        self._orange_coefficients: np.ndarray = make_initial_coefficients()
+        self._orange_prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._last_orange_obs: np.ndarray = np.zeros(SE3_OBS_DIM, dtype=np.float32)
 
         # Encoder params (numpy, synced from algorithm)
         self._k_spatial: np.ndarray = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 0.1
@@ -112,15 +117,23 @@ class SE3GymEnv(gym.Env):
             self._build_env()
 
         obs_list = self._env.reset()
-        blue_obs, _orange_obs = self._parse_obs(obs_list)
+        blue_obs, orange_obs = self._parse_obs(obs_list)
 
         # Reset field state
         self._coefficients = make_initial_coefficients()
         self._prev_ball_vel = np.zeros(3, dtype=np.float32)
 
+        # Reset orange field state
+        self._orange_coefficients = make_initial_coefficients()
+        self._orange_prev_ball_vel = np.zeros(3, dtype=np.float32)
+
         # Build raw state from rlgym obs
-        raw_state = self._token_obs_to_raw_state(blue_obs)
+        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
         obs = pack_observation(raw_state, self._coefficients)
+
+        # Cache orange obs
+        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         return obs, {}
 
@@ -132,11 +145,11 @@ class SE3GymEnv(gym.Env):
 
         obs_list, rewards, terminated, _info = self._env.step(
             np.stack([action, opp_action], axis=0))
-        blue_obs, _orange_obs = self._parse_obs(obs_list)
+        blue_obs, orange_obs = self._parse_obs(obs_list)
         self._step_count += 1
 
         # Build raw state from rlgym tokens
-        raw_state = self._token_obs_to_raw_state(blue_obs)
+        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
 
         # Update coefficients (numpy, no grad)
         self._coefficients = update_coefficients_np(
@@ -147,6 +160,14 @@ class SE3GymEnv(gym.Env):
         self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
 
         obs = pack_observation(raw_state, self._coefficients)
+
+        # Update orange perspective
+        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        self._orange_coefficients = update_coefficients_np(
+            self._k_spatial, self._quaternions, self._lr,
+            self._orange_coefficients, orange_raw)
+        self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         blue_reward = float(rewards[0])
         timed_out = self._step_count >= self.max_steps
@@ -162,6 +183,50 @@ class SE3GymEnv(gym.Env):
         if self._env is not None:
             self._env.close()
             self._env = None
+
+    def get_opponent_obs(self) -> np.ndarray:
+        """Return current SE3 observation from the orange player's perspective."""
+        return self._last_orange_obs.copy()
+
+    def step_with_opponent_action(
+        self, action: np.ndarray, opp_action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        """Step with an externally-computed opponent action.
+
+        Same as step() but uses the provided opp_action instead of random
+        (for batched GPU inference in the training loop).
+        """
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        opp_action = np.clip(opp_action, -1.0, 1.0).astype(np.float32)
+
+        obs_list, rewards, terminated, _info = self._env.step(
+            np.stack([action, opp_action], axis=0))
+        blue_obs, orange_obs = self._parse_obs(obs_list)
+        self._step_count += 1
+
+        raw_state = self._token_obs_to_raw_state(blue_obs, self._prev_ball_vel)
+        self._coefficients = update_coefficients_np(
+            self._k_spatial, self._quaternions, self._lr,
+            self._coefficients, raw_state)
+        self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        obs = pack_observation(raw_state, self._coefficients)
+
+        orange_raw = self._token_obs_to_raw_state(orange_obs, self._orange_prev_ball_vel)
+        self._orange_coefficients = update_coefficients_np(
+            self._k_spatial, self._quaternions, self._lr,
+            self._orange_coefficients, orange_raw)
+        self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
+
+        blue_reward = float(rewards[0])
+        timed_out = self._step_count >= self.max_steps
+        done = bool(terminated or timed_out)
+
+        ball_y = _info['state'].ball.position[1]
+        goal = (1 if ball_y > _GOAL_Y else -1) if terminated else 0
+        info = {'goal': goal}
+
+        return obs, blue_reward, done, False, info
 
     # ── internal ────────────────────────────────────────────────────────────
 
@@ -235,7 +300,7 @@ class SE3GymEnv(gym.Env):
             return obs_result[0], obs_result[1]
         raise ValueError(f'Unexpected obs format: {type(obs_result)}')
 
-    def _token_obs_to_raw_state(self, flat_obs: np.ndarray) -> np.ndarray:
+    def _token_obs_to_raw_state(self, flat_obs: np.ndarray, prev_ball_vel: np.ndarray) -> np.ndarray:
         """Convert TokenObsBuilder output (100,) to SE3 raw state (57,).
 
         TokenObsBuilder format (10 tokens × 10 features):
@@ -287,6 +352,6 @@ class SE3GymEnv(gym.Env):
         raw[_GS_OFF:_GS_OFF + 3] = tokens[9, :3]
 
         # Previous ball velocity (for contact detection)
-        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = self._prev_ball_vel
+        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = prev_ball_vel
 
         return raw

@@ -121,7 +121,7 @@ class SimEvaluationHook(EvaluationHook):
         dict
             Results with 'tiers', 'eval_wall_time', 'convergence_reached', etc.
         """
-        from encoder import N_TOKENS, TOKEN_FEATURES, ENTITY_TYPE_IDS_1V1
+        from se3_field import SE3Encoder
 
         t0 = time.monotonic()
 
@@ -129,8 +129,13 @@ class SimEvaluationHook(EvaluationHook):
         policy = algorithm.policy
         encoder.eval()
         policy.eval()
-        entity_ids = torch.tensor(
-            ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
+        _is_se3 = isinstance(encoder, SE3Encoder)
+        if _is_se3:
+            entity_ids = None
+        else:
+            from encoder import ENTITY_TYPE_IDS_1V1
+            entity_ids = torch.tensor(
+                ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
 
         # Clear opponent snapshots — eval uses random opponents only
         envs.set_opponent_snapshot(None)
@@ -146,7 +151,7 @@ class SimEvaluationHook(EvaluationHook):
 
         # Check convergence
         target_tier = self.cfg.skill_target_tier
-        target_wr = tier_results.get(target_tier, {}).get('win_rate', 0.0)
+        target_wr = tier_results.get(target_tier, {}).get('mean_score', 0.0)
         converged = target_wr >= self.cfg.skill_target_win_rate
 
         self._last_eval_step = step
@@ -162,7 +167,7 @@ class SimEvaluationHook(EvaluationHook):
         print(f'[eval] step={step} done in {wall_time:.1f}s '
               f'(converged={converged})')
         for tier, data in tier_results.items():
-            print(f'[eval]   {tier}: win_rate={data["win_rate"]:.2%}')
+            print(f'[eval]   {tier}: avg_goals={data["mean_score"]:+.3f}')
 
         return results
 
@@ -181,12 +186,13 @@ class SimEvaluationHook(EvaluationHook):
         Runs episodes_per_tier episodes across all env workers in parallel.
         Agent inference is batched on GPU; opponents are random (no snapshot).
         """
-        from encoder import N_TOKENS, TOKEN_FEATURES
+        from se3_field import SE3Encoder
 
         num_envs = envs.num_envs
         episodes_needed = self.cfg.episodes_per_tier
         t_window = self.cfg.t_window
         timeout = self.cfg.episode_timeout_steps
+        _is_se3 = isinstance(encoder, SE3Encoder)
 
         scores = []
         env_steps = np.zeros(num_envs, dtype=np.int64)
@@ -198,8 +204,12 @@ class SimEvaluationHook(EvaluationHook):
             # Batched GPU inference — deterministic policy
             with torch.no_grad():
                 x = torch.tensor(obs, dtype=torch.float32, device=device)
-                tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
-                emb = encoder(tokens, entity_ids)
+                if _is_se3:
+                    emb = encoder(x)
+                else:
+                    from encoder import N_TOKENS, TOKEN_FEATURES
+                    tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
+                    emb = encoder(tokens, entity_ids)
                 actions, _ = policy.act_deterministic(emb)
             actions_np = actions.cpu().numpy().astype(np.float32)
 
@@ -230,7 +240,6 @@ class SimEvaluationHook(EvaluationHook):
         timeouts = sum(1 for s in scores if s == 0)
 
         return {
-            'win_rate': wins / n if n else 0.0,
             'loss_rate': losses / n if n else 0.0,
             'timeout_rate': timeouts / n if n else 0.0,
             'mean_score': sum(scores) / n if n else 0.0,
@@ -286,7 +295,7 @@ class SimEvaluationHook(EvaluationHook):
         """Check whether the skill target was met."""
         tier = self.cfg.skill_target_tier
         tier_data = eval_results.get('tiers', {}).get(tier, {})
-        return tier_data.get('win_rate', 0.0) >= self.cfg.skill_target_win_rate
+        return tier_data.get('mean_score', 0.0) >= self.cfg.skill_target_win_rate
 
     def run_interactive(self, algorithm: Algorithm, step: int = 0) -> None:
         """Launch a spectator session: watch the agent play episodes.

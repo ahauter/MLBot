@@ -1,23 +1,30 @@
 algorithm:
   class: training.algorithms.se3_ppo.SE3PPOAlgorithm
+  params:
+    dream_steps: 5
+    dream_entropy_high: 2.0
+    dream_entropy_low: 0.1
+    dream_ratio: 0.25
+
+reward:
+  class: training.rewards.dense.DenseRewardFunction
 
 opponent_pool:
   class: training.opponents.se3_population.SE3Population
   params:
     agents: 4
-    generation_steps: 1000000
+    generation_steps: 1e6
     generation_noise_scale: 0.01
 
 env_class: training.environments.se3_env.SE3GymEnv
 
 seed: 0
-total_steps: 50000000
+total_steps: 5e8
 num_envs: 8
-envs_per_worker: 1
-eval_interval: 200000
+envs_per_worker: 32
+eval_interval: 1e6
 t_window: 1
-reward_type: sparse
 
 wandb:
-  project: se3-spectral
+  project: se3-spectral-dream
   enabled: true

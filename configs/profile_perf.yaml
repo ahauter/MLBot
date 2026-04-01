@@ -9,11 +9,12 @@ opponent_pool:
   params:
     agents: 4
     generation_steps: 10000
+    snapshot_interval: 1e6
     generation_noise_scale: 0.01
 
 seed: 0
 total_steps: 100000
-envs_per_worker: 16
+envs_per_worker: 32
 num_envs: 8
 t_window: 8
 log_interval: 5

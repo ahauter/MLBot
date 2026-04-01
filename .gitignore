@@ -5,6 +5,7 @@ __pycache__/
 
 # Collision meshes from the game
 collision_meshes/
+checkpoints/
 models/
 replay_data/
 wandb/

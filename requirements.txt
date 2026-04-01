@@ -1,7 +1,5 @@
-# Include everything the framework requires
-# You will automatically get updates for all versions starting with "1.".
-rlbot==1.*
-rlbottraining
+# RLBot v5 framework
+rlbot>=2.0.0.beta
 
 # Scenario builder & visualiser
 pyyaml

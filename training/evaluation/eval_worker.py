@@ -119,7 +119,6 @@ def _eval_tier(
     n = len(scores)
 
     return {
-        'win_rate': wins / n if n else 0.0,
         'loss_rate': losses / n if n else 0.0,
         'timeout_rate': timeouts / n if n else 0.0,
         'mean_score': sum(scores) / n if n else 0.0,
@@ -200,14 +199,13 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
             t_window=cfg.t_window,
             env_class=cfg.env_class,
         )
-        wr = tier_results[tier]['win_rate']
-        print(f'[eval_worker]   {tier}: win_rate={wr:.2%}')
+        print(f'[eval_worker]   {tier}: avg_goals={tier_results[tier]["mean_score"]:+.3f}')
 
     wall_time = time.monotonic() - t0
 
     # Check convergence
     target_tier = cfg.skill_target_tier
-    target_wr = tier_results.get(target_tier, {}).get('win_rate', 0.0)
+    target_wr = tier_results.get(target_tier, {}).get('mean_score', 0.0)
     converged = target_wr >= cfg.skill_target_win_rate
 
     # Build results
@@ -233,7 +231,7 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
         conv_data = {
             'step': step,
             'tier': target_tier,
-            'win_rate': target_wr,
+            'mean_score': target_wr,
             'timestamp': datetime.now(timezone.utc).isoformat(),
         }
         conv_tmp = str(conv_path) + '.tmp'
@@ -241,6 +239,6 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
             json.dump(conv_data, f, indent=2)
         os.replace(conv_tmp, str(conv_path))
         print(f'[eval_worker] CONVERGENCE at step {step}: '
-              f'{target_tier} win_rate={target_wr:.2%}')
+              f'{target_tier} avg_goals={target_wr:+.3f}')
 
     print(f'[eval_worker] step={step} done in {wall_time:.1f}s')

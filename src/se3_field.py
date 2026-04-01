@@ -49,9 +49,9 @@ OBJECTS: List[str] = [
 
 K = 8                              # spectral components per field
 N_OBJECTS = len(OBJECTS)            # 8
-COEFF_DIM = N_OBJECTS * K * 2      # 128  (real + imag per component)
+COEFF_DIM = N_OBJECTS * K * 3 * 2  # 384  (x/y/z × real/imag per component)
 RAW_STATE_DIM = 57                 # see layout table in plan
-SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 185
+SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 441
 
 # Object indices in OBJECTS list
 _BALL = 0
@@ -217,8 +217,8 @@ class SE3Encoder(nn.Module):
 
         # Split raw state and previous coefficients
         raw = packed_obs[:, :RAW_STATE_DIM]               # (batch, 57)
-        prev_coeff = packed_obs[:, RAW_STATE_DIM:]         # (batch, 128)
-        prev_coeff = prev_coeff.reshape(batch, N_OBJECTS, K, 2)
+        prev_coeff = packed_obs[:, RAW_STATE_DIM:]         # (batch, 384)
+        prev_coeff = prev_coeff.reshape(batch, N_OBJECTS, K, 3, 2)
 
         # Effective learning rates (positive via exp)
         lr = torch.exp(self.log_lr).unsqueeze(0)           # (1, N_OBJECTS)
@@ -231,11 +231,8 @@ class SE3Encoder(nn.Module):
         ball_pos = raw[:, _BALL_OFF:_BALL_OFF + 3]         # (batch, 3)
         ball_vel = raw[:, _BALL_OFF + 3:_BALL_OFF + 6]     # (batch, 3)
         ego_pos = raw[:, _EGO_OFF:_EGO_OFF + 3]
-        ego_vel = raw[:, _EGO_OFF + 3:_EGO_OFF + 6]
         ego_quat = raw[:, _EGO_OFF + 6:_EGO_OFF + 10]     # (batch, 4)
-        ego_boost = raw[:, _EGO_OFF + 10:_EGO_OFF + 11]    # (batch, 1)
         opp_pos = raw[:, _OPP_OFF:_OPP_OFF + 3]
-        opp_vel = raw[:, _OPP_OFF + 3:_OPP_OFF + 6]
         opp_quat = raw[:, _OPP_OFF + 6:_OPP_OFF + 10]
         prev_ball_vel = raw[:, _PREV_VEL_OFF:_PREV_VEL_OFF + 3]
 
@@ -286,47 +283,46 @@ class SE3Encoder(nn.Module):
         contact = detect_contact(prev_ball_vel, ball_vel)   # (batch,)
 
         # ── spectral field update (batched, differentiable) ──────────────
-        # Spatial component: cos(k_spatial @ pos)
+        # Spatial components: cos (real) and sin (imaginary)
         # k_spatial: (N_OBJECTS, K, 3), positions: (batch, N_OBJECTS, 3)
-        # -> spatial: (batch, N_OBJECTS, K)
-        spatial = torch.cos(
-            torch.einsum('okd,bod->bok', self.k_spatial, positions))
+        # -> phase, spatial_cos, spatial_sin: (batch, N_OBJECTS, K)
+        phase = torch.einsum('okd,bod->bok', self.k_spatial, positions)
+        spatial_cos = torch.cos(phase)
+        spatial_sin = torch.sin(phase)
 
         # Orientation component: quaternion inner product
         # q_basis: (N_OBJECTS, K, 4), orientations: (batch, N_OBJECTS, 4)
         # -> orient: (batch, N_OBJECTS, K)
         orient = torch.einsum('okd,bod->bok', q_basis, orientations)
 
-        # Field evaluation at observed state: spatial * orient * coeff_real
-        predicted = (spatial * orient * prev_coeff[:, :, :, 0]).sum(dim=-1)
-        # predicted: (batch, N_OBJECTS)
+        # Target: full 3D position vector (batch, N_OBJECTS, 3)
+        target = positions
 
-        # Target: position norm (simple scalar target)
-        target = positions.norm(dim=-1)  # (batch, N_OBJECTS)
+        # Field evaluation: sum over K components → (batch, N_OBJECTS, 3)
+        # basis: (batch, N_OBJECTS, K) unsqueeze(-1) → (batch, N_OBJECTS, K, 1)
+        # prev_coeff[..., 0]: (batch, N_OBJECTS, K, 3)
+        basis_cos = (spatial_cos * orient).unsqueeze(-1)   # (batch, N_OBJECTS, K, 1)
+        basis_sin = (spatial_sin * orient).unsqueeze(-1)
+        predicted_real = (basis_cos * prev_coeff[:, :, :, :, 0]).sum(dim=2)  # (batch, N_OBJECTS, 3)
+        predicted_imag = (basis_sin * prev_coeff[:, :, :, :, 1]).sum(dim=2)
+        residual_real = target - predicted_real            # (batch, N_OBJECTS, 3)
+        residual_imag = target - predicted_imag
 
-        # Residual
-        residual = target - predicted    # (batch, N_OBJECTS)
+        # Delta: outer product of basis (K) × residual (3) → (batch, N_OBJECTS, K, 3)
+        # lr: (1, N_OBJECTS) → (1, N_OBJECTS, 1, 1) after two unsqueezes
+        scaled_res_real = (lr.unsqueeze(-1) * residual_real).unsqueeze(2)  # (batch, N_OBJECTS, 1, 3)
+        scaled_res_imag = (lr.unsqueeze(-1) * residual_imag).unsqueeze(2)
+        delta_real = scaled_res_real * (spatial_cos * orient).unsqueeze(-1)  # (batch, N_OBJECTS, K, 3)
+        delta_imag = scaled_res_imag * (spatial_sin * orient).unsqueeze(-1)
 
-        # Coefficient update (real part only, imag preserved)
-        # delta_real = lr * residual * spatial * orient
-        delta_real = (lr * residual).unsqueeze(-1) * spatial * orient
-        # delta_real: (batch, N_OBJECTS, K)
-
-        new_coeff_real = prev_coeff[:, :, :, 0] + delta_real
-        new_coeff_imag = prev_coeff[:, :, :, 1]  # unchanged
+        new_coeff_real = prev_coeff[:, :, :, :, 0] + delta_real   # (batch, N_OBJECTS, K, 3)
+        new_coeff_imag = prev_coeff[:, :, :, :, 1] + delta_imag
 
         # Reset ball coefficients on contact (mask multiply, no in-place)
-        # contact_keep: 0.0 if contact, 1.0 if no contact, shape (batch, 1)
-        contact_keep = (1.0 - contact.float()).unsqueeze(-1)  # (batch, 1)
+        # contact_keep: 0.0 if contact, 1.0 if no contact → (batch, 1)
+        contact_keep = (1.0 - contact.float()).unsqueeze(-1)
 
-        # Build per-object keep mask: (batch, N_OBJECTS, 1) — all 1 except ball
-        keep_mask = torch.ones(batch, N_OBJECTS, 1, device=device)
-        # Use functional masking: multiply ball slice by contact_keep
-        ball_keep = contact_keep.unsqueeze(1)  # (batch, 1, 1)
-        obj_mask = torch.ones(N_OBJECTS, device=device)
-        # Ball uses contact_keep, others use 1.0
-        # Construct: (batch, N_OBJECTS, 1) where obj _BALL = contact_keep
-        obj_keep = torch.ones(batch, N_OBJECTS, 1, device=device)
+        # obj_keep: (batch, N_OBJECTS, 1) — ball uses contact_keep, others 1
         obj_keep_list = [
             contact_keep.unsqueeze(1) if i == _BALL
             else torch.ones(batch, 1, 1, device=device)
@@ -334,10 +330,12 @@ class SE3Encoder(nn.Module):
         ]
         obj_keep = torch.cat(obj_keep_list, dim=1)  # (batch, N_OBJECTS, 1)
 
+        # obj_keep: (batch, N_OBJECTS, 1) → broadcast over K and 3 axes
+        obj_keep = obj_keep.unsqueeze(-1)                  # (batch, N_OBJECTS, 1, 1)
         new_coeff_real = new_coeff_real * obj_keep
         new_coeff_imag = new_coeff_imag * obj_keep
 
-        # Stack and flatten
+        # Stack and flatten: (batch, N_OBJECTS, K, 3, 2) → (batch, 384)
         new_coeff = torch.stack([new_coeff_real, new_coeff_imag], dim=-1)
         return new_coeff.reshape(batch, COEFF_DIM)
 
@@ -379,7 +377,7 @@ def update_coefficients_np(
     Mirrors SE3Encoder.forward logic but in numpy for subprocess envs.
     Returns updated coefficients (128,).
     """
-    coeff = prev_coeff.reshape(N_OBJECTS, K, 2).copy()
+    coeff = prev_coeff.reshape(N_OBJECTS, K, 3, 2).copy()
 
     # Parse raw state
     ball_pos = raw_state[_BALL_OFF:_BALL_OFF + 3]
@@ -421,19 +419,25 @@ def update_coefficients_np(
         pos = positions[obj]
         ori = orientations[obj]
 
-        # Spatial: cos(k @ pos)  shape (K,)
-        spatial = np.cos(k_spatial[obj] @ pos)
+        # Spatial: cos (real) and sin (imaginary) bases
+        phase = k_spatial[obj] @ pos          # (K,)
+        spatial_cos = np.cos(phase)
+        spatial_sin = np.sin(phase)
 
         # Orientation: dot product  shape (K,)
         orient = (quaternions[obj] * ori).sum(axis=-1)
 
-        # Predicted and residual
-        predicted = (spatial * orient * coeff[obj, :, 0]).sum()
-        target = np.linalg.norm(pos)
-        residual = target - predicted
+        target = pos                                     # (3,) — x, y, z
 
-        # Update real coefficients
-        coeff[obj, :, 0] += lr[obj] * residual * spatial * orient
+        # Real update: (K,) @ (K, 3) → (3,); outer (K,) × (3,) → (K, 3)
+        predicted_real = (spatial_cos * orient) @ coeff[obj, :, :, 0]
+        residual_real = target - predicted_real
+        coeff[obj, :, :, 0] += np.outer(lr[obj] * spatial_cos * orient, residual_real)
+
+        # Imaginary update
+        predicted_imag = (spatial_sin * orient) @ coeff[obj, :, :, 1]
+        residual_imag = target - predicted_imag
+        coeff[obj, :, :, 1] += np.outer(lr[obj] * spatial_sin * orient, residual_imag)
 
     # Reset ball on contact
     if contact:

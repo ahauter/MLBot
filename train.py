@@ -968,11 +968,15 @@ def _opponent_inference(opp_obs: np.ndarray, encoder, policy,
     -------
     (num_envs, 8) numpy array of opponent actions
     """
-    from encoder import ENTITY_TYPE_IDS_1V1
+    from se3_field import SE3Encoder
     x = torch.tensor(opp_obs, dtype=torch.float32, device=device)
-    tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
-    eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
-    emb = encoder(tokens, eids)
+    if isinstance(encoder, SE3Encoder):
+        emb = encoder(x)
+    else:
+        from encoder import ENTITY_TYPE_IDS_1V1
+        tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
+        eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
+        emb = encoder(tokens, eids)
     action, _ = policy.act_deterministic(emb)
     return action.cpu().numpy()
 
@@ -1117,10 +1121,11 @@ def collect_and_train(
         obs = next_obs
         total_steps += num_envs
 
-        # Trigger updates for full buffers
+        # Trigger updates for full buffers — gate on _buffer_ready to prevent
+        # queuing multiple updates for the same agent while pos stays at capacity
         for agent_idx in agent_workers:
             agent = agents[agent_idx]
-            if agent.should_update():
+            if agent._buffer_ready.is_set() and agent.should_update():
                 agent._buffer_ready.clear()
                 updater.trigger(agent, agent_idx)
 
@@ -1286,12 +1291,22 @@ def train(config: dict):
     all_update_times: List[tuple] = []  # (agent_id, wall_time) for report
 
     # ── opponent model (centralized GPU inference) ───────────────────────
-    from encoder import SharedTransformerEncoder, D_MODEL
-    from policy_head import StochasticPolicyHead
     from training.opponents.pool import load_opponent_from_snapshot
 
-    opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL).to(device)
-    opponent_policy = StochasticPolicyHead(d_model=D_MODEL).to(device)
+    _algo_cls = config.get('algorithm', {}).get('cls')
+    _is_se3 = _algo_cls is not None and 'SE3' in _algo_cls.__name__
+
+    if _is_se3:
+        from se3_field import SE3Encoder
+        from se3_policy import StochasticSE3Policy
+        opponent_encoder = SE3Encoder().to(device)
+        opponent_policy = StochasticSE3Policy().to(device)
+    else:
+        from encoder import SharedTransformerEncoder, D_MODEL
+        from policy_head import StochasticPolicyHead
+        opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL).to(device)
+        opponent_policy = StochasticPolicyHead(d_model=D_MODEL).to(device)
+
     opponent_encoder.eval()
     opponent_policy.eval()
     opponent_loaded = False
@@ -1464,10 +1479,6 @@ def train(config: dict):
                 eval_metrics = eval_hook.format_metrics(eval_results)
                 if eval_metrics:
                     logger.log(total_collected, **eval_metrics)
-                if eval_hook.check_convergence(eval_results):
-                    print(f'[train] Convergence reached at step '
-                          f'{total_collected:,}!')
-                    break
 
             profiler.end_round()
 

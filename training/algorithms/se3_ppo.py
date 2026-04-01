@@ -26,7 +26,8 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
-from se3_field import SE3Encoder, SE3_OBS_DIM, COEFF_DIM
+from se3_field import (SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM,
+                       N_OBJECTS, K, DT, _BALL_OFF, _EGO_OFF, _OPP_OFF)
 from se3_policy import StochasticSE3Policy
 from training.abstractions import Algorithm, ActionResult
 from training.algorithms.ppo import RolloutBuffer
@@ -52,6 +53,12 @@ class SE3PPOAlgorithm(Algorithm):
         self.rollout_steps = params['rollout_steps']
         self.ppo_epochs = params['ppo_epochs']
         self.minibatch_size = params['minibatch_size']
+        self.spectral_ent_coef_intra = params['spectral_ent_coef_intra']
+        self.spectral_ent_coef_inter = params['spectral_ent_coef_inter']
+        self.dream_steps = params['dream_steps']
+        self.dream_entropy_high = params['dream_entropy_high']
+        self.dream_entropy_low = params['dream_entropy_low']
+        self.dream_ratio = params['dream_ratio']
 
         self.num_envs = config.get('num_envs', 1)
 
@@ -102,6 +109,12 @@ class SE3PPOAlgorithm(Algorithm):
             'rollout_steps': 2048,
             'ppo_epochs': 4,
             'minibatch_size': 2048,
+            'spectral_ent_coef_intra': 0.001,
+            'spectral_ent_coef_inter': 0.001,
+            'dream_steps': 5,
+            'dream_entropy_high': 2.0,
+            'dream_entropy_low': 0.1,
+            'dream_ratio': 0.25,
         }
 
     @classmethod
@@ -115,6 +128,10 @@ class SE3PPOAlgorithm(Algorithm):
             'algorithm.params.ppo_epochs': {'type': 'int', 'low': 2, 'high': 10},
             'algorithm.params.minibatch_size': {
                 'type': 'categorical', 'choices': [256, 512, 1024, 2048]},
+            'algorithm.params.spectral_ent_coef_intra': {
+                'type': 'float', 'low': 1e-4, 'high': 1e-2, 'log': True},
+            'algorithm.params.spectral_ent_coef_inter': {
+                'type': 'float', 'low': 1e-4, 'high': 1e-2, 'log': True},
         }
 
     def _encode(self, obs: np.ndarray) -> torch.Tensor:
@@ -160,6 +177,57 @@ class SE3PPOAlgorithm(Algorithm):
             value=val,
         )
 
+    @torch.no_grad()
+    def _dream_rollout(self, seed_obs: np.ndarray) -> np.ndarray:
+        """Free-run encoder from a seed observation using velocity extrapolation.
+
+        Euler-steps positions (ball, ego, opp) using velocities from the raw
+        state, then runs the encoder's LMS update on the extrapolated obs.
+        Terminates when H_intra exits [dream_entropy_low, dream_entropy_high].
+
+        Returns (n, SE3_OBS_DIM) array of imagined observations, n ∈ [0, dream_steps].
+        """
+        raw = seed_obs[:RAW_STATE_DIM].copy()
+        coeff = seed_obs[RAW_STATE_DIM:].copy()
+
+        # (pos_start, pos_end, vel_start, vel_end) for ball, ego, opp
+        _moveable = [
+            (_BALL_OFF,     _BALL_OFF + 3, _BALL_OFF + 3, _BALL_OFF + 6),
+            (_EGO_OFF,      _EGO_OFF + 3,  _EGO_OFF + 3,  _EGO_OFF + 6),
+            (_OPP_OFF,      _OPP_OFF + 3,  _OPP_OFF + 3,  _OPP_OFF + 6),
+        ]
+
+        dream_obs = []
+        for _ in range(self.dream_steps):
+            # Euler step: pos_next = pos + vel * dt
+            raw_next = raw.copy()
+            for ps, pe, vs, ve in _moveable:
+                raw_next[ps:pe] = raw[ps:pe] + raw[vs:ve] * DT
+
+            obs_next = np.concatenate([raw_next, coeff]).astype(np.float32)
+
+            # LMS update on extrapolated observation
+            obs_t = torch.tensor(obs_next[None], dtype=torch.float32, device=self.device)
+            coeff_t = self.encoder(obs_t)   # (1, COEFF_DIM)
+
+            # Spectral entropy check
+            emb = coeff_t.reshape(1, N_OBJECTS, K, 3, 2)
+            energy = emb.pow(2).sum(dim=-1)              # (1, N_OBJECTS, K, 3)
+            energy_k = energy.sum(dim=-1)                # (1, N_OBJECTS, K)
+            p = energy_k / (energy_k.sum(dim=-1, keepdim=True) + 1e-8)
+            H_intra = -(p * (p + 1e-8).log()).sum(dim=-1).mean().item()
+
+            if H_intra > self.dream_entropy_high or H_intra < self.dream_entropy_low:
+                break
+
+            coeff = coeff_t.cpu().numpy().ravel()
+            dream_obs.append(obs_next)
+            raw = raw_next
+
+        if not dream_obs:
+            return np.empty((0, SE3_OBS_DIM), dtype=np.float32)
+        return np.stack(dream_obs, axis=0)
+
     def should_update(self) -> bool:
         return self.buffer.pos >= self.buffer.capacity
 
@@ -176,11 +244,19 @@ class SE3PPOAlgorithm(Algorithm):
 
         self.buffer.compute_gae(last_values)
 
+        # Generate dream observations from the last real observation
+        dream_obs_np = self._dream_rollout(last_obs[0])
+        self.encoder.train()   # _dream_rollout leaves encoder in eval; restore
+        _has_dream = dream_obs_np.shape[0] > 0 and self.dream_ratio > 0.0
+        dream_steps_total = dream_obs_np.shape[0]
+
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
         total_clip_fraction = 0.0
         total_approx_kl = 0.0
+        total_H_intra = 0.0
+        total_H_inter = 0.0
         n_updates = 0
 
         for _ in range(self.ppo_epochs):
@@ -211,9 +287,43 @@ class SE3PPOAlgorithm(Algorithm):
 
                 value_loss = nn.functional.mse_loss(new_values, returns_t)
 
+                # Spectral entropy regularization
+                # energy: (mb, N_OBJECTS, K, 3) — magnitude² per component per axis
+                coeff = emb.reshape(emb.shape[0], N_OBJECTS, K, 3, 2)
+                energy = coeff.pow(2).sum(dim=-1)              # (mb, N_OBJECTS, K, 3)
+
+                # Intra-object: sum over axes → entropy over K components
+                energy_k = energy.sum(dim=-1)                  # (mb, N_OBJECTS, K)
+                p_intra = energy_k / (energy_k.sum(dim=-1, keepdim=True) + 1e-8)
+                H_intra = -(p_intra * (p_intra + 1e-8).log()).sum(dim=-1).mean()
+
+                # Inter-object: sum over K and axes → entropy over N_OBJECTS
+                E_per_obj = energy.sum(dim=(2, 3))             # (mb, N_OBJECTS)
+                p_inter = E_per_obj / (E_per_obj.sum(dim=-1, keepdim=True) + 1e-8)
+                H_inter = -(p_inter * (p_inter + 1e-8).log()).sum(dim=-1).mean()
+
+                # Dream policy loss: policy on imagined states, value as advantage
+                dream_policy_loss = torch.tensor(0.0, device=self.device)
+                if _has_dream:
+                    n_dream = max(1, int(self.minibatch_size * self.dream_ratio))
+                    n_avail = dream_obs_np.shape[0]
+                    idx = np.random.choice(n_avail, min(n_dream, n_avail), replace=False)
+                    dream_t = torch.tensor(
+                        dream_obs_np[idx], dtype=torch.float32, device=self.device)
+                    dream_emb = self.encoder(dream_t)
+                    _, dream_log_prob, dream_value, _ = self.policy(dream_emb)
+                    dream_adv = dream_value.detach()
+                    if dream_adv.numel() > 1:
+                        dream_adv = (dream_adv - dream_adv.mean()) / (
+                            dream_adv.std() + 1e-8)
+                    dream_policy_loss = -(dream_log_prob * dream_adv).mean()
+
                 loss = (policy_loss
                         + self.vf_coef * value_loss
-                        - self.ent_coef * entropy.mean())
+                        - self.ent_coef * entropy.mean()
+                        + self.spectral_ent_coef_intra * H_intra
+                        - self.spectral_ent_coef_inter * H_inter
+                        + self.dream_ratio * dream_policy_loss)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -235,13 +345,12 @@ class SE3PPOAlgorithm(Algorithm):
                 total_entropy += entropy.mean().item()
                 total_clip_fraction += clip_fraction
                 total_approx_kl += approx_kl
+                total_H_intra += H_intra.item()
+                total_H_inter += H_inter.item()
                 n_updates += 1
 
         self.encoder.eval()
         self.policy.eval()
-
-        self.buffer.reset()
-        self._buffer_ready.set()
 
         if n_updates == 0:
             return {}
@@ -251,6 +360,9 @@ class SE3PPOAlgorithm(Algorithm):
             'entropy': total_entropy / n_updates,
             'clip_fraction': total_clip_fraction / n_updates,
             'approx_kl': total_approx_kl / n_updates,
+            'spectral_H_intra': total_H_intra / n_updates,
+            'spectral_H_inter': total_H_inter / n_updates,
+            'dream_steps_mean': dream_steps_total,
         }
 
     def save_checkpoint(self, path: Path) -> None:
