@@ -65,20 +65,20 @@ import torch.nn as nn
 
 # ── normalisation constants ───────────────────────────────────────────────────
 
-FIELD_X      = 4096.0
-FIELD_Y      = 5120.0
-CEILING_Z    = 2044.0
-MAX_VEL      = 2300.0
-MAX_ANG_VEL  = 5.5
-MAX_BOOST    = 100.0
-MAX_SCORE    = 10.0
-MAX_TIME     = 300.0
+FIELD_X = 4096.0
+FIELD_Y = 5120.0
+CEILING_Z = 2044.0
+MAX_VEL = 2300.0
+MAX_ANG_VEL = 5.5
+MAX_BOOST = 100.0
+MAX_SCORE = 10.0
+MAX_TIME = 300.0
 
 # ── token dimensions ──────────────────────────────────────────────────────────
 
-TOKEN_FEATURES    = 10   # stored feature width (Euler angles in slots 6-8)
+TOKEN_FEATURES = 10   # stored feature width (Euler angles in slots 6-8)
 ENCODER_INPUT_DIM = 13   # after GPU-side Euler → forward+up expansion
-D_MODEL           = 64
+D_MODEL = 64
 
 # N_TOKENS=10 kept for backward compatibility with 1v1 tokenisers.
 # New code should read N from the token array shape, not this constant.
@@ -87,7 +87,7 @@ N_TOKENS = 10
 # ── temporal window ───────────────────────────────────────────────────────────
 
 T_WINDOW = 4   # default sliding window size (4 steps × ~66 ms ≈ 266 ms)
-T_MAX    = 8   # maximum window size the model supports
+T_MAX = 8   # maximum window size the model supports
 
 # ── entity type IDs ───────────────────────────────────────────────────────────
 
@@ -111,9 +111,9 @@ def _euler_features_to_forward_up(x: torch.Tensor) -> torch.Tensor:
     Runs under torch.no_grad() — no backprop through sin/cos.
     """
     # Recover radians from the normalised [-1, 1] storage.
-    yaw   = x[..., 6] * math.pi
+    yaw = x[..., 6] * math.pi
     pitch = x[..., 7] * math.pi
-    roll  = x[..., 8] * math.pi
+    roll = x[..., 8] * math.pi
 
     cy, sy = torch.cos(yaw),   torch.sin(yaw)
     cp, sp = torch.cos(pitch), torch.sin(pitch)
@@ -123,9 +123,9 @@ def _euler_features_to_forward_up(x: torch.Tensor) -> torch.Tensor:
     fwd_x = cp * cy
     fwd_y = cp * sy
     fwd_z = sp
-    up_x  = -cr * cy * sp - sr * sy
-    up_y  = -cr * sy * sp + sr * cy
-    up_z  = cp * cr
+    up_x = -cr * cy * sp - sr * sy
+    up_y = -cr * sy * sp + sr * cy
+    up_z = cp * cr
 
     # Stack the six direction components: (*, 6)
     dir_vec = torch.stack([fwd_x, fwd_y, fwd_z, up_x, up_y, up_z], dim=-1)
@@ -176,47 +176,47 @@ def state_to_tokens(
     opp_idx = car_idx ^ 1
 
     ball = packet.balls[0].physics
-    own  = packet.players[car_idx].physics
-    opp  = packet.players[opp_idx].physics
-
+    own = packet.players[car_idx].physics
+    opp = packet.players[opp_idx].physics
+    is_orange = -1 * car_idx or 1
     own_boost = float(packet.players[car_idx].boost)
 
     ball_token = np.array([
-        ball.location.x         / FIELD_X,
-        ball.location.y         / FIELD_Y,
-        ball.location.z         / CEILING_Z,
-        ball.velocity.x         / MAX_VEL,
-        ball.velocity.y         / MAX_VEL,
-        ball.velocity.z         / MAX_VEL,
-        ball.angular_velocity.x / MAX_ANG_VEL,
-        ball.angular_velocity.y / MAX_ANG_VEL,
+        is_orange * ball.location.x / FIELD_X,
+        is_orange * ball.location.y / FIELD_Y,
+        ball.location.z / CEILING_Z,
+        is_orange * ball.velocity.x / MAX_VEL,
+        is_orange * ball.velocity.y / MAX_VEL,
+        ball.velocity.z / MAX_VEL,
+        is_orange * ball.angular_velocity.x / MAX_ANG_VEL,
+        is_orange * ball.angular_velocity.y / MAX_ANG_VEL,
         ball.angular_velocity.z / MAX_ANG_VEL,
         0.0,
     ], dtype=np.float32)
 
     own_token = np.array([
-        own.location.x  / FIELD_X,
-        own.location.y  / FIELD_Y,
-        own.location.z  / CEILING_Z,
-        own.velocity.x  / MAX_VEL,
-        own.velocity.y  / MAX_VEL,
-        own.velocity.z  / MAX_VEL,
-        float(own.rotation.yaw)   / math.pi,
+        is_orange * own.location.x / FIELD_X,
+        is_orange * own.location.y / FIELD_Y,
+        own.location.z / CEILING_Z,
+        is_orange * own.velocity.x / MAX_VEL,
+        is_orange * own.velocity.y / MAX_VEL,
+        own.velocity.z / MAX_VEL,
+        is_orange * float(own.rotation.yaw) / math.pi,
         float(own.rotation.pitch) / math.pi,
-        float(own.rotation.roll)  / math.pi,
+        float(own.rotation.roll) / math.pi,
         own_boost / MAX_BOOST,
     ], dtype=np.float32)
 
     opp_token = np.array([
-        opp.location.x  / FIELD_X,
-        opp.location.y  / FIELD_Y,
-        opp.location.z  / CEILING_Z,
-        opp.velocity.x  / MAX_VEL,
-        opp.velocity.y  / MAX_VEL,
-        opp.velocity.z  / MAX_VEL,
-        float(opp.rotation.yaw)   / math.pi,
+        is_orange * opp.location.x / FIELD_X,
+        is_orange * opp.location.y / FIELD_Y,
+        opp.location.z / CEILING_Z,
+        is_orange * opp.velocity.x / MAX_VEL,
+        is_orange * opp.velocity.y / MAX_VEL,
+        opp.velocity.z / MAX_VEL,
+        is_orange * float(opp.rotation.yaw) / math.pi,
         float(opp.rotation.pitch) / math.pi,
-        float(opp.rotation.roll)  / math.pi,
+        float(opp.rotation.roll) / math.pi,
         0.0,
     ], dtype=np.float32)
 
@@ -233,15 +233,16 @@ def state_to_tokens(
     while len(pad_tokens) < _N_BIG_PADS:
         pad_tokens.append(np.zeros(TOKEN_FEATURES, dtype=np.float32))
 
-    blue_score   = float(packet.teams[0].score)
+    blue_score = float(packet.teams[0].score)
     orange_score = float(packet.teams[1].score)
-    score_diff   = (blue_score - orange_score) if car_idx == 0 else (orange_score - blue_score)
-    time_rem     = float(getattr(packet.match_info, 'seconds_remaining', 0.0))
-    overtime     = float(getattr(packet.match_info, 'is_overtime', False))
+    score_diff = is_orange * (
+        blue_score - orange_score)
+    time_rem = float(getattr(packet.match_info, 'seconds_remaining', 0.0))
+    overtime = float(getattr(packet.match_info, 'is_overtime', False))
 
     gs_token = np.array([
         np.clip(score_diff / MAX_SCORE, -1.0, 1.0),
-        np.clip(time_rem   / MAX_TIME,   0.0, 1.0),
+        np.clip(time_rem / MAX_TIME,   0.0, 1.0),
         overtime,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     ], dtype=np.float32)
@@ -278,7 +279,7 @@ class _TransformerEncoderLayer(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim: int):
         super().__init__()
-        self.attn  = nn.MultiheadAttention(
+        self.attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads, dropout=0.0, batch_first=True,
         )
         self.ffn = nn.Sequential(
@@ -296,10 +297,10 @@ class _TransformerEncoderLayer(nn.Module):
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x_norm   = self.norm1(x)
+        x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
-        x        = x + self.drop1(attn_out)
-        x        = x + self.drop2(self.ffn(self.norm2(x)))
+        x = x + self.drop1(attn_out)
+        x = x + self.drop2(self.ffn(self.norm2(x)))
         return x
 
 
@@ -322,9 +323,9 @@ class SharedTransformerEncoder(nn.Module):
                  Never use at inference.
     """
 
-    N_HEADS  = 4
+    N_HEADS = 4
     N_LAYERS = 2
-    FFN_DIM  = 128
+    FFN_DIM = 128
 
     def __init__(self, d_model: int = D_MODEL):
         super().__init__()
@@ -371,12 +372,13 @@ class SharedTransformerEncoder(nn.Module):
 
         # Apply entity permutation (AWAC data augmentation — training only)
         if entity_perm is not None:
-            tokens          = tokens[:, :, entity_perm, :]
+            tokens = tokens[:, :, entity_perm, :]
             entity_type_ids = entity_type_ids[entity_perm]
 
         x = tokens.reshape(batch, T * N, F)
         with torch.no_grad():
-            x = _euler_features_to_forward_up(x)              # (batch, T*N, 13)
+            x = _euler_features_to_forward_up(
+                x)              # (batch, T*N, 13)
         x = self.input_projection(x)                          # (batch, T*N, D)
 
         # Entity type embeddings — tiled across T timesteps
@@ -403,7 +405,8 @@ class SharedTransformerEncoder(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path: str) -> None:
-        self.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))
+        self.load_state_dict(torch.load(
+            path, map_location='cpu', weights_only=True))
 
     @classmethod
     def load_from(cls, path: str) -> 'SharedTransformerEncoder':
@@ -419,7 +422,7 @@ class SharedTransformerEncoder(nn.Module):
         old_w = state.get('input_projection.weight')
         if old_w is not None and old_w.shape[1] == TOKEN_FEATURES:
             new_w = torch.zeros(old_w.shape[0], ENCODER_INPUT_DIM)
-            new_w[:, :6]  = old_w[:, :6]   # pos + vel unchanged
+            new_w[:, :6] = old_w[:, :6]   # pos + vel unchanged
             new_w[:, 12:] = old_w[:, 9:]   # boost / trailing features
             # cols 6-11 (forward+up) start at zero
             state['input_projection.weight'] = new_w
