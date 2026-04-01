@@ -25,6 +25,7 @@ import argparse
 import importlib
 import multiprocessing
 import multiprocessing.connection
+import os
 import random
 import sys
 import threading
@@ -1126,6 +1127,60 @@ def collect_and_train(
     return total_steps
 
 
+# ── checkpoint save / load for resume ──────────────────────────────────────
+
+def save_training_state(path: Path, population, total_collected: int,
+                        collection_round: int, last_gen_step: int,
+                        generation_pending: bool) -> None:
+    """Save full training state (all agents + loop counters) atomically."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    state = {
+        'total_collected': total_collected,
+        'collection_round': collection_round,
+        'last_gen_step': last_gen_step,
+        'generation_pending': generation_pending,
+        'population_generation': population.generation,
+        'population_last_snapshot_step': population._last_snapshot_step,
+        'population_scores': population.scores,
+        'num_agents': population.num_agents,
+        'agents': [],
+    }
+    for agent in population.agents:
+        state['agents'].append({
+            'encoder': agent.encoder.state_dict(),
+            'policy': agent.policy.state_dict(),
+            'optimizer': agent.optimizer.state_dict(),
+        })
+    tmp = path / 'training_state.pt.tmp'
+    torch.save(state, tmp)
+    os.replace(tmp, path / 'training_state.pt')
+
+
+def load_training_state(path: Path, population, device: str = 'cpu') -> dict:
+    """Load training state from checkpoint, restore all agents and population."""
+    ckpt = torch.load(Path(path) / 'training_state.pt',
+                      map_location=device, weights_only=False)
+    saved_agents = ckpt['num_agents']
+    if saved_agents != population.num_agents:
+        raise ValueError(
+            f'Checkpoint has {saved_agents} agents but population has '
+            f'{population.num_agents}')
+    for i, agent_state in enumerate(ckpt['agents']):
+        population.agents[i].encoder.load_state_dict(agent_state['encoder'])
+        population.agents[i].policy.load_state_dict(agent_state['policy'])
+        population.agents[i].optimizer.load_state_dict(agent_state['optimizer'])
+    population._generation = ckpt['population_generation']
+    population._last_snapshot_step = ckpt['population_last_snapshot_step']
+    population.scores = ckpt['population_scores']
+    return {
+        'total_collected': ckpt['total_collected'],
+        'collection_round': ckpt['collection_round'],
+        'last_gen_step': ckpt['last_gen_step'],
+        'generation_pending': ckpt['generation_pending'],
+    }
+
+
 # ── main training loop ──────────────────────────────────────────────────────
 
 def train(config: dict):
@@ -1260,11 +1315,25 @@ def train(config: dict):
     last_gen_step = 0
     generation_pending = False
 
+    # ── resume from checkpoint ─────────────────────────────────────────
+    resume_path = model_dir / 'latest'
+    if config.get('resume', False) and (resume_path / 'training_state.pt').exists():
+        resumed = load_training_state(resume_path, population, device=device)
+        total_collected = resumed['total_collected']
+        collection_round = resumed['collection_round']
+        last_gen_step = resumed['last_gen_step']
+        generation_pending = resumed['generation_pending']
+        print(f'[train] Resumed from checkpoint: step {total_collected:,}, '
+              f'round {collection_round}')
+    elif config.get('resume', False):
+        print('[train] --resume specified but no checkpoint found, starting fresh.')
+
     print(f'[train] {num_agents} agent(s), {num_envs} envs, '
           f'rollout_steps={config.get("algorithm", {}).get("params", {}).get("rollout_steps", 2048)}')
 
     from tqdm import tqdm
-    pbar = tqdm(total=total_steps, unit='step', dynamic_ncols=True)
+    pbar = tqdm(total=total_steps, initial=total_collected,
+                unit='step', dynamic_ncols=True)
     try:
         while total_collected < total_steps:
             profiler.start_round()
@@ -1369,12 +1438,12 @@ def train(config: dict):
             if num_agents > 1 and total_collected - last_gen_step >= gen_steps:
                 generation_pending = True
 
-            # Checkpoint
+            # Checkpoint (full training state for resume)
             _t0 = time.perf_counter()
             if collection_round % (log_interval * 10) == 0:
-                best_idx = population.rank_agents()[0]
-                population.agents[best_idx].save_checkpoint(
-                    model_dir / 'latest')
+                save_training_state(model_dir / 'latest', population,
+                                    total_collected, collection_round,
+                                    last_gen_step, generation_pending)
             _t1 = time.perf_counter()
             profiler.add_time('checkpoint_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'checkpoint')
@@ -1407,7 +1476,12 @@ def train(config: dict):
     finally:
         pbar.close()
         updater.stop()
-        # Save final checkpoint
+        # Save resumable checkpoint (all agents + loop state)
+        save_training_state(model_dir / 'latest', population,
+                            total_collected, collection_round,
+                            last_gen_step, generation_pending)
+        print(f'[train] Saved resumable checkpoint to {model_dir}/latest')
+        # Save best-agent-only checkpoint for deployment
         best_idx = population.rank_agents()[0]
         population.agents[best_idx].save_checkpoint(model_dir / 'final')
         print(f'[train] Saved final checkpoint to {model_dir}/final')
@@ -1443,6 +1517,8 @@ def main():
     parser.add_argument('--num-envs', type=int, default=None)
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable W&B logging')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from latest checkpoint')
     args = parser.parse_args()
 
     # Load config
@@ -1480,6 +1556,9 @@ def main():
 
     if args.no_wandb:
         config.setdefault('logger', {})['params'] = {'enabled': False}
+
+    if args.resume:
+        config['resume'] = True
 
     train(config)
 
