@@ -1,0 +1,26 @@
+algorithm:
+  class: training.algorithms.ppo.PPOAlgorithm
+  params:
+    rollout_steps: 64
+    ppo_epochs: 2
+    minibatch_size: 64
+
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 1
+    snapshot_interval: 5000
+
+env_class: training.environments.dummy_env.DummyEnv
+
+seed: 42
+total_steps: 20000
+num_envs: 2
+envs_per_worker: 1
+eval_interval: 0
+log_interval: 5
+t_window: 8
+model_dir: models/test_resume
+
+wandb:
+  enabled: false
