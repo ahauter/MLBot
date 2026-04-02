@@ -433,7 +433,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # Auto-scale with exponential decay
         state['max_residual'] = max(abs(r), state['max_residual'] * 0.98)
         mr = max(state['max_residual'], 0.01)
-        rdy = np.clip(r / mr * 3.0, -4.0, 4.0)
+        rdy = np.clip(abs(r) / mr * 3.0, 0, 4.0)
         if abs(rdy) > 0.05:
             lb_residual_arrow[0] = ax_b.annotate(
                 '', xy=(rx, rdy), xytext=(rx, 0),
