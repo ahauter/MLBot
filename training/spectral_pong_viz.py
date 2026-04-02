@@ -47,7 +47,7 @@ SCORE_COLOR = 'white'
 ENV_FIELD_COLOR = '#c084fc'
 INTERACT_COLOR = '#a78bfa'
 RESIDUAL_COLOR = '#facc15'
-REWARD_COLOR = '#fb923c'       # orange for learned reward field
+REWARD_COLOR = '#fb923c'       # (unused, reward field removed)
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -261,114 +261,86 @@ class WavepacketObject2D:
 # -- Simple RL paddle controller -----------------------------------------------
 
 class SimpleRLController:
-    """Single wide hidden layer trained with REINFORCE + eligibility traces.
+    """Linear policy: action = tanh(w · state + b).
 
-    Each instance controls ONE paddle. State is the full wavepacket
-    representation + game state. Action is a single float in [-1, 1].
+    Trained with REINFORCE + eligibility traces.  Only 10 parameters
+    (9 weights + 1 bias) — the spectral encoder does the heavy lifting.
     """
 
     TRACE_CLIP = 1.0
     WEIGHT_DECAY = 0.9999
 
-    def __init__(self, state_dim: int, hidden_dim: int = 256,
-                 lr: float = 3e-5, gamma: float = 0.95, std: float = 0.5):
-        scale1 = np.sqrt(2.0 / state_dim)
-        scale2 = np.sqrt(2.0 / hidden_dim)
-        self.W1 = np.random.randn(hidden_dim, state_dim) * scale1
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(1, hidden_dim) * scale2
-        self.b2 = np.zeros(1)
-        self.lr = lr
-        self.gamma = gamma
-        self.std = std
-        self._reset_traces()
-        # Diagnostics (updated each act() call)
-        self.last_h1 = np.zeros(hidden_dim)
-        self.last_mean = 0.0
-        self.last_action = 0.0
-
-    def _reset_traces(self) -> None:
-        self.trace_W1 = np.zeros_like(self.W1)
-        self.trace_b1 = np.zeros_like(self.b1)
-        self.trace_W2 = np.zeros_like(self.W2)
-        self.trace_b2 = np.zeros_like(self.b2)
-
-    STATE_DIM = 10
+    STATE_DIM = 9
     STATE_LABELS = [
-        'nip_env', 'nip_padL', 'nip_padR', 'nip_rew',
+        'nip_env', 'nip_padL', 'nip_padR',
         'x_env_x', 'x_env_y',
         'x_padL_x', 'x_padL_y',
         'x_padR_x', 'x_padR_y',
     ]
 
+    def __init__(self, state_dim: int, lr: float = 3e-3,
+                 gamma: float = 0.95, std: float = 0.5, **_kwargs):
+        self.w = np.random.randn(state_dim) * 0.1
+        self.b = 0.0
+        self.lr = lr
+        self.gamma = gamma
+        self.std = std
+        self._reset_traces()
+        # Diagnostics
+        self.last_mean = 0.0
+        self.last_action = 0.0
+
+    def _reset_traces(self) -> None:
+        self.trace_w = np.zeros_like(self.w)
+        self.trace_b = 0.0
+
     @staticmethod
     def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
-                    wp_env, wp_reward) -> np.ndarray:
-        """10-dim spectral interaction features."""
+                    wp_env) -> np.ndarray:
+        """9-dim spectral interaction features."""
         return np.array([
             wp_ball.normalized_inner_product(wp_env),
             wp_ball.normalized_inner_product(wp_paddle_l),
             wp_ball.normalized_inner_product(wp_paddle_r),
-            wp_ball.normalized_inner_product(wp_reward),
             *wp_ball.cross_product_2d(wp_env),
             *wp_ball.cross_product_2d(wp_paddle_l),
             *wp_ball.cross_product_2d(wp_paddle_r),
         ])
 
     def act(self, state: np.ndarray) -> float:
-        """Forward pass + sample from Gaussian policy. Returns action in [-1,1]."""
-        # Forward
-        z1 = self.W1 @ state + self.b1
-        h1 = np.maximum(z1, 0)                          # ReLU
-        z2 = float((self.W2 @ h1)[0] + self.b2[0])
-        mean = np.tanh(z2)                               # bounded mean
-
-        # Sample
+        """Linear policy: tanh(w·s + b) + noise."""
+        z = float(self.w @ state + self.b)
+        mean = np.tanh(z)
         action = float(np.clip(mean + self.std * np.random.randn(), -1, 1))
 
-        # ∇ log π  (Gaussian + tanh chain rule)
+        # ∇ log π through tanh
         d_logpi = (action - mean) / (self.std ** 2)
-        d_z2 = d_logpi * (1 - mean ** 2)                 # through tanh
-        grad_W2 = d_z2 * h1[None, :]
-        grad_b2 = np.array([d_z2])
-        d_h1 = self.W2[0] * d_z2
-        d_z1 = d_h1 * (z1 > 0)                           # through ReLU
-        grad_W1 = d_z1[:, None] * state[None, :]
-        grad_b1 = d_z1
+        d_z = d_logpi * (1 - mean ** 2)
+        grad_w = d_z * state
+        grad_b = d_z
 
-        # Accumulate eligibility traces (clipped to prevent runaway)
-        self.trace_W1 = self.gamma * self.trace_W1 + grad_W1
-        self.trace_b1 = self.gamma * self.trace_b1 + grad_b1
-        self.trace_W2 = self.gamma * self.trace_W2 + grad_W2
-        self.trace_b2 = self.gamma * self.trace_b2 + grad_b2
-        np.clip(self.trace_W1, -self.TRACE_CLIP, self.TRACE_CLIP,
-                out=self.trace_W1)
-        np.clip(self.trace_b1, -self.TRACE_CLIP, self.TRACE_CLIP,
-                out=self.trace_b1)
-        np.clip(self.trace_W2, -self.TRACE_CLIP, self.TRACE_CLIP,
-                out=self.trace_W2)
-        np.clip(self.trace_b2, -self.TRACE_CLIP, self.TRACE_CLIP,
-                out=self.trace_b2)
+        # Eligibility traces (clipped)
+        self.trace_w = np.clip(
+            self.gamma * self.trace_w + grad_w,
+            -self.TRACE_CLIP, self.TRACE_CLIP)
+        self.trace_b = np.clip(
+            self.gamma * self.trace_b + grad_b,
+            -self.TRACE_CLIP, self.TRACE_CLIP)
 
-        # Weight decay — prevent tanh saturation
-        self.W1 *= self.WEIGHT_DECAY
-        self.W2 *= self.WEIGHT_DECAY
+        # Weight decay
+        self.w *= self.WEIGHT_DECAY
 
-        # Store diagnostics for debug display
-        self.last_h1 = h1.copy()
+        # Diagnostics
         self.last_mean = mean
         self.last_action = action
-
         return action
 
     def update(self, reward: float) -> None:
-        """REINFORCE update on sparse reward signal."""
+        """REINFORCE update on sparse reward."""
         if abs(reward) < 1e-10:
             return
-        self.W1 += self.lr * reward * self.trace_W1
-        self.b1 += self.lr * reward * self.trace_b1
-        self.W2 += self.lr * reward * self.trace_W2
-        self.b2 += self.lr * reward * self.trace_b2
+        self.w += self.lr * reward * self.trace_w
+        self.b += self.lr * reward * self.trace_b
         self._reset_traces()
 
 
@@ -398,8 +370,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 paddle_damping: float = 0.85,
                 beta_paddle: float = 0.3,
                 gamma_paddle: float = 0.2,
-                reward_lr: float = 0.3,
-                reward_decay: float = 0.999,
                 ball_lr: float = 0.15,
                 paddle_lr: float = 0.1,
                 lr_tracking: float = 0.01):
@@ -434,21 +404,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         c_cos=env_c_cos, c_sin=np.zeros((K, 2)),
         lr=env_lr, lr_tracking=0.0)
 
-    reward_c_cos = np.zeros((K, 2))
-    reward_c_cos[2, 0] = 1.0  # frequency 2 → both axes
-    reward_c_cos[2, 1] = 1.0
-    wp_reward = WavepacketObject2D(
-        K, frequencies, pos0=(0.0, 0.0), mass=1.0,
-        c_cos=reward_c_cos, c_sin=np.zeros((K, 2)),
-        lr=reward_lr, lr_tracking=0.0)
+    # (Reward field removed — was overwhelming spectral signals)
 
     # -- RL paddle controllers (one per paddle, opposite rewards) ------------
     rl_left = None
     rl_right = None
     if spectral_paddle:
         # State: 5 wavepackets × (K×2 cos + K×2 sin) + 6 game-state floats
-        rl_left = SimpleRLController(SimpleRLController.STATE_DIM, hidden_dim=8)
-        rl_right = SimpleRLController(SimpleRLController.STATE_DIM, hidden_dim=8)
+        rl_left = SimpleRLController(SimpleRLController.STATE_DIM)
+        rl_right = SimpleRLController(SimpleRLController.STATE_DIM)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -529,8 +493,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                           label='R paddle')
     lx_env, = ax_x.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
                         label='Env (learned)')
-    lx_reward, = ax_x.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
-                           ls='--', label='Reward (learned)')
     lx_dot, = ax_x.plot([], [], 'o', color=BALL_COLOR, markersize=8,
                         zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_x.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
@@ -554,8 +516,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                           label='R paddle')
     ly_env, = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
                         label='Env (learned)')
-    ly_reward, = ax_y.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
-                           ls='--', label='Reward (learned)')
     ly_dot, = ax_y.plot([], [], 'o', color=BALL_COLOR, markersize=8,
                         zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_y.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
@@ -616,8 +576,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     debug_mean_r = debug_act_r = debug_text_r = None
 
     if spectral_paddle:
-        hidden_dim = rl_left.W1.shape[0]
-        K_coeff = K
 
         # Input features: 10-dim spectral interaction bar chart
         n_feat = SimpleRLController.STATE_DIM
@@ -630,29 +588,31 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                  fontsize=6, color=LABEL_COLOR)
         ax_input.axvline(0, color='#333', lw=0.5)
         ax_input.invert_yaxis()
-        ax_input.set_title('Spectral Features (10d)',
+        ax_input.set_title('Spectral Features (9d)',
                            color=TITLE_COLOR, fontsize=9)
 
-        # Hidden bars — left controller
-        bars_l = ax_hid_l.barh(range(hidden_dim), np.zeros(hidden_dim),
+        # Weights — left controller
+        bars_l = ax_hid_l.barh(range(n_feat), np.zeros(n_feat),
                                color=PADDLE_COLOR_L, height=0.7)
         debug_bars_l = list(bars_l)
-        ax_hid_l.set_xlim(0, 2.0)
-        ax_hid_l.set_yticks(range(hidden_dim))
-        ax_hid_l.set_yticklabels([str(i) for i in range(hidden_dim)],
-                                 fontsize=6, color=LABEL_COLOR)
-        ax_hid_l.set_title('L Hidden', color=PADDLE_COLOR_L, fontsize=9)
+        ax_hid_l.set_xlim(-1.0, 1.0)
+        ax_hid_l.set_yticks(range(n_feat))
+        ax_hid_l.set_yticklabels(SimpleRLController.STATE_LABELS,
+                                 fontsize=5, color=LABEL_COLOR)
+        ax_hid_l.axvline(0, color='#333', lw=0.5)
+        ax_hid_l.set_title('L Weights', color=PADDLE_COLOR_L, fontsize=9)
         ax_hid_l.invert_yaxis()
 
-        # Hidden bars — right controller
-        bars_r = ax_hid_r.barh(range(hidden_dim), np.zeros(hidden_dim),
+        # Weights — right controller
+        bars_r = ax_hid_r.barh(range(n_feat), np.zeros(n_feat),
                                color=PADDLE_COLOR_R, height=0.7)
         debug_bars_r = list(bars_r)
-        ax_hid_r.set_xlim(0, 2.0)
-        ax_hid_r.set_yticks(range(hidden_dim))
-        ax_hid_r.set_yticklabels([str(i) for i in range(hidden_dim)],
-                                 fontsize=6, color=LABEL_COLOR)
-        ax_hid_r.set_title('R Hidden', color=PADDLE_COLOR_R, fontsize=9)
+        ax_hid_r.set_xlim(-1.0, 1.0)
+        ax_hid_r.set_yticks(range(n_feat))
+        ax_hid_r.set_yticklabels(SimpleRLController.STATE_LABELS,
+                                 fontsize=5, color=LABEL_COLOR)
+        ax_hid_r.axvline(0, color='#333', lw=0.5)
+        ax_hid_r.set_title('R Weights', color=PADDLE_COLOR_R, fontsize=9)
         ax_hid_r.invert_yaxis()
 
         # Output gauge — left: bar for mean, dot for action
@@ -693,8 +653,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- animation step -------------------------------------------------------
 
     def init():
-        for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env, lx_reward,
-                   ly_ball, ly_pad_l, ly_pad_r, ly_env, ly_reward]:
+        for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env,
+                   ly_ball, ly_pad_l, ly_pad_r, ly_env]:
             ln.set_data([], [])
         lx_dot.set_data([], [])
         ly_dot.set_data([], [])
@@ -717,7 +677,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             if spectral_paddle and rl_left is not None:
                 # RL policy: wavepacket state → paddle velocity (one per paddle)
                 rl_state = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, wp_reward)
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env)
                 act_l = rl_left.act(rl_state)
                 act_r = rl_right.act(rl_state)
                 left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -867,18 +827,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                               anomaly_scale=deviation_mag)
             wp_env.normalize()
 
-        # 6. Reward field learns from goal events
-        if scored:
-            wp_reward.update_lms(
-                np.array([ball['x'], ball['y']]),
-                np.array([reward, reward]), anomaly_scale=1.0)
-            wp_reward.normalize()
-
-        # Decay reward field so old goals fade
-        wp_reward.c_cos *= reward_decay
-        wp_reward.c_sin *= reward_decay
-
-        # 7. Update stored positions
+        # 6. Update stored positions
         wp_ball.pos[:] = ball_pos
         wp_paddle_l.pos[:] = paddle_l_pos
         wp_paddle_r.pos[:] = paddle_r_pos
@@ -899,7 +848,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0) ** 2)
         lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0) ** 2)
         lx_env.set_data(x_dom, wp_env.evaluate(x_dom, axis=0) ** 2)
-        lx_reward.set_data(x_dom, wp_reward.evaluate(x_dom, axis=0) ** 2)
         lx_dot.set_data([ball['x']], [0])
 
         # -- draw Y-domain (plot F² = PMF, x=field², y=domain) ----------
@@ -907,7 +855,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1) ** 2, y_dom)
         ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1) ** 2, y_dom)
         ly_env.set_data(wp_env.evaluate(y_dom, axis=1) ** 2, y_dom)
-        ly_reward.set_data(wp_reward.evaluate(y_dom, axis=1) ** 2, y_dom)
         ly_dot.set_data([0], [ball['y']])
 
         # -- draw court ---------------------------------------------------
@@ -941,10 +888,11 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 bar.set_width(rl_state[i])
 
             # Hidden activations
+            # Weights
             for i, bar in enumerate(debug_bars_l):
-                bar.set_width(rl_left.last_h1[i])
+                bar.set_width(rl_left.w[i])
             for i, bar in enumerate(debug_bars_r):
-                bar.set_width(rl_right.last_h1[i])
+                bar.set_width(rl_right.w[i])
 
             # Output gauges
             debug_mean_l.set_xdata([rl_left.last_mean])
@@ -1001,12 +949,6 @@ def main():
     parser.add_argument('--gamma-paddle', type=float, default=0.2,
                         help='Reward-gradient coupling strength '
                              '(default: 0.2)')
-    parser.add_argument('--reward-lr', type=float, default=0.3,
-                        help='Reward field LMS learning rate '
-                             '(default: 0.3)')
-    parser.add_argument('--reward-decay', type=float, default=0.999,
-                        help='Per-frame reward coefficient decay '
-                             '(default: 0.999)')
     parser.add_argument('--ball-lr', type=float, default=0.15,
                         help='Ball interaction LMS learning rate '
                              '(default: 0.15)')
@@ -1051,8 +993,6 @@ def main():
         paddle_damping=args.paddle_damping,
         beta_paddle=args.beta_paddle,
         gamma_paddle=args.gamma_paddle,
-        reward_lr=args.reward_lr,
-        reward_decay=args.reward_decay,
         ball_lr=args.ball_lr,
         paddle_lr=args.paddle_lr,
         lr_tracking=args.lr_tracking,
