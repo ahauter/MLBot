@@ -148,7 +148,7 @@ class WavepacketObject2D:
         a, b = WORLD_BOUNDS[axis]
         grid = np.linspace(a, b, 200)
         vals = self.evaluate(grid, axis)
-        return float(np.trapezoid(vals ** 2, grid))
+        return float(np.trapz(vals ** 2, grid))
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
