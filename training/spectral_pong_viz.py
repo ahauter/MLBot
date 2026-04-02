@@ -293,20 +293,27 @@ class SimpleRLController:
         self.trace_W2 = np.zeros_like(self.W2)
         self.trace_b2 = np.zeros_like(self.b2)
 
+    STATE_DIM = 10
+    STATE_LABELS = [
+        'nip_env', 'nip_padL', 'nip_padR', 'nip_rew',
+        'x_env_x', 'x_env_y',
+        'x_padL_x', 'x_padL_y',
+        'x_padR_x', 'x_padR_y',
+    ]
+
     @staticmethod
-    def build_state(wavepackets: list, ball: dict,
-                    left_paddle: dict, right_paddle: dict) -> np.ndarray:
-        parts = []
-        for wp in wavepackets:
-            coeffs = np.concatenate([wp.c_cos.ravel(), wp.c_sin.ravel()])
-            norm = np.linalg.norm(coeffs) + 1e-8
-            parts.append(coeffs / norm)
-        # Game state normalized to ~[-1, 1] by world bounds
-        parts.append(np.array([ball['x'] / 5.0, ball['y'] / 3.0,
-                               ball['vx'] / 3.0, ball['vy'] / 3.0,
-                               left_paddle['y'] / 3.0,
-                               right_paddle['y'] / 3.0]))
-        return np.concatenate(parts)
+    def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
+                    wp_env, wp_reward) -> np.ndarray:
+        """10-dim spectral interaction features."""
+        return np.array([
+            wp_ball.normalized_inner_product(wp_env),
+            wp_ball.normalized_inner_product(wp_paddle_l),
+            wp_ball.normalized_inner_product(wp_paddle_r),
+            wp_ball.normalized_inner_product(wp_reward),
+            *wp_ball.cross_product_2d(wp_env),
+            *wp_ball.cross_product_2d(wp_paddle_l),
+            *wp_ball.cross_product_2d(wp_paddle_r),
+        ])
 
     def act(self, state: np.ndarray) -> float:
         """Forward pass + sample from Gaussian policy. Returns action in [-1,1]."""
@@ -440,9 +447,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     rl_right = None
     if spectral_paddle:
         # State: 5 wavepackets × (K×2 cos + K×2 sin) + 6 game-state floats
-        state_dim = 5 * (K * 2 * 2) + 6
-        rl_left = SimpleRLController(state_dim, hidden_dim=8)
-        rl_right = SimpleRLController(state_dim, hidden_dim=8)
+        rl_left = SimpleRLController(SimpleRLController.STATE_DIM, hidden_dim=8)
+        rl_right = SimpleRLController(SimpleRLController.STATE_DIM, hidden_dim=8)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -613,17 +619,18 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         hidden_dim = rl_left.W1.shape[0]
         K_coeff = K
 
-        # Input heatmap: 5 wavepackets × 32 coefficients (cos|sin × 2 axes)
-        init_data = np.zeros((5, K_coeff * 4))
-        debug_heatmap = ax_input.imshow(
-            init_data, aspect='auto', cmap='coolwarm',
-            vmin=-1, vmax=1, interpolation='nearest')
-        ax_input.set_yticks(range(5))
-        ax_input.set_yticklabels(['Ball', 'PadL', 'PadR', 'Env', 'Rew'],
-                                 fontsize=7, color=LABEL_COLOR)
-        ax_input.axvline(K_coeff * 2 - 0.5, color='#555', lw=0.5, ls='--')
-        ax_input.set_xticks([])
-        ax_input.set_title('Encoder State  (cos | sin)',
+        # Input features: 10-dim spectral interaction bar chart
+        n_feat = SimpleRLController.STATE_DIM
+        feat_bars = ax_input.barh(range(n_feat), np.zeros(n_feat),
+                                  color=BALL_COLOR, height=0.7)
+        debug_heatmap = list(feat_bars)  # reuse name, now a list of bars
+        ax_input.set_xlim(-1.2, 1.2)
+        ax_input.set_yticks(range(n_feat))
+        ax_input.set_yticklabels(SimpleRLController.STATE_LABELS,
+                                 fontsize=6, color=LABEL_COLOR)
+        ax_input.axvline(0, color='#333', lw=0.5)
+        ax_input.invert_yaxis()
+        ax_input.set_title('Spectral Features (10d)',
                            color=TITLE_COLOR, fontsize=9)
 
         # Hidden bars — left controller
@@ -710,8 +717,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             if spectral_paddle and rl_left is not None:
                 # RL policy: wavepacket state → paddle velocity (one per paddle)
                 rl_state = SimpleRLController.build_state(
-                    [wp_ball, wp_paddle_l, wp_paddle_r, wp_env, wp_reward],
-                    ball, left_paddle, right_paddle)
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, wp_reward)
                 act_l = rl_left.act(rl_state)
                 act_r = rl_right.act(rl_state)
                 left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -930,10 +936,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
         # -- update debug strip -------------------------------------------
         if spectral_paddle and debug_heatmap is not None:
-            # Input heatmap: reshape wavepacket coeffs to (5, 4K)
-            coeff_dim = K * 4  # c_cos(K×2) + c_sin(K×2)
-            input_mat = rl_state[:5 * coeff_dim].reshape(5, coeff_dim)
-            debug_heatmap.set_array(input_mat)
+            # Input features bar chart
+            for i, bar in enumerate(debug_heatmap):
+                bar.set_width(rl_state[i])
 
             # Hidden activations
             for i, bar in enumerate(debug_bars_l):
