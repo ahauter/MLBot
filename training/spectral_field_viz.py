@@ -13,8 +13,13 @@ without changing field shape.
 Key physics:
   - Position = wavepacket peak location (tracked via cumulative shift)
   - Velocity = shift rate of the wavepacket in position space
-  - Force = -alpha * F_other(x_self) — field value of other objects at self's position
+  - Force = -alpha * <F_self, F_other> — overlap integral (inner product) of fields
   - Mass = resistance to acceleration (walls: 1e6, ball: 1.0)
+
+The inner product force is the physics-standard approach: in quantum mechanics,
+the interaction energy between two particles with contact potential V=g*delta(r)
+is E = g * integral |psi_1|^2 |psi_2|^2 dx.  Our linear version (coefficient
+dot product) computes this via Parseval's theorem in O(K) instead of O(N).
 
 The initial parameters are tuned so a human sees Newtonian-like ball-bouncing,
 but in the actual ML experiment these become learnable parameters so RL
@@ -50,8 +55,8 @@ COEFF_CLIP = 10.0  # matches se3_field.py
 # Style (matching training/scenario_visualizer.py)
 BG_COLOR = '#12121f'
 BALL_COLOR = '#38bdf8'
-BALL_PRED_COLOR = '#7dd3fc'
 WALL_COLOR = '#f87171'
+INTERACT_COLOR = '#a78bfa'
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -118,6 +123,15 @@ class WavepacketObject:
         """Field value at a single point."""
         return float(np.sum(self.c_cos * np.cos(self.k * x) +
                             self.c_sin * np.sin(self.k * x)))
+
+    def inner_product(self, other: 'WavepacketObject') -> float:
+        """Overlap integral <F_self, F_other> via Parseval's theorem.
+
+        Equal to integral F_self(x) * F_other(x) dx (up to normalization).
+        In coefficient space this is just the dot product — O(K) not O(N).
+        """
+        return float(np.sum(self.c_cos * other.c_cos +
+                            self.c_sin * other.c_sin))
 
     def shift(self, delta: float) -> None:
         """Fourier shift: move the wavepacket peak by delta.
@@ -197,28 +211,26 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, x0=0.0, mass=1.0, v0=ball_v0,
         sigma=ball_sigma, amplitude=ball_amplitude)
 
-    objects = [ball, wall]
-
     state = {'t': 0}
     history_x = deque(maxlen=window)
-    history_wall = deque(maxlen=window)
+    history_force = deque(maxlen=window)
     history_t = deque(maxlen=window)
 
     # ── figure setup ─────────────────────────────────────────────────────
-    fig, (ax_field, ax_track) = plt.subplots(
-        2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [2, 1]})
+    fig, (ax_field, ax_interact, ax_track) = plt.subplots(
+        3, 1, figsize=(12, 9), gridspec_kw={'height_ratios': [2, 1, 1]})
     fig.patch.set_facecolor(BG_COLOR)
-    fig.suptitle('1D Spectral Field — Wavepacket Dynamics',
-                 color=TITLE_COLOR, fontsize=13, fontweight='bold', y=0.96)
+    fig.suptitle('1D Spectral Field — Inner Product Dynamics',
+                 color=TITLE_COLOR, fontsize=13, fontweight='bold', y=0.97)
 
-    for ax in (ax_field, ax_track):
+    for ax in (ax_field, ax_interact, ax_track):
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
             spine.set_color('#333')
         ax.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
 
-    # ── top panel ────────────────────────────────────────────────────────
+    # ── top panel: fields + force arrow ──────────────────────────────────
     ax_field.set_xlim(-6, 6)
     ax_field.set_ylim(-6, 6)
     ax_field.set_xlabel('x (spatial domain)', color=LABEL_COLOR, fontsize=9)
@@ -238,9 +250,12 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                zorder=5, markeredgecolor='white',
                                markeredgewidth=1.5)
 
+    # Force arrow (updated each frame)
+    force_arrow = [None]  # mutable container for the annotation artist
+
     eq_text = (r'$\mathrm{shift}(\delta): c_j \to R(k_j \delta)\, c_j$'
                '\n'
-               r'$\dot{v} = -\alpha\, F_{wall}(x_{ball}) / m$')
+               r'$F = -\alpha\, \langle F_{ball},\, F_{wall} \rangle / m$')
     ax_field.text(0.02, 0.97, eq_text, transform=ax_field.transAxes,
                   color='#ccc', fontsize=9, verticalalignment='top',
                   bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -249,19 +264,46 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_field.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
 
-    # ── bottom panel ─────────────────────────────────────────────────────
+    # ── middle panel: interaction density ────────────────────────────────
+    ax_interact.set_xlim(-6, 6)
+    ax_interact.set_ylim(-3, 3)
+    ax_interact.set_xlabel('x (spatial domain)', color=LABEL_COLOR, fontsize=9)
+    ax_interact.set_ylabel('Interaction', color=LABEL_COLOR, fontsize=9)
+    ax_interact.set_title(r'Interaction Density  $F_{ball}(x) \cdot F_{wall}(x)$'
+                          r'    (area = $\langle F_{ball}, F_{wall} \rangle$ = force)',
+                          color=TITLE_COLOR, fontsize=10, fontweight='bold',
+                          pad=8)
+    ax_interact.axvline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.3)
+    ax_interact.axvline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.3)
+    ax_interact.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
+
+    line_interact, = ax_interact.plot([], [], color=INTERACT_COLOR, lw=1.5,
+                                       alpha=0.9)
+    # Filled regions re-drawn each frame; store for cleanup
+    interact_fills = []
+
+    force_text = ax_interact.text(0.02, 0.92, '', transform=ax_interact.transAxes,
+                                   color=INTERACT_COLOR, fontsize=9,
+                                   fontweight='bold', verticalalignment='top',
+                                   bbox=dict(boxstyle='round,pad=0.3',
+                                             facecolor='#1a1a2e',
+                                             edgecolor='#333', alpha=0.9))
+
+    # ── bottom panel: position + force time series ───────────────────────
     ax_track.set_ylim(wall_left - 1, wall_right + 1)
     ax_track.set_xlabel('Timestep', color=LABEL_COLOR, fontsize=9)
-    ax_track.set_ylabel('Position', color=LABEL_COLOR, fontsize=9)
-    ax_track.set_title('Position Tracking', color=TITLE_COLOR,
+    ax_track.set_ylabel('Position / Force', color=LABEL_COLOR, fontsize=9)
+    ax_track.set_title('Position & Force Over Time', color=TITLE_COLOR,
                        fontsize=11, fontweight='bold', pad=8)
     ax_track.axhline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
+    ax_track.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
 
     line_actual, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
-                                  label='Ball position (wavepacket peak)')
-    line_wall_at_ball, = ax_track.plot([], [], color=BALL_PRED_COLOR, lw=1.2,
-                                ls='--', alpha=0.7, label='Wall field at ball')
+                                  label='Ball position')
+    line_force_hist, = ax_track.plot([], [], color=INTERACT_COLOR, lw=1.2,
+                                     ls='--', alpha=0.7,
+                                     label='Force (inner product)')
 
     ax_track.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
@@ -270,7 +312,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                 color='#555', fontsize=8,
                                 horizontalalignment='right')
 
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     # ── animation callbacks ──────────────────────────────────────────────
 
@@ -278,36 +320,33 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         line_ball_field.set_data([], [])
         line_wall_field.set_data([], [])
         ball_dot.set_data([], [])
+        line_interact.set_data([], [])
+        force_text.set_text('')
         line_actual.set_data([], [])
-        line_wall_at_ball.set_data([], [])
+        line_force_hist.set_data([], [])
         frame_text.set_text('')
         return (line_ball_field, line_wall_field, ball_dot,
-                line_actual, line_wall_at_ball, frame_text)
+                line_interact, line_actual, line_force_hist, frame_text)
 
     def step(_frame):
         t = state['t']
 
-        # ── compute forces on each object ────────────────────────
-        # Force on ball from wall field
-        wall_at_ball = wall.predict(ball.x)
-        force_on_ball = -alpha * wall_at_ball
-
-        # Force on wall from ball field (symmetric, but wall barely moves)
-        ball_at_wall = ball.predict(wall.x)
-        force_on_wall = -alpha * ball_at_wall
+        # ── compute force via inner product ──────────────────────
+        overlap = ball.inner_product(wall)
+        force_on_ball = -alpha * overlap
 
         # ── step all objects ─────────────────────────────────────
         ball.step(force_on_ball, dt)
-        wall.step(force_on_wall, dt)
+        wall.step(-force_on_ball, dt)  # Newton's 3rd (opposite on wall)
 
         # ── record history ───────────────────────────────────────
         history_x.append(ball.x)
-        history_wall.append(wall_at_ball)
+        history_force.append(force_on_ball)
         history_t.append(t)
 
         state['t'] = t + 1
 
-        # ── draw top panel ───────────────────────────────────────
+        # ── draw top panel: fields + force arrow ─────────────────
         ball_curve = ball.evaluate(x_domain)
         wall_curve = wall.evaluate(x_domain)
 
@@ -316,20 +355,57 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         ball_dot.set_data([ball.x], [0])
         frame_text.set_text(f't={t}')
 
-        # ── draw bottom panel ────────────────────────────────────
+        # Force arrow at ball position
+        if force_arrow[0] is not None:
+            force_arrow[0].remove()
+        arrow_scale = 3.0  # scale force for visual arrow length
+        arrow_dx = force_on_ball * arrow_scale
+        # Clamp arrow length for readability
+        arrow_dx = np.clip(arrow_dx, -2.5, 2.5)
+        if abs(arrow_dx) > 0.05:
+            force_arrow[0] = ax_field.annotate(
+                '', xy=(ball.x + arrow_dx, 0),
+                xytext=(ball.x, 0),
+                arrowprops=dict(arrowstyle='->', color=INTERACT_COLOR,
+                                lw=2.5, mutation_scale=15),
+                zorder=6)
+        else:
+            force_arrow[0] = None
+
+        # ── draw middle panel: interaction density ───────────────
+        interaction = ball_curve * wall_curve
+        line_interact.set_data(x_domain, interaction)
+
+        # Update filled regions (remove old, draw new)
+        for fill in interact_fills:
+            fill.remove()
+        interact_fills.clear()
+        interact_fills.append(ax_interact.fill_between(
+            x_domain, interaction, 0,
+            where=interaction > 0, color=INTERACT_COLOR, alpha=0.15))
+        interact_fills.append(ax_interact.fill_between(
+            x_domain, interaction, 0,
+            where=interaction < 0, color=WALL_COLOR, alpha=0.15))
+
+        force_text.set_text(
+            rf'$\langle F_{{ball}}, F_{{wall}} \rangle = {overlap:+.3f}$'
+            f'    force = {force_on_ball:+.3f}')
+
+        # ── draw bottom panel: time series ───────────────────────
         ts = np.array(history_t)
         line_actual.set_data(ts, np.array(history_x))
-        line_wall_at_ball.set_data(ts, np.array(history_wall))
+        line_force_hist.set_data(ts, np.array(history_force))
 
         if len(ts) > 1:
             ax_track.set_xlim(ts[0], ts[-1] + 1)
 
         return (line_ball_field, line_wall_field, ball_dot,
-                line_actual, line_wall_at_ball, frame_text)
+                line_interact, line_actual, line_force_hist, frame_text)
 
     frames = range(max_frames) if max_frames is not None else itertools.count()
+    # blit=False because fill_between creates new artists each frame
     anim = FuncAnimation(fig, step, frames=frames, init_func=init,
-                         interval=interval, blit=True, repeat=False)
+                         interval=interval, blit=False, repeat=False)
     return fig, anim
 
 
@@ -342,8 +418,8 @@ def main():
                         help='Save animation to file (e.g. out.gif)')
     parser.add_argument('--K', type=int, default=8,
                         help='Number of spectral components (default: 8)')
-    parser.add_argument('--alpha', type=float, default=0.12,
-                        help='Force coupling strength (default: 0.12)')
+    parser.add_argument('--alpha', type=float, default=0.15,
+                        help='Force coupling strength (default: 0.15)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Frame limit (default: infinite for display, '
                              'required for --save)')
