@@ -85,13 +85,14 @@ class WavepacketObject2D:
                  c_cos: np.ndarray | None = None,
                  c_sin: np.ndarray | None = None,
                  sigma: float = 0.8, amplitude: float = 1.5,
-                 lr: float = 0.0):
+                 lr: float = 0.0, lr_tracking: float = 0.0):
         self.K = K
         self.k = np.asarray(frequencies, dtype=np.float64)
         self.mass = mass
         self.pos = np.array(pos0, dtype=np.float64)
         self.vel = np.array(vel0, dtype=np.float64)
         self.lr = lr
+        self.lr_tracking = lr_tracking
 
         if c_cos is not None and c_sin is not None:
             self.c_cos = np.array(c_cos, dtype=np.float64)  # (K, 2)
@@ -160,6 +161,14 @@ class WavepacketObject2D:
             for d in range(2)
         ])
 
+    def normalized_inner_product(self, other: 'WavepacketObject2D') -> float:
+        """Spectral alignment score in ~[0, 1]. Attention weight for LMS."""
+        ip = self.inner_product_2d(other)  # (2,)
+        norm_s = np.sqrt(np.sum(self.c_cos**2 + self.c_sin**2, axis=0))  # (2,)
+        norm_o = np.sqrt(np.sum(other.c_cos**2 + other.c_sin**2, axis=0))  # (2,)
+        nip = ip / (norm_s * norm_o + 1e-8)  # (2,)
+        return float(np.linalg.norm(nip) / np.sqrt(2))
+
     def shift(self, delta: float, axis: int) -> None:
         """Fourier-domain phase rotation for one axis."""
         for j in range(self.K):
@@ -197,6 +206,24 @@ class WavepacketObject2D:
             self._set_c_flat(d, c_new)
         return residual
 
+    def update_with_attention(self, domain_pos: np.ndarray,
+                              target_2d: np.ndarray,
+                              interaction_scales: list[float]) -> np.ndarray:
+        """LMS with effective_lr = lr_tracking + lr * sum(interaction_scales)."""
+        effective_lr = self.lr_tracking + self.lr * sum(interaction_scales)
+        if effective_lr <= 0:
+            return np.zeros(2)
+        residual = np.zeros(2)
+        for d in range(2):
+            basis = self._basis(domain_pos[d])
+            c = self._c_flat(d)
+            res = target_2d[d] - float(c @ basis)
+            residual[d] = res
+            c_new = c + effective_lr * basis * res
+            np.clip(c_new, -COEFF_CLIP, COEFF_CLIP, out=c_new)
+            self._set_c_flat(d, c_new)
+        return residual
+
 
 
 # -- helpers ------------------------------------------------------------------
@@ -226,27 +253,33 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 beta_paddle: float = 0.3,
                 gamma_paddle: float = 0.2,
                 reward_lr: float = 0.3,
-                reward_decay: float = 0.999):
+                reward_decay: float = 0.999,
+                ball_lr: float = 0.15,
+                paddle_lr: float = 0.1,
+                lr_tracking: float = 0.01):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1.0,
-        sigma=ball_sigma, amplitude=ball_amplitude)
+        sigma=ball_sigma, amplitude=ball_amplitude,
+        lr=ball_lr, lr_tracking=lr_tracking)
 
     wp_paddle_l = WavepacketObject2D(
         K, frequencies,
         pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0.0), mass=1e6,
-        sigma=0.5, amplitude=1.0)
+        sigma=0.5, amplitude=1.0,
+        lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
     wp_paddle_r = WavepacketObject2D(
         K, frequencies,
         pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0.0), mass=1e6,
-        sigma=0.5, amplitude=1.0)
+        sigma=0.5, amplitude=1.0,
+        lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
     wp_env = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1e6,
         c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
-        lr=env_lr)
+        lr=env_lr, lr_tracking=0.0)
 
     # Learned reward field: maps positions to reward values via LMS.
     # Both amplitude axes store scalar reward (axis 0 = reward-at-x,
@@ -254,7 +287,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     wp_reward = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1.0,
         c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
-        lr=reward_lr)
+        lr=reward_lr, lr_tracking=0.0)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -528,12 +561,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
-            # Train reward field at the goal position before resetting ball
-            goal_pos = np.array([ball['x'], ball['y']])
-            wp_reward.update_lms(goal_pos,
-                                 np.array([reward, reward]),
-                                 anomaly_scale=1.0)
-
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
@@ -542,33 +569,58 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             # Re-init ball wavepacket on score
             wp_ball.__init__(K, frequencies, pos0=(ball['x'], ball['y']),
                              mass=1.0, sigma=ball_sigma,
-                             amplitude=ball_amplitude)
+                             amplitude=ball_amplitude,
+                             lr=ball_lr, lr_tracking=lr_tracking)
 
-        # -- update observed wavepackets ----------------------------------
+        # -- update wavepackets: shift + attention-weighted LMS -----------
         ball_pos = np.array([ball['x'], ball['y']])
-        wp_ball.set_position(ball_pos)
+        paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
+        paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
 
-        wp_paddle_l.set_position(
-            np.array([paddle_lx, left_paddle['y']]))
-        wp_paddle_r.set_position(
-            np.array([paddle_rx, right_paddle['y']]))
+        # 1. Propagation: shift by velocity (free-flight kinematics)
+        for d in range(2):
+            wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
+        delta_l = left_paddle['y'] - wp_paddle_l.pos[1]
+        delta_r = right_paddle['y'] - wp_paddle_r.pos[1]
+        if abs(delta_l) > 1e-12:
+            wp_paddle_l.shift(delta_l, axis=1)
+        if abs(delta_r) > 1e-12:
+            wp_paddle_r.shift(delta_r, axis=1)
 
-        # -- LMS wall learning from acceleration anomaly ------------------
-        # Skip on scoring frames — ball teleport creates a bogus anomaly.
+        # 2. Normalized inner products (attention weights)
+        nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
+        nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
+        nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
+        nip_ball_reward = abs(wp_ball.normalized_inner_product(wp_reward))
+
+        # 3. Attention-weighted LMS correction
         if not scored:
-            # Subtract contributions from ALL known sources (env + paddles)
-            # so the env field only learns from truly unexplained anomalies.
+            wp_ball.update_with_attention(
+                ball_pos, ball_pos,
+                [nip_ball_env, nip_ball_padL, nip_ball_padR])
+            wp_paddle_l.update_with_attention(
+                paddle_l_pos, paddle_l_pos,
+                [nip_ball_padL])
+            wp_paddle_r.update_with_attention(
+                paddle_r_pos, paddle_r_pos,
+                [nip_ball_padR])
+            wp_env.update_with_attention(
+                ball_pos, ball_pos,
+                [nip_ball_env])
+            wp_reward.update_with_attention(
+                ball_pos, np.array([reward, reward]),
+                [nip_ball_reward])
+
+        # 4. Update stored positions for cross_product usage
+        wp_ball.pos[:] = ball_pos
+        wp_paddle_l.pos[:] = paddle_l_pos
+        wp_paddle_r.pos[:] = paddle_r_pos
+
+        # 5. Anomaly for display only
+        if not scored:
             a_actual = np.array([(vx_after - vx_before) / dt,
                                  (vy_after - vy_before) / dt])
-            force_env = -alpha * wp_ball.inner_product_2d(wp_env)
-            force_pad_l = -alpha * wp_ball.inner_product_2d(wp_paddle_l)
-            force_pad_r = -alpha * wp_ball.inner_product_2d(wp_paddle_r)
-            a_predicted = (force_env + force_pad_l + force_pad_r) / wp_ball.mass
-            a_residual = a_actual - a_predicted
-
-            anomaly_mag = np.linalg.norm(a_residual) * 0.01
-            ball_next = ball_pos + np.array([ball['vx'], ball['vy']]) * dt
-            wp_env.update_lms(ball_next, ball_pos, anomaly_scale=anomaly_mag)
+            a_residual = a_actual
         else:
             a_residual = np.zeros(2)
 
@@ -674,6 +726,15 @@ def main():
     parser.add_argument('--reward-decay', type=float, default=0.999,
                         help='Per-frame reward coefficient decay '
                              '(default: 0.999)')
+    parser.add_argument('--ball-lr', type=float, default=0.15,
+                        help='Ball interaction LMS learning rate '
+                             '(default: 0.15)')
+    parser.add_argument('--paddle-lr', type=float, default=0.1,
+                        help='Paddle interaction LMS learning rate '
+                             '(default: 0.1)')
+    parser.add_argument('--lr-tracking', type=float, default=0.01,
+                        help='Always-on tracking LMS learning rate '
+                             '(default: 0.01)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -712,6 +773,9 @@ def main():
         gamma_paddle=args.gamma_paddle,
         reward_lr=args.reward_lr,
         reward_decay=args.reward_decay,
+        ball_lr=args.ball_lr,
+        paddle_lr=args.paddle_lr,
+        lr_tracking=args.lr_tracking,
     )
 
     if args.save:
