@@ -1155,12 +1155,11 @@ def save_training_state(path: Path, population, total_collected: int,
         'num_agents': population.num_agents,
         'agents': [],
     }
-    for agent in population.agents:
-        state['agents'].append({
-            'encoder': agent.encoder.state_dict(),
-            'policy': agent.policy.state_dict(),
-            'optimizer': agent.optimizer.state_dict(),
-        })
+    for i, agent in enumerate(population.agents):
+        # Use per-agent checkpoint directory for algorithm-agnostic save
+        agent_dir = path / f'agent_{i}'
+        agent.save_checkpoint(agent_dir)
+        state['agents'].append(str(agent_dir))
     tmp = path / 'training_state.pt.tmp'
     torch.save(state, tmp)
     os.replace(tmp, path / 'training_state.pt')
@@ -1175,10 +1174,8 @@ def load_training_state(path: Path, population, device: str = 'cpu') -> dict:
         raise ValueError(
             f'Checkpoint has {saved_agents} agents but population has '
             f'{population.num_agents}')
-    for i, agent_state in enumerate(ckpt['agents']):
-        population.agents[i].encoder.load_state_dict(agent_state['encoder'])
-        population.agents[i].policy.load_state_dict(agent_state['policy'])
-        population.agents[i].optimizer.load_state_dict(agent_state['optimizer'])
+    for i, agent_dir in enumerate(ckpt['agents']):
+        population.agents[i].load_checkpoint(Path(agent_dir))
     population._generation = ckpt['population_generation']
     population._last_snapshot_step = ckpt['population_last_snapshot_step']
     population.scores = ckpt['population_scores']
@@ -1458,6 +1455,11 @@ def train(config: dict):
                 save_training_state(model_dir / 'latest', population,
                                     total_collected, collection_round,
                                     last_gen_step, generation_pending)
+                # Export deployment weights so the bot loads them next game
+                best_idx = population.rank_agents()[0]
+                best_agent = population.agents[best_idx]
+                if hasattr(best_agent, 'save_deployment_weights'):
+                    best_agent.save_deployment_weights(Path('models'))
             _t1 = time.perf_counter()
             profiler.add_time('checkpoint_time', _t1 - _t0)
             profiler.record_event(_t0, _t1, 'checkpoint')
@@ -1499,6 +1501,10 @@ def train(config: dict):
         best_idx = population.rank_agents()[0]
         population.agents[best_idx].save_checkpoint(model_dir / 'final')
         print(f'[train] Saved final checkpoint to {model_dir}/final')
+        # Export deployment weights (encoder.pt + policy.pt) for bot inference
+        if hasattr(population.agents[best_idx], 'save_deployment_weights'):
+            population.agents[best_idx].save_deployment_weights(Path('models'))
+            print('[train] Saved deployment weights to models/encoder.pt, policy.pt')
 
         # Generate profiling report if enabled
         if profiling_enabled:

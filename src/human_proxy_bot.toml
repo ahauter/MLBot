@@ -1,0 +1,17 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "HumanProxyBot"
+agent_id = "austin/humanproxy"
+run_command = "..\\venv\\Scripts\\python human_proxy_bot.py"
+run_command_linux = "../venv/bin/python human_proxy_bot.py"
+loadout_file = ""
+logo_file = ""
+root_dir = ""
+
+[details]
+description = "Human gamepad proxy for live-play SAC training"
+fun_fact = ""
+source_link = ""
+developer = "Austin"
+language = "Python"
+tags = ["1v1"]
