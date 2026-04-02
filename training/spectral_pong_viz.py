@@ -225,7 +225,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 paddle_damping: float = 0.85,
                 beta_paddle: float = 0.3,
                 gamma_paddle: float = 0.2,
-                reward_lr: float = 0.3):
+                reward_lr: float = 0.3,
+                reward_decay: float = 0.999):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
@@ -423,7 +424,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 #   reward_grad  = dR/dy at paddle pos — move toward higher reward
                 tracking_l = wp_paddle_l.cross_product_2d(wp_ball)[1]
                 wall_signal = wp_ball.cross_product_2d(wp_env)[1]
-                reward_grad_l = wp_reward.gradient(left_paddle['y'], axis=1)
+                reward_grad_l = np.tanh(wp_reward.gradient(left_paddle['y'], axis=1))
                 force_l = (alpha_paddle * tracking_l
                            - beta_paddle * wall_signal
                            + gamma_paddle * reward_grad_l)
@@ -431,7 +432,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 left_paddle['y'] += paddle_vel['l'] * dt
 
                 tracking_r = wp_paddle_r.cross_product_2d(wp_ball)[1]
-                reward_grad_r = wp_reward.gradient(right_paddle['y'], axis=1)
+                reward_grad_r = np.tanh(wp_reward.gradient(right_paddle['y'], axis=1))
                 force_r = (alpha_paddle * tracking_r
                            - beta_paddle * wall_signal
                            + gamma_paddle * reward_grad_r)
@@ -563,6 +564,10 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         ball_next = ball_pos + np.array([ball['vx'], ball['vy']]) * dt
         wp_env.update_lms(ball_next, ball_pos, anomaly_scale=anomaly_mag)
 
+        # Decay reward field so old goals fade and coefficients stay bounded
+        wp_reward.c_cos *= reward_decay
+        wp_reward.c_sin *= reward_decay
+
         state['anomaly'] = a_residual
         state['max_anomaly'] = max(np.linalg.norm(a_residual),
                                     state['max_anomaly'] * 0.98)
@@ -658,6 +663,9 @@ def main():
     parser.add_argument('--reward-lr', type=float, default=0.3,
                         help='Reward field LMS learning rate '
                              '(default: 0.3)')
+    parser.add_argument('--reward-decay', type=float, default=0.999,
+                        help='Per-frame reward coefficient decay '
+                             '(default: 0.999)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -695,6 +703,7 @@ def main():
         beta_paddle=args.beta_paddle,
         gamma_paddle=args.gamma_paddle,
         reward_lr=args.reward_lr,
+        reward_decay=args.reward_decay,
     )
 
     if args.save:
