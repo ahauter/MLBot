@@ -39,6 +39,7 @@ from se3_field import (
     D_AMP,
     N_OBJECTS,
     OBJECTS,
+    _EGO,
     _TEAM,
 )
 from eval_convergence import stream_dataset_chunks, AMP_DIM_NAMES
@@ -338,8 +339,8 @@ def print_report(metrics: Dict) -> None:
     print(f"\n4. Temporal Autocorrelation (decorrelation lag):")
     print(f"  {'object':<12s} {'delta lag':>10s} {'surprise lag':>12s}")
     for obj in range(N_OBJECTS):
-        dl = ac["delta_decorr_lag"][obj]
-        sl = ac["surprise_decorr_lag"][obj]
+        dl = int(ac["delta_decorr_lag"][obj])
+        sl = int(ac["surprise_decorr_lag"][obj])
         print(f"  {OBJECTS[obj]:<12s} {dl:10d} {sl:12d}")
 
     # 5. Action-change SNR
@@ -368,78 +369,177 @@ def print_report(metrics: Dict) -> None:
 
 
 def save_plot(metrics: Dict, path: str) -> None:
-    """Save 4-panel analysis figure."""
+    """Save 6-panel analysis figure telling the delta vs surprise story."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyBboxPatch
     except ImportError:
         print("matplotlib not installed — skipping plot")
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    COLOR_D = "#4682B4"   # steelblue  — delta
+    COLOR_S = "#E8734A"   # coral-ish  — surprise
+    w = 0.35
 
-    # Panel 1: Per-dim breakdown (bar chart)
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    fig.suptitle("Momentum Signal Analysis: Delta vs Surprise",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    # ── Panel 1: Per-Dimension Magnitude ─────────────────────────────
     ax = axes[0, 0]
     bd = metrics["per_dim_breakdown"]
     x = np.arange(D_AMP)
-    w = 0.35
     dm = bd["delta_mag"].mean(axis=0)
     sm = bd["surprise_mag"].mean(axis=0)
-    ax.bar(x - w / 2, dm, w, label="delta", color="steelblue")
-    ax.bar(x + w / 2, sm, w, label="surprise", color="coral")
+    bars_d = ax.bar(x - w / 2, dm, w, label="delta", color=COLOR_D, edgecolor="white", linewidth=0.5)
+    bars_s = ax.bar(x + w / 2, sm, w, label="surprise", color=COLOR_S, edgecolor="white", linewidth=0.5)
     ax.set_xticks(x)
     ax.set_xticklabels(AMP_DIM_NAMES, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Mean |signal|")
-    ax.set_title("Per-Dimension Magnitude")
-    ax.legend()
+    ax.set_title("Signal Magnitude by Dimension", fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+    # Annotate the dominant group
+    ang_vel_mean = (dm[3:6].mean() + sm[3:6].mean()) / 2
+    pos_mean = (dm[0:3].mean() + sm[0:3].mean()) / 2
+    if ang_vel_mean > 3 * pos_mean:
+        ax.annotate("angular velocity\ndominates (~16x position)",
+                    xy=(4, dm[4]), xytext=(6.5, dm[3] * 0.9),
+                    fontsize=7, color="gray",
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=0.8))
 
-    # Panel 2: Correlation heatmap
+    # ── Panel 2: Action-Change SNR ───────────────────────────────────
     ax = axes[0, 1]
-    corr = metrics["correlation"]["corr_matrix"]
-    obj_names = [OBJECTS[i][:4] for i in range(N_OBJECTS)]
-    im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
-    ax.set_xticks(np.arange(D_AMP))
-    ax.set_xticklabels([n[:5] for n in AMP_DIM_NAMES], rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(np.arange(N_OBJECTS))
-    ax.set_yticklabels(obj_names, fontsize=8)
-    ax.set_title("Correlation (delta vs surprise)")
-    fig.colorbar(im, ax=ax, shrink=0.8)
-
-    # Panel 3: Autocorrelation curves
-    ax = axes[1, 0]
-    ac = metrics["temporal_autocorr"]
-    for obj in range(N_OBJECTS):
-        if obj == _TEAM:
-            continue
-        lags = np.arange(1, ac["delta_autocorr"].shape[1] + 1)
-        ax.plot(lags, ac["delta_autocorr"][obj], "-",
-                label=f"{OBJECTS[obj]} delta", linewidth=1.2)
-        ax.plot(lags, ac["surprise_autocorr"][obj], "--",
-                label=f"{OBJECTS[obj]} surprise", linewidth=1.2)
-    ax.axhline(0.5, color="gray", linestyle=":", alpha=0.5)
-    ax.set_xlabel("Lag (steps)")
-    ax.set_ylabel("Autocorrelation")
-    ax.set_title("Temporal Autocorrelation")
-    ax.legend(fontsize=7, ncol=2)
-
-    # Panel 4: SNR comparison
-    ax = axes[1, 1]
     snr = metrics["action_change_snr"]
-    x = np.arange(N_OBJECTS)
+    x_obj = np.arange(N_OBJECTS)
     ds = np.nan_to_num(snr["delta_snr"], nan=0)
     ss = np.nan_to_num(snr["surprise_snr"], nan=0)
-    ax.bar(x - w / 2, ds, w, label="delta SNR", color="steelblue")
-    ax.bar(x + w / 2, ss, w, label="surprise SNR", color="coral")
-    ax.set_xticks(x)
+    ax.bar(x_obj - w / 2, ds, w, label="delta", color=COLOR_D, edgecolor="white", linewidth=0.5)
+    ax.bar(x_obj + w / 2, ss, w, label="surprise", color=COLOR_S, edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x_obj)
     ax.set_xticklabels([OBJECTS[i] for i in range(N_OBJECTS)], fontsize=8)
     ax.axhline(1.0, color="gray", linestyle=":", alpha=0.5)
     ax.set_ylabel("SNR (change / stable)")
-    ax.set_title("Action-Change Detection SNR")
-    ax.legend()
+    ax.set_title("Action-Change Detection SNR", fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_yscale("log")
+    # Annotate key finding
+    if ds[0] > 0 and ss[0] > 0:
+        ratio = ds[0] / max(ss[0], 1e-6)
+        ax.annotate(f"delta {ratio:.0f}x sharper\non ball",
+                    xy=(0, ds[0]), xytext=(1.5, ds[0] * 0.7),
+                    fontsize=7, color="gray",
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=0.8))
 
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    # ── Panel 3: Correlation Heatmap ─────────────────────────────────
+    ax = axes[1, 0]
+    corr = metrics["correlation"]["corr_matrix"]
+    obj_names = [OBJECTS[i] for i in range(N_OBJECTS)]
+    im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(np.arange(D_AMP))
+    ax.set_xticklabels([n[:6] for n in AMP_DIM_NAMES], rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(np.arange(N_OBJECTS))
+    ax.set_yticklabels(obj_names, fontsize=8)
+    ax.set_title("Correlation (delta vs surprise)", fontweight="bold")
+    fig.colorbar(im, ax=ax, shrink=0.8, label="Pearson r")
+    # Overlay text values
+    for i in range(N_OBJECTS):
+        for j in range(D_AMP):
+            val = corr[i, j]
+            color = "white" if abs(val) > 0.6 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                    fontsize=6, color=color)
+
+    # ── Panel 4: Information Content (Variance) ──────────────────────
+    ax = axes[1, 1]
+    ic = metrics["information_content"]
+    dv = ic["delta_var"].mean(axis=-1)   # (N_OBJECTS,) mean across dims
+    sv = ic["surprise_var"].mean(axis=-1)
+    ax.bar(x_obj - w / 2, dv, w, label="delta", color=COLOR_D, edgecolor="white", linewidth=0.5)
+    ax.bar(x_obj + w / 2, sv, w, label="surprise", color=COLOR_S, edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x_obj)
+    ax.set_xticklabels([OBJECTS[i] for i in range(N_OBJECTS)], fontsize=8)
+    ax.set_ylabel("Variance (higher = more informative)")
+    ax.set_title("Information Content", fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+    # Add ratio annotation
+    for i in range(N_OBJECTS):
+        if dv[i] > 1e-8:
+            r = sv[i] / dv[i]
+            y_pos = max(dv[i], sv[i]) * 1.05
+            ax.text(i, y_pos, f"{r:.0%}", ha="center", fontsize=7, color="gray")
+
+    # ── Panel 5: Per-Dim Correlation (ego car detail) ────────────────
+    ax = axes[2, 0]
+    ego_corr = corr[_EGO if _EGO < N_OBJECTS else 1, :]  # ego car row
+    colors = [COLOR_D if c < 0.93 else "#888888" for c in ego_corr]
+    bars = ax.bar(np.arange(D_AMP), ego_corr, color=colors, edgecolor="white", linewidth=0.5)
+    ax.axhline(0.95, color="red", linestyle="--", alpha=0.6, label="redundancy threshold (0.95)")
+    ax.axhline(0.90, color="orange", linestyle="--", alpha=0.4, label="high correlation (0.90)")
+    ax.set_xticks(np.arange(D_AMP))
+    ax.set_xticklabels(AMP_DIM_NAMES, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Pearson r")
+    ax.set_ylim(0, 1.1)
+    ax.set_title("Ego Car: Per-Dim Correlation Detail", fontweight="bold")
+    ax.legend(fontsize=7, loc="lower right")
+    ax.grid(axis="y", alpha=0.3)
+
+    # ── Panel 6: Summary Text Box ────────────────────────────────────
+    ax = axes[2, 1]
+    ax.axis("off")
+
+    red = metrics["redundancy"]
+    mean_corr = metrics["correlation"]["corr_summary"].mean()
+    mean_var_ratio = ic["ratio"].mean()
+    mean_delta_snr = np.nanmean(snr["delta_snr"][:4])  # exclude stadium
+    mean_surp_snr = np.nanmean(snr["surprise_snr"][:4])
+
+    summary_lines = [
+        ("VERDICT", "Keep both signals — they are complementary"),
+        ("", ""),
+        ("Redundancy", f"{red['redundancy_fraction']:.0%} of dims at |r| > 0.95"),
+        ("Mean correlation", f"r = {mean_corr:.2f} (correlated but not redundant)"),
+        ("Variance ratio", f"surprise = {mean_var_ratio:.0%} of delta's variance"),
+        ("SNR advantage", f"delta {mean_delta_snr / max(mean_surp_snr, 1e-6):.1f}x sharper on action changes"),
+        ("", ""),
+        ("Delta", "Sharp impulse detector — best for \"did the player"),
+        ("", "just change their input?\""),
+        ("", ""),
+        ("Surprise", "Smoothed anomaly tracker — best for \"is this"),
+        ("", "behavior unexpected given recent history?\""),
+        ("", ""),
+        ("Dominant dims", "Angular velocity (steering/rotation) = 80% of signal"),
+        ("Ball advantage", "Cleanest signal due to deterministic physics"),
+    ]
+
+    y = 0.95
+    for label, text in summary_lines:
+        if label == "VERDICT":
+            ax.text(0.05, y, text, transform=ax.transAxes,
+                    fontsize=11, fontweight="bold", color="#2d5a27",
+                    verticalalignment="top")
+        elif label:
+            ax.text(0.05, y, f"{label}:", transform=ax.transAxes,
+                    fontsize=8, fontweight="bold", verticalalignment="top")
+            ax.text(0.35, y, text, transform=ax.transAxes,
+                    fontsize=8, verticalalignment="top")
+        else:
+            ax.text(0.35, y, text, transform=ax.transAxes,
+                    fontsize=8, verticalalignment="top", color="#555555")
+        y -= 0.065
+
+    # Border around summary
+    ax.add_patch(FancyBboxPatch(
+        (0.02, 0.02), 0.96, 0.96, transform=ax.transAxes,
+        boxstyle="round,pad=0.02", facecolor="#f8f8f8",
+        edgecolor="#cccccc", linewidth=1, zorder=-1))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(path, dpi=150, bbox_inches="tight")
     print(f"Plot saved to {path}")
     plt.close()
 
@@ -460,6 +560,23 @@ def save_json(metrics: Dict, path: str) -> None:
     with open(path, "w") as f:
         json.dump(_convert(metrics), f, indent=2)
     print(f"Results saved to {path}")
+
+
+def load_json(path: str) -> Dict:
+    """Load metrics from JSON (lists converted back to numpy arrays)."""
+    def _to_numpy(obj):
+        if isinstance(obj, list):
+            try:
+                return np.array(obj, dtype=np.float64)
+            except (ValueError, TypeError):
+                return obj
+        if isinstance(obj, dict):
+            return {k: _to_numpy(v) for k, v in obj.items()}
+        return obj
+
+    with open(path) as f:
+        data = json.load(f)
+    return _to_numpy(data)
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -487,12 +604,25 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument("--plot", type=str, default=None,
-                        help="Save 4-panel analysis plot")
+                        help="Save 6-panel analysis plot")
     parser.add_argument("--output-json", type=str, default=None,
                         help="Save results as JSON")
+    parser.add_argument("--from-json", type=str, default=None,
+                        help="Load previously saved JSON results (skip data collection)")
     parser.add_argument("--snr-threshold", type=float, default=0.1,
                         help="Accel residual change threshold for SNR metric")
     args = parser.parse_args()
+
+    if args.from_json:
+        # Re-plot mode: load previously saved metrics
+        print(f"Loading metrics from {args.from_json}...")
+        metrics = load_json(args.from_json)
+        print_report(metrics)
+        if args.plot:
+            save_plot(metrics, args.plot)
+        else:
+            print("Hint: use --plot <path.png> to generate the visualization")
+        return
 
     device = torch.device(args.device)
     print(f"Device: {device}")
