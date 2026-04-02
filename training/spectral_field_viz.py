@@ -43,10 +43,8 @@ BALL_COLOR = '#38bdf8'
 WALL_COLOR = '#f87171'
 INTERACT_COLOR = '#a78bfa'
 NEWTON_COLOR = '#4ade80'
-RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall (legacy)
 RESIDUAL_COLOR = '#facc15'   # yellow for LMS residual
 ENV_FIELD_COLOR = '#c084fc'  # purple for learned environment field
-PAD_COLOR = '#2dd4bf'        # teal for friction pad region marker
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -153,13 +151,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                      wall_right: float, wall_warmup: int,
                      ball_sigma: float, ball_amplitude: float,
                      ball_lr: float, wall_mass: float,
-                     pad_center: float, pad_width: float,
-                     pad_friction: float,
                      interval: int, max_frames: int | None):
     x_domain = np.linspace(-6, 6, 500)
     window = 300
-    pad_left = pad_center - pad_width / 2
-    pad_right = pad_center + pad_width / 2
 
     # ════════════════════════════════════════════════════════════════════
     # PANEL A state: Spectral → Position
@@ -251,7 +245,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                    color=NEWTON_COLOR, fontsize=11, fontweight='bold', pad=8)
     ax_b.axvline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
     ax_b.axvline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
-    ax_b.axvspan(pad_left, pad_right, color=PAD_COLOR, alpha=0.12, zorder=0)
 
     lb_ball_field, = ax_b.plot([], [], color=BALL_COLOR, lw=2, alpha=0.9,
                                label='Ball wavepacket (shifted)')
@@ -282,8 +275,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_track.axhline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
-    ax_track.axhspan(pad_left, pad_right, color=PAD_COLOR,
-                     alpha=0.08, zorder=0)
 
     lt_spectral, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
                                  label='A: Spectral ball')
@@ -295,11 +286,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     frame_text = ax_a.text(0.98, 0.02, '', transform=ax_a.transAxes,
                            color='#555', fontsize=8,
                            horizontalalignment='right')
-    lb_vel_text = ax_b.text(0.98, 0.97, '', transform=ax_b.transAxes,
-                            color=NEWTON_COLOR, fontsize=10,
-                            fontweight='bold',
-                            horizontalalignment='right',
-                            verticalalignment='top')
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -313,7 +299,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         la_dot.set_data([], [])
         lb_dot.set_data([], [])
         frame_text.set_text('')
-        lb_vel_text.set_text('')
         return ()
 
     def step(_frame):
@@ -337,10 +322,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         v_before = newton['v']
 
         newton['x'] += newton['v'] * dt
-
-        # Friction pad: decelerate proportional to velocity
-        if pad_left <= newton['x'] <= pad_right:
-            newton['v'] -= pad_friction * newton['v'] * dt
 
         # Wall bounces
         if newton['x'] >= wall_right:
@@ -408,7 +389,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         lb_ball_field.set_data(x_domain, b_ball_curve)
         lb_env_field.set_data(x_domain, b_env_curve)
         lb_dot.set_data([nx], [0])
-        lb_vel_text.set_text(f'v={newton["v"]:.2f}')
 
         # Force arrow on panel B (reconstructed force)
         if lb_arrow[0] is not None:
@@ -469,12 +449,6 @@ def main():
                         help='LMS learning rate (default: 0.15)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Frame limit (default: infinite, required for --save)')
-    parser.add_argument('--pad-center', type=float, default=1.5,
-                        help='Friction pad center position (default: 1.5)')
-    parser.add_argument('--pad-width', type=float, default=1.0,
-                        help='Friction pad width (default: 1.0)')
-    parser.add_argument('--pad-friction', type=float, default=0.3,
-                        help='Friction pad coefficient mu (default: 0.3)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -504,9 +478,6 @@ def main():
         ball_amplitude=1.5,
         ball_lr=args.lr,
         wall_mass=1e6,
-        pad_center=args.pad_center,
-        pad_width=args.pad_width,
-        pad_friction=args.pad_friction,
         interval=50,
         max_frames=args.frames,
     )
