@@ -348,10 +348,10 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             conn.send(('ok',))
 
         elif cmd == 'set_se3_params':
-            k_spatial, quaternions, lr, W_interact = data
+            k_spatial, quaternions, lr, W_interact, accel_alpha = data
             for env in envs:
                 if hasattr(env, 'set_encoder_params'):
-                    env.set_encoder_params(k_spatial, quaternions, lr, W_interact)
+                    env.set_encoder_params(k_spatial, quaternions, lr, W_interact, accel_alpha)
             conn.send(('ok',))
 
         elif cmd == 'close':
@@ -480,10 +480,11 @@ class SubprocVecEnv:
 
     def set_se3_params(self, k_spatial: np.ndarray, quaternions: np.ndarray,
                        lr: np.ndarray,
-                       W_interact: np.ndarray = None) -> None:
+                       W_interact: np.ndarray = None,
+                       accel_alpha: np.ndarray = None) -> None:
         """Sync SE3 encoder parameters to all env subprocesses."""
         for conn in self.parents:
-            conn.send(('set_se3_params', (k_spatial, quaternions, lr, W_interact)))
+            conn.send(('set_se3_params', (k_spatial, quaternions, lr, W_interact, accel_alpha)))
         for conn in self.parents:
             conn.recv()
 
@@ -1292,7 +1293,8 @@ def train(config: dict):
             q = agent.encoder.quaternions.cpu().numpy()
             lr_arr = torch.exp(agent.encoder.log_lr).cpu().numpy()
             w = agent.encoder.W_interact.cpu().numpy()
-        envs.set_se3_params(k, q, lr_arr, w)
+            aa = agent.encoder.log_accel_alpha.cpu().numpy()
+        envs.set_se3_params(k, q, lr_arr, w, aa)
 
     _sync_se3_params()  # initial sync before first rollout
 

@@ -41,6 +41,7 @@ sys.path.insert(0, str(_REPO / "training"))
 
 from se3_field import (
     SE3Encoder,
+    ACCEL_HIST_DIM,
     COEFF_DIM,
     D_AMP,
     N_OBJECTS,
@@ -103,10 +104,14 @@ def evaluate_convergence(
         steady_state: (N_OBJECTS, D_AMP)      — mean over last 25% of window
         object_summary: (N_OBJECTS,)          — final residual per object
         dim_summary: (D_AMP,)                 — final residual per dimension
+        delta_norm_curve: (W, N_OBJECTS)      — mean accel delta norm per step
+        surprise_norm_curve: (W, N_OBJECTS)   — mean accel surprise norm per step
     """
     encoder.eval().to(device)
 
     residual_sum = torch.zeros(window_len, N_OBJECTS, D_AMP, device=device)
+    delta_norm_sum = torch.zeros(window_len, N_OBJECTS, device=device)
+    surprise_norm_sum = torch.zeros(window_len, N_OBJECTS, device=device)
     n_windows = 0
     t0 = time.time()
 
@@ -120,15 +125,17 @@ def evaluate_convergence(
             batch = batch.to(device)                # (B, W, RAW_STATE_DIM)
             B = batch.shape[0]
             coefficients = torch.zeros(B, COEFF_DIM, device=device)
+            accel_hist = torch.zeros(B, ACCEL_HIST_DIM, device=device)
             batch_start = n_windows
 
             for t in range(window_len):
                 t_step = time.time()
                 raw_t = batch[:, t, :]              # (B, RAW_STATE_DIM)
-                packed = torch.cat([raw_t, coefficients], dim=-1)
+                packed = torch.cat([raw_t, coefficients, accel_hist], dim=-1)
 
                 with torch.no_grad():
-                    new_coeff, basis_cos, basis_sin, _, coeff_5d = \
+                    (new_coeff, basis_cos, basis_sin, _, coeff_5d,
+                     accel_delta, accel_surprise, new_accel_hist) = \
                         encoder._update_coefficients(packed)
 
                 targets   = build_amplitude_targets(raw_t)
@@ -136,11 +143,16 @@ def evaluate_convergence(
                 step_residual = (targets - predicted).pow(2)    # (B, N_OBJECTS, D_AMP)
                 residual_sum[t] += step_residual.mean(dim=0)
 
+                # Track momentum signal norms
+                delta_norm_sum[t] += accel_delta.norm(dim=-1).mean(dim=0)      # (N_OBJECTS,)
+                surprise_norm_sum[t] += accel_surprise.norm(dim=-1).mean(dim=0)
+
                 coefficients = new_coeff.detach()
+                accel_hist = new_accel_hist.detach()
 
                 step_ms = (time.time() - t_step) * 1000
                 print(
-                    f"  windows {batch_start + 1}–{batch_start + B}/{max_windows}"
+                    f"  windows {batch_start + 1}\u2013{batch_start + B}/{max_windows}"
                     f"  step {t + 1}/{window_len}"
                     f"  mse={step_residual.mean().item():.6f}"
                     f"  ({step_ms:.2f}ms)"
@@ -151,7 +163,7 @@ def evaluate_convergence(
             print(f"  [{n_windows}/{max_windows}] windows processed ({elapsed:.1f}s)")
 
     if n_windows == 0:
-        raise ValueError("No trajectory windows found — check --data-dir.")
+        raise ValueError("No trajectory windows found \u2014 check --data-dir.")
 
     residual_curve = (residual_sum / n_windows).cpu().numpy().astype(np.float32)
     final_residual = residual_curve[-1]
@@ -165,6 +177,10 @@ def evaluate_convergence(
         if len(below) > 0:
             convergence_step[obj] = below[0]
 
+    # Momentum signal curves
+    delta_norm_curve = (delta_norm_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
+    surprise_norm_curve = (surprise_norm_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
+
     return {
         "residual_curve": residual_curve,
         "final_residual": final_residual,
@@ -172,6 +188,8 @@ def evaluate_convergence(
         "steady_state": steady_state,
         "object_summary": final_residual.mean(axis=-1),
         "dim_summary": final_residual.mean(axis=0),
+        "delta_norm_curve": delta_norm_curve,       # (W, N_OBJECTS)
+        "surprise_norm_curve": surprise_norm_curve,  # (W, N_OBJECTS)
         "n_windows": n_windows,
         "window_len": window_len,
     }
@@ -191,6 +209,7 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
     print(f"\n{'=' * 60}")
     print(header)
     print(f"{'=' * 60}")
+    steady_start = int(W * 0.75)
     print(f"Windows evaluated: {n}")
     print(f"Window length: {W} steps")
 
@@ -213,6 +232,16 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
         name = OBJECTS[obj]
         print(f"  {name:<12s} {ss[obj].mean():.6f}")
 
+    # Action momentum signals
+    if "delta_norm_curve" in results:
+        print(f"\nAction Momentum (mean norm, last 25% of window):")
+        delta_ss = results["delta_norm_curve"][steady_start:].mean(axis=0)
+        surprise_ss = results["surprise_norm_curve"][steady_start:].mean(axis=0)
+        print(f"  {'object':<12s} {'delta':>8s} {'surprise':>10s}")
+        for obj in range(N_OBJECTS):
+            name = OBJECTS[obj]
+            print(f"  {name:<12s} {delta_ss[obj]:8.6f} {surprise_ss[obj]:10.6f}")
+
     overall = results["final_residual"].mean()
     n_converged = (results["convergence_step"] < W).sum()
     print(
@@ -233,7 +262,7 @@ def save_plot(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("matplotlib not installed — skipping plot")
+        print("matplotlib not installed \u2014 skipping plot")
         return
 
     curve = results["residual_curve"]   # (W, N_OBJECTS, D_AMP)

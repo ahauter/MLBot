@@ -4,13 +4,13 @@ SE3 Gymnasium Environment
 Wraps rlgym-sim as a gymnasium.Env for SE(3) spectral field training.
 
 The env maintains SE3 field state (coefficients) internally and produces
-SE3_OBS_DIM-dim observations: [raw_state (74) | coefficients (1080)].
+SE3_OBS_DIM-dim observations: [raw_state (74) | coefficients (1080) | accel_hist (90)].
 
 The SE3Encoder in the algorithm recomputes the coefficient update
 differentiably during training.  The env's numpy update is used only
 during rollout collection (no grad needed).
 
-Observation: (1154,) float32
+Observation: (1244,) float32
 Action:      (8,)    float32 — 5 analog [-1,1] + 3 binary (threshold 0.5)
 """
 from __future__ import annotations
@@ -35,7 +35,9 @@ from encoder import (
 )
 from se3_field import (
     SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, N_OBJECTS, K, D_AMP,
-    make_initial_coefficients, update_coefficients_np,
+    ACCEL_HIST_DIM,
+    make_initial_coefficients, update_coefficients_with_hist_np,
+    make_initial_accel_hist,
     pack_observation, euler_to_quaternion_batch,
     _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF,
     _PREV_VEL_OFF, _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
@@ -94,6 +96,7 @@ class SE3GymEnv(gym.Env):
 
         # SE3 field state (blue / agent perspective)
         self._coefficients: np.ndarray = make_initial_coefficients()
+        self._accel_hist: np.ndarray = make_initial_accel_hist()
         self._prev_ball_vel = _zero_vel3()
         self._prev_ego_vel = _zero_vel3()
         self._prev_opp_vel = _zero_vel3()
@@ -108,6 +111,7 @@ class SE3GymEnv(gym.Env):
 
         # SE3 field state (orange / opponent perspective)
         self._orange_coefficients: np.ndarray = make_initial_coefficients()
+        self._orange_accel_hist: np.ndarray = make_initial_accel_hist()
         self._orange_prev_ball_vel = _zero_vel3()
         self._orange_prev_ego_vel = _zero_vel3()
         self._orange_prev_opp_vel = _zero_vel3()
@@ -127,16 +131,20 @@ class SE3GymEnv(gym.Env):
         self._quaternions /= np.maximum(norms, 1e-8)
         self._lr: np.ndarray = np.full(N_OBJECTS, 0.05, dtype=np.float32)
         self._W_interact: np.ndarray = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
+        self._accel_alpha: Optional[np.ndarray] = None
 
     def set_encoder_params(self, k_spatial: np.ndarray, quaternions: np.ndarray,
                            lr: np.ndarray,
-                           W_interact: Optional[np.ndarray] = None) -> None:
+                           W_interact: Optional[np.ndarray] = None,
+                           accel_alpha: Optional[np.ndarray] = None) -> None:
         """Sync encoder parameters from the algorithm (called periodically)."""
         self._k_spatial = k_spatial.copy()
         self._quaternions = quaternions.copy()
         self._lr = lr.copy()
         if W_interact is not None:
             self._W_interact = W_interact.copy()
+        if accel_alpha is not None:
+            self._accel_alpha = accel_alpha.copy()
 
     def reset(
         self,
@@ -154,6 +162,7 @@ class SE3GymEnv(gym.Env):
 
         # Reset field state
         self._coefficients = make_initial_coefficients()
+        self._accel_hist = make_initial_accel_hist()
         self._prev_ball_vel = _zero_vel3()
         self._prev_ego_vel = _zero_vel3()
         self._prev_opp_vel = _zero_vel3()
@@ -167,6 +176,7 @@ class SE3GymEnv(gym.Env):
 
         # Reset orange field state
         self._orange_coefficients = make_initial_coefficients()
+        self._orange_accel_hist = make_initial_accel_hist()
         self._orange_prev_ball_vel = _zero_vel3()
         self._orange_prev_ego_vel = _zero_vel3()
         self._orange_prev_opp_vel = _zero_vel3()
@@ -184,7 +194,7 @@ class SE3GymEnv(gym.Env):
             self._prev_ball_ang_vel, self._prev_ego_ang_vel, self._prev_opp_ang_vel,
             self._prev_ego_scalars, self._prev_opp_scalars,
             self._prev_ego_euler, self._prev_opp_euler)
-        obs = pack_observation(raw_state, self._coefficients)
+        obs = pack_observation(raw_state, self._coefficients, self._accel_hist)
 
         # Cache orange obs
         orange_raw = self._token_obs_to_raw_state(
@@ -194,7 +204,7 @@ class SE3GymEnv(gym.Env):
             self._orange_prev_opp_ang_vel,
             self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
             self._orange_prev_ego_euler, self._orange_prev_opp_euler)
-        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients, self._orange_accel_hist)
 
         return obs, {}
 
@@ -216,15 +226,16 @@ class SE3GymEnv(gym.Env):
             self._prev_ego_scalars, self._prev_opp_scalars,
             self._prev_ego_euler, self._prev_opp_euler)
 
-        # Update coefficients (numpy, no grad)
-        self._coefficients = update_coefficients_np(
+        # Update coefficients and accel history (numpy, no grad)
+        self._coefficients, self._accel_hist = update_coefficients_with_hist_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._coefficients, raw_state, W_interact=self._W_interact)
+            self._coefficients, raw_state, self._accel_hist,
+            W_interact=self._W_interact, accel_alpha=self._accel_alpha)
 
         # Cache prev state for next step
         self._cache_prev_state(raw_state, blue_obs, is_orange=False)
 
-        obs = pack_observation(raw_state, self._coefficients)
+        obs = pack_observation(raw_state, self._coefficients, self._accel_hist)
 
         # Update orange perspective
         orange_raw = self._token_obs_to_raw_state(
@@ -234,11 +245,12 @@ class SE3GymEnv(gym.Env):
             self._orange_prev_opp_ang_vel,
             self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
             self._orange_prev_ego_euler, self._orange_prev_opp_euler)
-        self._orange_coefficients = update_coefficients_np(
+        self._orange_coefficients, self._orange_accel_hist = update_coefficients_with_hist_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._orange_coefficients, orange_raw, W_interact=self._W_interact)
+            self._orange_coefficients, orange_raw, self._orange_accel_hist,
+            W_interact=self._W_interact, accel_alpha=self._accel_alpha)
         self._cache_prev_state(orange_raw, orange_obs, is_orange=True)
-        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients, self._orange_accel_hist)
 
         blue_reward = float(rewards[0])
         timed_out = self._step_count >= self.max_steps
@@ -280,11 +292,12 @@ class SE3GymEnv(gym.Env):
             self._prev_ball_ang_vel, self._prev_ego_ang_vel, self._prev_opp_ang_vel,
             self._prev_ego_scalars, self._prev_opp_scalars,
             self._prev_ego_euler, self._prev_opp_euler)
-        self._coefficients = update_coefficients_np(
+        self._coefficients, self._accel_hist = update_coefficients_with_hist_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._coefficients, raw_state, W_interact=self._W_interact)
+            self._coefficients, raw_state, self._accel_hist,
+            W_interact=self._W_interact, accel_alpha=self._accel_alpha)
         self._cache_prev_state(raw_state, blue_obs, is_orange=False)
-        obs = pack_observation(raw_state, self._coefficients)
+        obs = pack_observation(raw_state, self._coefficients, self._accel_hist)
 
         orange_raw = self._token_obs_to_raw_state(
             orange_obs, self._orange_prev_ball_vel,
@@ -293,11 +306,12 @@ class SE3GymEnv(gym.Env):
             self._orange_prev_opp_ang_vel,
             self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
             self._orange_prev_ego_euler, self._orange_prev_opp_euler)
-        self._orange_coefficients = update_coefficients_np(
+        self._orange_coefficients, self._orange_accel_hist = update_coefficients_with_hist_np(
             self._k_spatial, self._quaternions, self._lr,
-            self._orange_coefficients, orange_raw, W_interact=self._W_interact)
+            self._orange_coefficients, orange_raw, self._orange_accel_hist,
+            W_interact=self._W_interact, accel_alpha=self._accel_alpha)
         self._cache_prev_state(orange_raw, orange_obs, is_orange=True)
-        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
+        self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients, self._orange_accel_hist)
 
         blue_reward = float(rewards[0])
         timed_out = self._step_count >= self.max_steps

@@ -35,6 +35,7 @@ from se3_field import (
     _PREV_ANG_VEL_OFF, _PREV_EGO_ANG_VEL_OFF, _PREV_OPP_ANG_VEL_OFF,
     _PREV_SCALARS_OFF, _PREV_OPP_SCALARS_OFF,
     D_FIELD, D_OUTER, CONV_OUT, CONTEXT_DIM,
+    ACCEL_HIST_DIM, ACCEL_CTX_DIM, make_initial_accel_hist,
 )
 from se3_policy import SE3Policy, StochasticSE3Policy
 
@@ -134,24 +135,27 @@ class TestContactDetection:
 class TestSE3Encoder:
 
     def test_forward_shape(self):
-        """forward() returns (batch, COEFF_DIM=1080)."""
+        """forward() returns (coeff (batch, COEFF_DIM), accel_hist (batch, ACCEL_HIST_DIM))."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
-        out = encoder(obs)
-        assert out.shape == (4, COEFF_DIM), f"Expected (4, {COEFF_DIM}), got {out.shape}"
+        coeff, accel_hist = encoder(obs)
+        assert coeff.shape == (4, COEFF_DIM), f"Expected (4, {COEFF_DIM}), got {coeff.shape}"
+        assert accel_hist.shape == (4, ACCEL_HIST_DIM), \
+            f"Expected (4, {ACCEL_HIST_DIM}), got {accel_hist.shape}"
 
     def test_forward_single(self):
-        """forward() returns (1, COEFF_DIM)."""
+        """forward() returns (coeff (1, COEFF_DIM), accel_hist (1, ACCEL_HIST_DIM))."""
         encoder = SE3Encoder()
         obs = torch.randn(1, SE3_OBS_DIM)
-        out = encoder(obs)
-        assert out.shape == (1, COEFF_DIM)
+        coeff, accel_hist = encoder(obs)
+        assert coeff.shape == (1, COEFF_DIM)
+        assert accel_hist.shape == (1, ACCEL_HIST_DIM)
 
     def test_gradient_flows_to_k_spatial(self):
         """Backprop from output reaches k_spatial."""
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
-        out = encoder(obs)
+        out, _ = encoder(obs)
         loss = out.sum()
         loss.backward()
         assert encoder.k_spatial.grad is not None
@@ -161,7 +165,7 @@ class TestSE3Encoder:
         """Backprop from output reaches quaternion params."""
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
-        out = encoder(obs)
+        out, _ = encoder(obs)
         loss = out.sum()
         loss.backward()
         assert encoder.quaternions.grad is not None
@@ -171,7 +175,7 @@ class TestSE3Encoder:
         """Backprop from output reaches log_lr."""
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
-        out = encoder(obs)
+        out, _ = encoder(obs)
         loss = out.sum()
         loss.backward()
         assert encoder.log_lr.grad is not None
@@ -191,7 +195,7 @@ class TestSE3Encoder:
         obs[0, RAW_STATE_DIM:RAW_STATE_DIM + ball_coeff_size] = 1.0
 
         with torch.no_grad():
-            out = encoder(obs)
+            out, _ = encoder(obs)
 
         # Ball coefficients should be zero after contact reset
         ball_coeff = out[0, :ball_coeff_size]
@@ -245,17 +249,32 @@ class TestCoefficientHelpers:
         raw[_EGO_OFF + 6:_EGO_OFF + 10] = [1.0, 0.0, 0.0, 0.0]  # ego quat
         raw[_OPP_OFF + 6:_OPP_OFF + 10] = [1.0, 0.0, 0.0, 0.0]  # opp quat
 
-        new_coeff = update_coefficients_np(k, q, lr, coeff, raw)
+        new_coeff, accel_res = update_coefficients_np(k, q, lr, coeff, raw)
         assert new_coeff.shape == (COEFF_DIM,)
         assert not np.allclose(new_coeff, coeff), "Coefficients should change"
+        assert accel_res.shape == (N_OBJECTS, D_AMP)
 
     def test_pack_observation(self):
         raw = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         coeff = make_initial_coefficients()
-        packed = pack_observation(raw, coeff)
+        accel_hist = make_initial_accel_hist()
+        packed = pack_observation(raw, coeff, accel_hist)
         assert packed.shape == (SE3_OBS_DIM,)
         np.testing.assert_array_equal(packed[:RAW_STATE_DIM], raw)
-        np.testing.assert_array_equal(packed[RAW_STATE_DIM:], coeff)
+        np.testing.assert_array_equal(
+            packed[RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM], coeff)
+        np.testing.assert_array_equal(
+            packed[RAW_STATE_DIM + COEFF_DIM:], accel_hist)
+
+    def test_pack_observation_default_accel_hist(self):
+        """pack_observation with no accel_hist arg uses zeros."""
+        raw = np.zeros(RAW_STATE_DIM, dtype=np.float32)
+        coeff = make_initial_coefficients()
+        packed = pack_observation(raw, coeff)
+        assert packed.shape == (SE3_OBS_DIM,)
+        np.testing.assert_array_equal(
+            packed[RAW_STATE_DIM + COEFF_DIM:],
+            np.zeros(ACCEL_HIST_DIM, dtype=np.float32))
 
 
 # ── Math correctness tests ────────────────────────────────────────────────────
@@ -302,12 +321,13 @@ class TestSpectralMath:
             lr_np = np.exp(encoder.log_lr.numpy())
 
         # Numpy update
-        coeff_np = update_coefficients_np(k_np, q_norm, lr_np, coeff0, raw)
+        coeff_np, _ = update_coefficients_np(k_np, q_norm, lr_np, coeff0, raw)
 
         # PyTorch update
         obs = torch.tensor(pack_observation(raw, coeff0), dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            coeff_pt = encoder(obs)[0].numpy()
+            coeff_pt, _ = encoder(obs)
+            coeff_pt = coeff_pt[0].numpy()
 
         np.testing.assert_allclose(
             coeff_pt, coeff_np, atol=1e-5,
@@ -359,7 +379,7 @@ class TestSpectralMath:
         res_before = residual_real(coeff, obj=0)
 
         for _ in range(200):
-            coeff = update_coefficients_np(k, q, lr, coeff, raw)
+            coeff, _ = update_coefficients_np(k, q, lr, coeff, raw)
 
         res_after = residual_real(coeff, obj=0)
         assert res_after < res_before, (
@@ -395,7 +415,7 @@ class TestSpectralMath:
         res_before = complex_residual(coeff)
 
         for _ in range(200):
-            coeff = update_coefficients_np(k, q, lr, coeff, raw)
+            coeff, _ = update_coefficients_np(k, q, lr, coeff, raw)
 
         res_after = complex_residual(coeff)
         assert res_after < res_before or res_before < 1e-6, (
@@ -408,14 +428,14 @@ class TestSpectralMath:
 
         # Give all coefficients a non-zero prev value
         obs = torch.zeros(1, SE3_OBS_DIM)
-        obs[0, RAW_STATE_DIM:] = 1.0  # all prev coefficients = 1
+        obs[0, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM] = 1.0  # all prev coefficients = 1
 
         # Trigger contact: large velocity change on ball
         obs[0, _BALL_OFF + 3] = 10.0   # ball vx (current)
         # prev_ball_vel at _PREV_VEL_OFF stays 0 → huge Δv/dt → contact
 
         with torch.no_grad():
-            out = encoder(obs)
+            out, _ = encoder(obs)
 
         coeff = out[0].reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
 
@@ -434,8 +454,9 @@ class TestSpectralMath:
         encoder.eval()
         obs = torch.zeros(1, SE3_OBS_DIM)
         with torch.no_grad():
-            out = encoder(obs)
+            out, accel_hist = encoder(obs)
         assert torch.isfinite(out).all(), "Forward pass on zero state must be finite"
+        assert torch.isfinite(accel_hist).all(), "Accel hist must be finite"
 
     def test_parity_with_nonzero_prev_coefficients(self):
         """Parity holds when starting from non-zero coefficients (not just episode start)."""
@@ -453,11 +474,12 @@ class TestSpectralMath:
             k_np = encoder.k_spatial.numpy()
             lr_np = np.exp(encoder.log_lr.numpy())
 
-        coeff_np = update_coefficients_np(k_np, q_norm, lr_np, coeff0, raw)
+        coeff_np, _ = update_coefficients_np(k_np, q_norm, lr_np, coeff0, raw)
 
         obs = torch.tensor(pack_observation(raw, coeff0), dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            coeff_pt = encoder(obs)[0].numpy()
+            coeff_pt, _ = encoder(obs)
+            coeff_pt = coeff_pt[0].numpy()
 
         np.testing.assert_allclose(
             coeff_pt, coeff_np, atol=1e-5,
@@ -878,9 +900,9 @@ class TestCoefficientClipping:
         encoder = SE3Encoder()
         # Feed large prev-coefficients to trigger clipping
         obs = torch.randn(2, SE3_OBS_DIM)
-        obs[:, RAW_STATE_DIM:] = 50.0  # way above clip bound
+        obs[:, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM] = 50.0  # way above clip bound
         with torch.no_grad():
-            out = encoder(obs)
+            out, _ = encoder(obs)
         assert out.max().item() <= COEFF_CLIP + 1e-6
         assert out.min().item() >= -COEFF_CLIP - 1e-6
 
@@ -894,7 +916,7 @@ class TestCoefficientClipping:
         # Large prev coefficients
         prev_coeff = np.full(COEFF_DIM, 50.0, dtype=np.float32)
         raw = np.random.randn(RAW_STATE_DIM).astype(np.float32) * 0.5
-        out = update_coefficients_np(k_sp, quats, lr, prev_coeff, raw)
+        out, _ = update_coefficients_np(k_sp, quats, lr, prev_coeff, raw)
         assert out.max() <= COEFF_CLIP + 1e-6
         assert out.min() >= -COEFF_CLIP - 1e-6
 
@@ -902,7 +924,7 @@ class TestCoefficientClipping:
         """Gradients flow through clamp for in-range values."""
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM, requires_grad=False)
-        out = encoder(obs)
+        out, _ = encoder(obs)
         loss = out.sum()
         loss.backward()
         assert encoder.k_spatial.grad is not None
@@ -935,18 +957,20 @@ class TestComplexCoupling:
         """Setting coeff_imag != 0 should change position prediction vs imag=0."""
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
-        # Zero all prev coefficients
+        # Zero all prev coefficients and accel hist
         obs[:, RAW_STATE_DIM:] = 0.0
         with torch.no_grad():
-            out_zero = encoder(obs).clone()
+            out_zero, _ = encoder(obs)
+            out_zero = out_zero.clone()
 
         # Set imaginary coefficients to nonzero
         obs2 = obs.clone()
-        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, D_AMP, N_CHANNELS)
+        prev = obs2[:, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM].reshape(
+            2, N_OBJECTS, K, D_AMP, N_CHANNELS)
         prev[:, :, :, :, 1] = 0.5  # imag channel
-        obs2[:, RAW_STATE_DIM:] = prev.reshape(2, -1)
+        obs2[:, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM] = prev.reshape(2, -1)
         with torch.no_grad():
-            out_imag = encoder(obs2)
+            out_imag, _ = encoder(obs2)
 
         # Outputs should differ because sin basis × imag contributes to Re[f]
         assert not torch.allclose(out_zero, out_imag, atol=1e-6), \
@@ -1018,9 +1042,9 @@ class TestWInteract:
         prev = np.random.randn(COEFF_DIM).astype(np.float32) * 0.1
         raw = self._make_raw_state()
 
-        out_none = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=None)
+        out_none, _ = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=None)
         W_zero = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
-        out_zero = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
+        out_zero, _ = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
 
         np.testing.assert_allclose(out_none, out_zero, atol=1e-6,
                                    err_msg="W_interact=0 should match W_interact=None")
@@ -1035,10 +1059,10 @@ class TestWInteract:
         raw = self._make_raw_state()
 
         W_zero = np.zeros((N_OBJECTS, N_OBJECTS), dtype=np.float32)
-        out_zero = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
+        out_zero, _ = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_zero)
 
         W_nonzero = np.random.randn(N_OBJECTS, N_OBJECTS).astype(np.float32) * 0.1
-        out_coupled = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_nonzero)
+        out_coupled, _ = update_coefficients_np(k_sp, quats, lr, prev, raw, W_interact=W_nonzero)
 
         assert not np.allclose(out_zero, out_coupled, atol=1e-6), \
             "Non-zero W_interact should change output"
@@ -1047,7 +1071,7 @@ class TestWInteract:
         """Backprop should reach W_interact."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
-        out = encoder(obs)
+        out, _ = encoder(obs)
         loss = out.sum()
         loss.backward()
 
@@ -1091,14 +1115,15 @@ class TestNumpyTorchParity:
         prev_coeff = np.zeros(COEFF_DIM, dtype=np.float32)
 
         # Numpy path
-        np_out = update_coefficients_np(k_sp_np, q_np, lr_np, prev_coeff, raw,
-                                        W_interact=W_np)
+        np_out, _ = update_coefficients_np(k_sp_np, q_np, lr_np, prev_coeff, raw,
+                                           W_interact=W_np)
 
         # Torch path
         obs = pack_observation(raw, prev_coeff)
         obs_t = torch.from_numpy(obs).unsqueeze(0)
         with torch.no_grad():
-            torch_out = encoder(obs_t).squeeze(0).numpy()
+            torch_out, _ = encoder(obs_t)
+            torch_out = torch_out.squeeze(0).numpy()
 
         np.testing.assert_allclose(np_out, torch_out, atol=1e-4,
                                    err_msg="Numpy and torch complex update should match")
@@ -1280,6 +1305,7 @@ class TestPhysicsConvergence:
 
         for epoch in range(n_epochs):
             coeff = torch.zeros(1, COEFF_DIM)
+            accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
             total_loss = torch.tensor(0.0)
             n_pred = 0
 
@@ -1288,10 +1314,11 @@ class TestPhysicsConvergence:
                 # letting gradients flow through short temporal windows
                 if t % bptt_len == 0 and t > 0:
                     coeff = coeff.detach()
+                    accel_hist = accel_hist.detach()
 
                 raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
-                obs = torch.cat([raw_t, coeff], dim=1)
-                coeff = encoder(obs)
+                obs = torch.cat([raw_t, coeff, accel_hist], dim=1)
+                coeff, accel_hist = encoder(obs)
 
                 # Next-step prediction: how well do coeff[t] predict pos[t+1]?
                 if t < len(raw_states) - 1:
@@ -1332,13 +1359,14 @@ class TestPhysicsConvergence:
 
         for _ in range(30):
             coeff = torch.zeros(1, COEFF_DIM)
+            accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
             total_loss = torch.tensor(0.0)
             n_pred = 0
 
             for t in range(len(raw_states)):
                 raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
-                obs = torch.cat([raw_t, coeff.detach()], dim=1)
-                coeff = encoder(obs)
+                obs = torch.cat([raw_t, coeff.detach(), accel_hist.detach()], dim=1)
+                coeff, accel_hist = encoder(obs)
 
                 if t < len(raw_states) - 1:
                     pos_next = torch.from_numpy(positions[t + 1]).unsqueeze(0)
@@ -1370,14 +1398,16 @@ class TestPhysicsConvergence:
 
         for _ in range(n_epochs):
             coeff = torch.zeros(1, COEFF_DIM)
+            accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
             total_loss = torch.tensor(0.0)
             n_pred = 0
             for t in range(len(raw_states)):
                 if t % 8 == 0 and t > 0:
                     coeff = coeff.detach()
+                    accel_hist = accel_hist.detach()
                 raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
-                obs = torch.cat([raw_t, coeff], dim=1)
-                coeff = encoder(obs)
+                obs = torch.cat([raw_t, coeff, accel_hist], dim=1)
+                coeff, accel_hist = encoder(obs)
                 if t < len(raw_states) - 1:
                     pos_next = torch.from_numpy(positions[t + 1]).unsqueeze(0)
                     total_loss = total_loss + self._reconstruction_mse(
@@ -1409,11 +1439,12 @@ class TestPhysicsConvergence:
         # Roll encoder forward, saving coefficients at each step
         all_coeff = []
         coeff = torch.zeros(1, COEFF_DIM)
+        accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
         with torch.no_grad():
             for t in range(len(raw_states)):
                 raw_t = torch.from_numpy(raw_states[t]).unsqueeze(0)
-                obs = torch.cat([raw_t, coeff], dim=1)
-                coeff = encoder(obs)
+                obs = torch.cat([raw_t, coeff, accel_hist], dim=1)
+                coeff, accel_hist = encoder(obs)
                 all_coeff.append(coeff.clone())
 
         # Measure reconstruction error at each horizon
@@ -1492,18 +1523,20 @@ class TestPhysicsConvergence:
 class TestEncodeForPolicy:
 
     def test_embed_shape(self):
-        """encode_for_policy() returns (batch, EMBED_DIM=26)."""
+        """encode_for_policy() returns (embed (batch, EMBED_DIM=30), coeff, accel_hist)."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
-        embed = encoder.encode_for_policy(obs)
+        embed, coeff, accel_hist = encoder.encode_for_policy(obs)
         assert embed.shape == (4, EMBED_DIM), f"Expected (4, {EMBED_DIM}), got {embed.shape}"
+        assert coeff.shape == (4, COEFF_DIM)
+        assert accel_hist.shape == (4, ACCEL_HIST_DIM)
 
     def test_embed_gradients(self):
         """Gradients from encode_for_policy reach k_spatial, quaternions, W_interact."""
         torch.manual_seed(42)
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
-        embed = encoder.encode_for_policy(obs)
+        embed, _, _ = encoder.encode_for_policy(obs)
         loss = (embed ** 2).sum()
         loss.backward()
         assert encoder.k_spatial.grad is not None
@@ -1520,7 +1553,7 @@ class TestEncodeForPolicy:
         encoder.eval()
         obs = torch.randn(32, SE3_OBS_DIM)
         with torch.no_grad():
-            embed = encoder.encode_for_policy(obs)
+            embed, _, _ = encoder.encode_for_policy(obs)
         # Per-sample mean should be near 0
         sample_means = embed.mean(dim=-1)
         assert sample_means.abs().mean() < 0.5, \
@@ -1532,11 +1565,13 @@ class TestEncodeForPolicy:
         encoder.eval()
         obs = torch.randn(2, SE3_OBS_DIM)
         with torch.no_grad():
-            coeff = encoder(obs)
-            embed = encoder.encode_for_policy(obs)
+            coeff, accel_hist = encoder(obs)
+            embed, coeff_e, accel_hist_e = encoder.encode_for_policy(obs)
         # Both should run without error and produce correct shapes
         assert coeff.shape == (2, COEFF_DIM)
         assert embed.shape == (2, EMBED_DIM)
+        assert accel_hist.shape == (2, ACCEL_HIST_DIM)
+        assert accel_hist_e.shape == (2, ACCEL_HIST_DIM)
 
 
 # ── Acceleration channel tests ──────────────────────────────────────────────
@@ -1554,6 +1589,7 @@ class TestAccelerationChannel:
 
         # Simulate freefall: ball vel changes by exactly GRAVITY_DV_Z per tick
         coeff = torch.zeros(1, COEFF_DIM)
+        accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
         for t in range(50):
             raw = torch.zeros(1, RAW_STATE_DIM)
             # Ball at some position
@@ -1571,9 +1607,9 @@ class TestAccelerationChannel:
             raw[0, _EGO_OFF + 6:_EGO_OFF + 10] = torch.tensor([1, 0, 0, 0.])
             raw[0, _OPP_OFF + 6:_OPP_OFF + 10] = torch.tensor([1, 0, 0, 0.])
 
-            obs = torch.cat([raw, coeff], dim=1)
+            obs = torch.cat([raw, coeff, accel_hist], dim=1)
             with torch.no_grad():
-                coeff = encoder(obs)
+                coeff, accel_hist = encoder(obs)
 
         # Accel channel coefficients (channel 2) for ball should be small
         c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
@@ -1594,17 +1630,18 @@ class TestAccelerationChannel:
         raw[0, _PREV_VEL_OFF] = 0.1  # prev ball vx = same
 
         coeff = torch.zeros(1, COEFF_DIM)
-        obs = torch.cat([raw, coeff], dim=1)
+        accel_hist = torch.zeros(1, ACCEL_HIST_DIM)
+        obs = torch.cat([raw, coeff, accel_hist], dim=1)
         with torch.no_grad():
-            coeff = encoder(obs)
+            coeff, accel_hist = encoder(obs)
 
         # Step 2: sudden impulse on ego
         raw2 = raw.clone()
         raw2[0, _EGO_OFF + 3] = 0.5  # ego vx jumps to 0.5
         raw2[0, _PREV_EGO_VEL_OFF] = 0.0  # prev ego vx was 0
-        obs2 = torch.cat([raw2, coeff], dim=1)
+        obs2 = torch.cat([raw2, coeff, accel_hist], dim=1)
         with torch.no_grad():
-            coeff2 = encoder(obs2)
+            coeff2, _ = encoder(obs2)
 
         c = coeff2.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
         ego_accel = c[_EGO, :, :, 2].abs().mean().item()
@@ -1669,8 +1706,8 @@ class TestLongSimulation:
         n_finite_checks = 0
 
         for t in range(len(raw_states)):
-            coeff = update_coefficients_np(k_np, q_np, lr_np, coeff, raw_states[t],
-                                           W_interact=W_np)
+            coeff, _ = update_coefficients_np(k_np, q_np, lr_np, coeff, raw_states[t],
+                                              W_interact=W_np)
             assert np.isfinite(coeff).all(), f"Non-finite coefficients at step {t}"
             max_coeff_val = max(max_coeff_val, np.abs(coeff).max())
             n_finite_checks += 1
@@ -1770,14 +1807,16 @@ class TestInteractionConvShapes:
             f"Expected ({batch}, {CONV_OUT}), got {out.shape}"
 
     def test_encode_for_policy_full_pipeline(self):
-        """Full encode_for_policy pipeline produces (batch, EMBED_DIM=26)."""
+        """Full encode_for_policy pipeline produces (batch, EMBED_DIM=30)."""
         encoder = SE3Encoder()
         encoder.eval()
         obs = torch.randn(4, SE3_OBS_DIM)
         with torch.no_grad():
-            embed = encoder.encode_for_policy(obs)
+            embed, coeff, accel_hist = encoder.encode_for_policy(obs)
         assert embed.shape == (4, EMBED_DIM)
-        assert EMBED_DIM == CONV_OUT + CONTEXT_DIM == 26
+        assert coeff.shape == (4, COEFF_DIM)
+        assert accel_hist.shape == (4, ACCEL_HIST_DIM)
+        assert EMBED_DIM == CONV_OUT + ACCEL_CTX_DIM + CONTEXT_DIM == 30
 
 
 # ── D_AMP=9 phase computation test ──────────────────────────────────────────
@@ -1833,3 +1872,152 @@ class TestDAmp9Phase:
         for obj in range(N_OBJECTS):
             assert k[obj].shape == (K, D_AMP), \
                 f"Object {obj} k_spatial shape mismatch: {k[obj].shape}"
+
+
+# ── Accel momentum tests ──────────────────────────────────────────────────────
+
+class TestAccelMomentum:
+    """Tests for accel delta/surprise momentum signals."""
+
+    def test_accel_hist_shape(self):
+        """make_initial_accel_hist returns (ACCEL_HIST_DIM,) zeros."""
+        hist = make_initial_accel_hist()
+        assert hist.shape == (ACCEL_HIST_DIM,)
+        assert hist.dtype == np.float32
+        assert np.all(hist == 0.0)
+
+    def _make_raw_state(self, seed: int = 0) -> np.ndarray:
+        """Build a plausible raw state with valid unit quaternions."""
+        rng = np.random.default_rng(seed)
+        raw = rng.uniform(-0.5, 0.5, RAW_STATE_DIM).astype(np.float32)
+        eq = rng.standard_normal(4).astype(np.float32)
+        raw[_EGO_OFF + 6:_EGO_OFF + 10] = eq / np.linalg.norm(eq)
+        oq = rng.standard_normal(4).astype(np.float32)
+        raw[_OPP_OFF + 6:_OPP_OFF + 10] = oq / np.linalg.norm(oq)
+        for i in range(6):
+            raw[_PAD_OFF + i] = np.clip(raw[_PAD_OFF + i], 0.0, 1.0)
+        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 9] = 0.0
+        raw[_PREV_ANG_VEL_OFF:_PREV_ANG_VEL_OFF + 9] = 0.0
+        raw[_PREV_SCALARS_OFF:_PREV_SCALARS_OFF + 6] = 0.0
+        raw[_BALL_OFF + 3:_BALL_OFF + 6] = 0.0
+        return raw
+
+    def _make_encoder_params(self, encoder):
+        """Extract numpy params from encoder."""
+        with torch.no_grad():
+            q = encoder.quaternions
+            q_norm = (q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)).numpy()
+            k_np = encoder.k_spatial.numpy()
+            lr_np = np.exp(encoder.log_lr.numpy())
+        return k_np, q_norm, lr_np
+
+    def test_delta_zero_on_constant_residual(self):
+        """When accel residual is constant across steps, delta approaches 0 after first step."""
+        from se3_field import update_coefficients_with_hist_np
+        encoder = SE3Encoder()
+        encoder.eval()
+        k_np, q_np, lr_np = self._make_encoder_params(encoder)
+
+        raw = self._make_raw_state(seed=10)
+        coeff = make_initial_coefficients()
+        accel_hist = make_initial_accel_hist()
+
+        # Run several steps with the SAME raw state to get constant residual
+        for _ in range(20):
+            coeff, accel_hist = update_coefficients_with_hist_np(
+                k_np, q_np, lr_np, coeff, raw, accel_hist)
+
+        # After convergence on constant state, delta (change in accel residual) should be ~0
+        _half = N_OBJECTS * D_AMP
+        prev_accel_res = accel_hist[:_half].reshape(N_OBJECTS, D_AMP)
+
+        # One more step
+        coeff_new, accel_hist_new = update_coefficients_with_hist_np(
+            k_np, q_np, lr_np, coeff, raw, accel_hist)
+        new_accel_res = accel_hist_new[:_half].reshape(N_OBJECTS, D_AMP)
+
+        delta = np.abs(new_accel_res - prev_accel_res).mean()
+        assert delta < 0.01, (
+            f"Delta should be near 0 on constant residual, got {delta:.6f}")
+
+    def test_surprise_decays_on_constant_residual(self):
+        """When accel residual is constant, surprise decays toward 0 via EMA."""
+        from se3_field import update_coefficients_with_hist_np
+        encoder = SE3Encoder()
+        encoder.eval()
+        k_np, q_np, lr_np = self._make_encoder_params(encoder)
+
+        raw = self._make_raw_state(seed=11)
+        coeff = make_initial_coefficients()
+        accel_hist = make_initial_accel_hist()
+
+        surprises = []
+        for step in range(30):
+            coeff, accel_hist = update_coefficients_with_hist_np(
+                k_np, q_np, lr_np, coeff, raw, accel_hist)
+            _half = N_OBJECTS * D_AMP
+            accel_res = accel_hist[:_half].reshape(N_OBJECTS, D_AMP)
+            accel_ema = accel_hist[_half:].reshape(N_OBJECTS, D_AMP)
+            surprise = np.abs(accel_res - accel_ema).mean()
+            surprises.append(surprise)
+
+        # Surprise at the end should be smaller than at step 5 (after initial transient)
+        assert surprises[-1] < surprises[5] + 1e-6, (
+            f"Surprise should decay: step 5={surprises[5]:.6f}, "
+            f"step {len(surprises)-1}={surprises[-1]:.6f}")
+
+    def test_delta_spikes_on_action_change(self):
+        """When accel residual changes suddenly, delta spikes."""
+        from se3_field import update_coefficients_with_hist_np
+        encoder = SE3Encoder()
+        encoder.eval()
+        k_np, q_np, lr_np = self._make_encoder_params(encoder)
+
+        raw = self._make_raw_state(seed=12)
+        coeff = make_initial_coefficients()
+        accel_hist = make_initial_accel_hist()
+
+        # Run 20 steps with constant state to let things settle
+        for _ in range(20):
+            coeff, accel_hist = update_coefficients_with_hist_np(
+                k_np, q_np, lr_np, coeff, raw, accel_hist)
+
+        _half = N_OBJECTS * D_AMP
+        prev_res = accel_hist[:_half].copy()
+
+        # Now change the state drastically (ego gets a big velocity impulse)
+        raw2 = raw.copy()
+        raw2[_EGO_OFF + 3:_EGO_OFF + 6] = [0.8, -0.5, 0.3]  # big velocity
+        raw2[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = [0.0, 0.0, 0.0]
+
+        coeff_new, accel_hist_new = update_coefficients_with_hist_np(
+            k_np, q_np, lr_np, coeff, raw2, accel_hist)
+        new_res = accel_hist_new[:_half]
+
+        delta = np.abs(new_res - prev_res).mean()
+        assert delta > 1e-4, (
+            f"Delta should spike on sudden state change, got {delta:.6f}")
+
+    def test_gradient_flows_through_delta_proj(self):
+        """Loss on embed -> delta_proj.weight.grad is nonzero."""
+        encoder = SE3Encoder()
+        obs = torch.randn(2, SE3_OBS_DIM)
+        embed, _, _ = encoder.encode_for_policy(obs)
+        loss = (embed ** 2).sum()
+        loss.backward()
+        assert encoder.delta_proj.weight.grad is not None, \
+            "delta_proj should have gradient"
+        assert encoder.delta_proj.weight.grad.abs().sum() > 0, \
+            "delta_proj gradient should be nonzero"
+
+    def test_gradient_flows_through_surprise_proj(self):
+        """Loss on embed -> surprise_proj.weight.grad is nonzero."""
+        encoder = SE3Encoder()
+        obs = torch.randn(2, SE3_OBS_DIM)
+        embed, _, _ = encoder.encode_for_policy(obs)
+        loss = (embed ** 2).sum()
+        loss.backward()
+        assert encoder.surprise_proj.weight.grad is not None, \
+            "surprise_proj should have gradient"
+        assert encoder.surprise_proj.weight.grad.abs().sum() > 0, \
+            "surprise_proj gradient should be nonzero"

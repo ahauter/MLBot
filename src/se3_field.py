@@ -73,12 +73,14 @@ COEFF_CLIP = 10.0                  # clamp coefficients to [-CLIP, CLIP]
 D_FIELD = 16                       # per-object projected field vector
 D_OUTER = 4                        # rank-reduced outer product dimension
 CONV_OUT = 16                      # channels out of interaction conv
+ACCEL_CTX_DIM = 4                  # ego_delta_norm + opp_delta_norm + ego_surprise_norm + opp_surprise_norm
 CONTEXT_DIM = 10                   # ego_boost(1) + game_state(3) + pad_active(6)
-EMBED_DIM = CONV_OUT + CONTEXT_DIM  # 26
+EMBED_DIM = CONV_OUT + ACCEL_CTX_DIM + CONTEXT_DIM  # 30
 
 # Raw state layout (74 dims)
 RAW_STATE_DIM = 74
-SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM  # 1154
+ACCEL_HIST_DIM = 2 * N_OBJECTS * D_AMP  # 90: prev_accel_res(45) + accel_ema(45)
+SE3_OBS_DIM = RAW_STATE_DIM + COEFF_DIM + ACCEL_HIST_DIM  # 1244
 
 # Gravity: normalised per-tick velocity change on z-axis
 # Rocket League gravity ≈ 650 uu/s², MAX_VEL=2300, tick=1/120
@@ -261,6 +263,12 @@ class SE3Encoder(nn.Module):
             nn.AdaptiveAvgPool2d(1),
         )
 
+        # Acceleration momentum projections
+        self.delta_proj = nn.Linear(D_AMP, D_FIELD)      # accel delta → field dim
+        self.surprise_proj = nn.Linear(D_AMP, D_FIELD)   # accel surprise → field dim
+        self.log_accel_alpha = nn.Parameter(              # learned EMA decay per object
+            torch.full((N_OBJECTS,), 0.0))                # sigmoid(0) = 0.5
+
         # LayerNorm on physical summary output
         self.output_norm = nn.LayerNorm(EMBED_DIM)
 
@@ -269,23 +277,31 @@ class SE3Encoder(nn.Module):
         """Output dimensionality for policy (EMBED_DIM)."""
         return EMBED_DIM
 
-    def _update_coefficients(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _update_coefficients(self, packed_obs: torch.Tensor):
         """Core coefficient update with D_AMP=9 amplitude vectors.
 
-        Returns (new_coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d).
+        Returns (new_coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d,
+                 accel_delta, accel_surprise, new_accel_hist).
 
-        new_coeff_flat: (batch, COEFF_DIM=1080) for env persistence
-        basis_cos/sin:  (batch, N_OBJECTS, K) scalar basis per component
-        raw:            (batch, RAW_STATE_DIM=74) parsed raw state
-        new_coeff_5d:   (batch, N_OBJECTS, K, D_AMP, N_CHANNELS) structured coefficients
+        new_coeff_flat:   (batch, COEFF_DIM=1080) for env persistence
+        basis_cos/sin:    (batch, N_OBJECTS, K) scalar basis per component
+        raw:              (batch, RAW_STATE_DIM=74) parsed raw state
+        new_coeff_5d:     (batch, N_OBJECTS, K, D_AMP, N_CHANNELS) structured coefficients
+        accel_delta:      (batch, N_OBJECTS, D_AMP) simple diff of accel residual
+        accel_surprise:   (batch, N_OBJECTS, D_AMP) residual vs EMA prediction
+        new_accel_hist:   (batch, ACCEL_HIST_DIM=90) updated history for env persistence
         """
         batch = packed_obs.shape[0]
         device = packed_obs.device
 
-        # Split raw state and previous coefficients
+        # Split raw state, previous coefficients, and accel history
         raw = packed_obs[:, :RAW_STATE_DIM]                 # (batch, 74)
-        prev_coeff = packed_obs[:, RAW_STATE_DIM:]           # (batch, 1080)
+        prev_coeff = packed_obs[:, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM]  # (batch, 1080)
         prev_coeff = prev_coeff.reshape(batch, N_OBJECTS, K, D_AMP, N_CHANNELS)
+        accel_hist = packed_obs[:, RAW_STATE_DIM + COEFF_DIM:]  # (batch, 90)
+        _half = N_OBJECTS * D_AMP  # 45
+        prev_accel_res = accel_hist[:, :_half].reshape(batch, N_OBJECTS, D_AMP)
+        prev_accel_ema = accel_hist[:, _half:].reshape(batch, N_OBJECTS, D_AMP)
 
         # Effective learning rates (positive via exp)
         lr = torch.exp(self.log_lr).unsqueeze(0)            # (1, N_OBJECTS)
@@ -460,24 +476,45 @@ class SE3Encoder(nn.Module):
         new_coeff = torch.stack([new_coeff_real, new_coeff_imag, new_coeff_accel], dim=-1)
         new_coeff = torch.clamp(new_coeff, -COEFF_CLIP, COEFF_CLIP)
 
-        return new_coeff.reshape(batch, COEFF_DIM), basis_cos, basis_sin, raw, new_coeff
+        # ── Action momentum signals ─────────────────────────────────────
+        # accel_residual here is post-coupling: (batch, N_OBJECTS, D_AMP)
+        # Simple difference: spikes when action changes
+        accel_delta = accel_residual - prev_accel_res
 
-    def forward(self, packed_obs: torch.Tensor) -> torch.Tensor:
+        # EMA with learned per-object decay
+        alpha = torch.sigmoid(self.log_accel_alpha)          # (N_OBJECTS,)
+        alpha_b = alpha.unsqueeze(0).unsqueeze(-1)           # (1, N_OBJECTS, 1)
+        new_accel_ema = alpha_b * accel_residual + (1 - alpha_b) * prev_accel_ema
+        accel_surprise = accel_residual - prev_accel_ema     # spikes vs EMA prediction
+
+        # Pack updated history for env persistence
+        new_accel_hist = torch.cat([
+            accel_residual.reshape(batch, -1),               # becomes prev_accel_res next tick
+            new_accel_ema.reshape(batch, -1),                # persisted EMA state
+        ], dim=-1)                                           # (batch, ACCEL_HIST_DIM)
+
+        return (new_coeff.reshape(batch, COEFF_DIM), basis_cos, basis_sin, raw, new_coeff,
+                accel_delta, accel_surprise, new_accel_hist)
+
+    def forward(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Update coefficients (for env persistence / buffer storage).
 
-        packed_obs: (batch, SE3_OBS_DIM=1154)
-        returns:    (batch, COEFF_DIM=1080) updated coefficients
+        packed_obs: (batch, SE3_OBS_DIM=1244)
+        returns:    (coeff_flat (batch, COEFF_DIM), new_accel_hist (batch, ACCEL_HIST_DIM))
         """
-        coeff_flat, _, _, _, _ = self._update_coefficients(packed_obs)
-        return coeff_flat
+        coeff_flat, _, _, _, _, _, _, new_accel_hist = self._update_coefficients(packed_obs)
+        return coeff_flat, new_accel_hist
 
-    def encode_for_policy(self, packed_obs: torch.Tensor) -> torch.Tensor:
+    def encode_for_policy(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update coefficients and return physical summary via interaction conv.
 
-        packed_obs: (batch, SE3_OBS_DIM=1154)
-        returns:    (batch, EMBED_DIM=26) normalised physical summary
+        packed_obs: (batch, SE3_OBS_DIM=1244)
+        returns:    (embed (batch, EMBED_DIM=30),
+                     coeff_flat (batch, COEFF_DIM=1080),
+                     new_accel_hist (batch, ACCEL_HIST_DIM=90))
         """
-        coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d = self._update_coefficients(packed_obs)
+        (coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d,
+         accel_delta, accel_surprise, new_accel_hist) = self._update_coefficients(packed_obs)
         batch = packed_obs.shape[0]
         device = packed_obs.device
 
@@ -488,13 +525,18 @@ class SE3Encoder(nn.Module):
         # Project to per-object field vectors
         f = self.field_proj(f_flat)                            # (batch, N_OBJECTS, D_FIELD)
 
+        # Project action momentum signals and fuse additively
+        f_delta = self.delta_proj(accel_delta)                 # (batch, N_OBJECTS, D_FIELD)
+        f_surprise = self.surprise_proj(accel_surprise)        # (batch, N_OBJECTS, D_FIELD)
+        f_combined = f + f_delta + f_surprise                  # (batch, N_OBJECTS, D_FIELD)
+
         # Inner product matrix: spectral alignment
-        inner = torch.bmm(f, f.transpose(1, 2))               # (batch, N_OBJECTS, N_OBJECTS)
+        inner = torch.bmm(f_combined, f_combined.transpose(1, 2))  # (batch, N_OBJECTS, N_OBJECTS)
         inner = inner.unsqueeze(1)                             # (batch, 1, 5, 5)
 
         # Rank-reduced outer products
-        left = self.proj_left(f)                               # (batch, N_OBJECTS, D_OUTER)
-        right = self.proj_right(f)                             # (batch, N_OBJECTS, D_OUTER)
+        left = self.proj_left(f_combined)                      # (batch, N_OBJECTS, D_OUTER)
+        right = self.proj_right(f_combined)                    # (batch, N_OBJECTS, D_OUTER)
 
         # Left self-outer: (batch, 5, 5, D_OUTER²)
         left_outer = torch.einsum('bid,bjc->bijdc', left, left)  # (batch, 5, 5, 4, 4)
@@ -513,15 +555,24 @@ class SE3Encoder(nn.Module):
         conv_out = self.interaction_conv(conv_input)
         conv_out = conv_out.squeeze(-1).squeeze(-1)            # (batch, CONV_OUT=16)
 
+        # Action momentum context: per-object norms
+        ego_delta_norm = accel_delta[:, _EGO].norm(dim=-1, keepdim=True)       # (batch, 1)
+        opp_delta_norm = accel_delta[:, _OPP].norm(dim=-1, keepdim=True)       # (batch, 1)
+        ego_surprise_norm = accel_surprise[:, _EGO].norm(dim=-1, keepdim=True) # (batch, 1)
+        opp_surprise_norm = accel_surprise[:, _OPP].norm(dim=-1, keepdim=True) # (batch, 1)
+
         # Context scalars from raw state
         ego_boost_ctx = raw[:, _EGO_OFF + 13:_EGO_OFF + 14]   # (batch, 1)
         game_state = raw[:, _GS_OFF:_GS_OFF + 3]              # (batch, 3)
         pad_active = raw[:, _PAD_OFF:_PAD_OFF + 6]            # (batch, 6)
 
-        # Assemble: CONV_OUT(16) + CONTEXT_DIM(10) = 26
-        embed = torch.cat([conv_out, ego_boost_ctx, game_state, pad_active], dim=-1)
+        # Assemble: CONV_OUT(16) + ACCEL_CTX(4) + CONTEXT(10) = 30
+        embed = torch.cat([conv_out,
+                           ego_delta_norm, opp_delta_norm,
+                           ego_surprise_norm, opp_surprise_norm,
+                           ego_boost_ctx, game_state, pad_active], dim=-1)
 
-        return self.output_norm(embed)
+        return self.output_norm(embed), coeff_flat, new_accel_hist
 
     @torch.no_grad()
     def normalise_quaternions_(self) -> None:
@@ -705,9 +756,58 @@ def update_coefficients_np(
     # Clamp to prevent unbounded growth
     np.clip(coeff, -COEFF_CLIP, COEFF_CLIP, out=coeff)
 
-    return coeff.ravel()
+    return coeff.ravel(), all_accel_residuals
 
 
-def pack_observation(raw_state: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
-    """Pack raw state and coefficients into SE3_OBS_DIM observation."""
-    return np.concatenate([raw_state, coefficients]).astype(np.float32)
+def update_coefficients_with_hist_np(
+    k_spatial: np.ndarray,
+    quaternions: np.ndarray,
+    lr: np.ndarray,
+    prev_coeff: np.ndarray,
+    raw_state: np.ndarray,
+    accel_hist: np.ndarray,
+    W_interact: Optional[np.ndarray] = None,
+    accel_alpha: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Coefficient update + accel momentum history update.
+
+    Returns (new_coeff (COEFF_DIM,), new_accel_hist (ACCEL_HIST_DIM,)).
+    """
+    new_coeff, accel_residual = update_coefficients_np(
+        k_spatial, quaternions, lr, prev_coeff, raw_state, W_interact)
+
+    _half = N_OBJECTS * D_AMP  # 45
+    prev_accel_res = accel_hist[:_half].reshape(N_OBJECTS, D_AMP)
+    prev_accel_ema = accel_hist[_half:].reshape(N_OBJECTS, D_AMP)
+
+    # Simple difference
+    accel_delta = accel_residual - prev_accel_res
+
+    # EMA update
+    if accel_alpha is not None:
+        alpha = 1.0 / (1.0 + np.exp(-accel_alpha))  # sigmoid
+        alpha_r = alpha[:, np.newaxis]  # (N_OBJECTS, 1)
+    else:
+        alpha_r = np.full((N_OBJECTS, 1), 0.5, dtype=np.float32)
+    new_ema = alpha_r * accel_residual + (1.0 - alpha_r) * prev_accel_ema
+    accel_surprise = accel_residual - prev_accel_ema
+
+    new_accel_hist = np.concatenate([
+        accel_residual.ravel(),
+        new_ema.ravel(),
+    ]).astype(np.float32)
+
+    return new_coeff, new_accel_hist
+
+
+def make_initial_accel_hist() -> np.ndarray:
+    """Return zero-initialised accel history (ACCEL_HIST_DIM,)."""
+    return np.zeros(ACCEL_HIST_DIM, dtype=np.float32)
+
+
+def pack_observation(raw_state: np.ndarray, coefficients: np.ndarray,
+                     accel_hist: Optional[np.ndarray] = None) -> np.ndarray:
+    """Pack raw state, coefficients, and accel history into SE3_OBS_DIM observation."""
+    if accel_hist is None:
+        accel_hist = make_initial_accel_hist()
+    return np.concatenate([raw_state, coefficients, accel_hist]).astype(np.float32)

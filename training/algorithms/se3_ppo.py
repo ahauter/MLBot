@@ -27,6 +27,7 @@ sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 from se3_field import (SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM,
+                       ACCEL_HIST_DIM,
                        EMBED_DIM, N_OBJECTS, K, D_AMP, N_CHANNELS, DT, GRAVITY_DV_Z,
                        _BALL_OFF, _EGO_OFF, _OPP_OFF)
 from se3_policy import StochasticSE3Policy
@@ -38,9 +39,9 @@ class SE3PPOAlgorithm(Algorithm):
     """
     PPO-Clip with SE3Encoder (learned field geometry) + StochasticSE3Policy.
 
-    obs_dim = SE3_OBS_DIM = raw_state (74) + prev_coefficients (1080).
-    encoder.encode_for_policy() produces EMBED_DIM (26) policy input.
-    encoder.forward() produces COEFF_DIM (1080) for buffer/env persistence.
+    obs_dim = SE3_OBS_DIM = raw_state (74) + prev_coefficients (1080) + accel_hist (90).
+    encoder.encode_for_policy() produces (EMBED_DIM (30), coeff_flat, new_accel_hist).
+    encoder.forward() produces (coeff_flat (1080), new_accel_hist (90)) for buffer/env persistence.
     """
 
     def __init__(self, config: dict):
@@ -139,7 +140,8 @@ class SE3PPOAlgorithm(Algorithm):
     def _encode(self, obs: np.ndarray) -> torch.Tensor:
         """Encode packed observations → EMBED_DIM physical summary for policy."""
         x = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        return self.encoder.encode_for_policy(x)
+        embed, _coeff, _accel_hist = self.encoder.encode_for_policy(x)
+        return embed
 
     @torch.no_grad()
     def select_action(self, obs: np.ndarray) -> ActionResult:
@@ -190,7 +192,8 @@ class SE3PPOAlgorithm(Algorithm):
         Returns (n, SE3_OBS_DIM) array of imagined observations, n ∈ [0, dream_steps].
         """
         raw = seed_obs[:RAW_STATE_DIM].copy()
-        coeff = seed_obs[RAW_STATE_DIM:].copy()
+        coeff = seed_obs[RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM].copy()
+        accel_hist = seed_obs[RAW_STATE_DIM + COEFF_DIM:].copy()
 
         # (pos_start, pos_end, vel_start, vel_end) for ball, ego, opp
         _moveable = [
@@ -207,11 +210,11 @@ class SE3PPOAlgorithm(Algorithm):
                 raw_next[ps:pe] = raw[ps:pe] + raw[vs:ve] * DT
                 raw_next[ve - 1] += GRAVITY_DV_Z  # gravity on z-velocity
 
-            obs_next = np.concatenate([raw_next, coeff]).astype(np.float32)
+            obs_next = np.concatenate([raw_next, coeff, accel_hist]).astype(np.float32)
 
             # LMS update on extrapolated observation
             obs_t = torch.tensor(obs_next[None], dtype=torch.float32, device=self.device)
-            coeff_t = self.encoder(obs_t)   # (1, COEFF_DIM)
+            coeff_t, new_accel_hist_t = self.encoder(obs_t)   # (1, COEFF_DIM), (1, ACCEL_HIST_DIM)
 
             # Spectral entropy check (use all N_CHANNELS for energy)
             emb = coeff_t.reshape(1, N_OBJECTS, K, D_AMP, N_CHANNELS)
@@ -224,6 +227,7 @@ class SE3PPOAlgorithm(Algorithm):
                 break
 
             coeff = coeff_t.cpu().numpy().ravel()
+            accel_hist = new_accel_hist_t.cpu().numpy().ravel()
             dream_obs.append(obs_next)
             raw = raw_next
 
@@ -268,10 +272,10 @@ class SE3PPOAlgorithm(Algorithm):
                 not_done = torch.tensor(1.0 - flat_dones[_idx], dtype=torch.float32, device=self.device)
 
                 # Encoder output at t: these are the coefficients the policy sees
-                coeff_t = self.encoder(obs_t)  # (N, COEFF_DIM)
+                coeff_t, _ah_diag = self.encoder(obs_t)  # (N, COEFF_DIM), (N, ACCEL_HIST_DIM)
 
                 # Actual next-step coefficients (computed by the env's numpy mirror)
-                coeff_tp1_actual = obs_tp1[:, RAW_STATE_DIM:]  # (N, COEFF_DIM)
+                coeff_tp1_actual = obs_tp1[:, RAW_STATE_DIM:RAW_STATE_DIM + COEFF_DIM]  # (N, COEFF_DIM)
 
                 # Encoder prediction: if we fed obs_tp1's raw state + coeff_t as prev,
                 # how close would it be? This measures tracking quality.
@@ -309,8 +313,8 @@ class SE3PPOAlgorithm(Algorithm):
                         advantages_t.std() + 1e-8)
 
                 # Differentiable encoder forward
-                emb = self.encoder.encode_for_policy(obs_t)  # (mb, EMBED_DIM) for policy
-                coeff_live = self.encoder(obs_t)              # (mb, COEFF_DIM) for entropy
+                emb, _coeff_pol, _ah_pol = self.encoder.encode_for_policy(obs_t)  # (mb, EMBED_DIM) for policy
+                coeff_live, _ah_live = self.encoder(obs_t)    # (mb, COEFF_DIM) for entropy
                 new_log_probs, new_values, entropy = self.policy.evaluate_actions(
                     emb, actions_t)
 
@@ -346,7 +350,7 @@ class SE3PPOAlgorithm(Algorithm):
                     idx = np.random.choice(n_avail, min(n_dream, n_avail), replace=False)
                     dream_t = torch.tensor(
                         dream_obs_np[idx], dtype=torch.float32, device=self.device)
-                    dream_emb = self.encoder.encode_for_policy(dream_t)
+                    dream_emb, _dream_coeff, _dream_ah = self.encoder.encode_for_policy(dream_t)
                     _, dream_log_prob, dream_value, _ = self.policy(dream_emb)
                     dream_adv = dream_value.detach()
                     if dream_adv.numel() > 1:

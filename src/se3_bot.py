@@ -3,8 +3,8 @@ SE3Bot — RLBot Agent using SE(3) Spectral Fields
 =================================================
 Loads SE3Encoder + SE3Policy at startup, then on every tick:
   1. Extract raw state from GamePacket (positions, velocities, ang_vel, Euler→quaternion)
-  2. Pack [raw_state | prev_coefficients] → SE3_OBS_DIM
-  3. SE3Encoder.encode_for_policy → 26-dim physical summary
+  2. Pack [raw_state | prev_coefficients | prev_accel_hist] → SE3_OBS_DIM
+  3. SE3Encoder.encode_for_policy → (embed, coeff, accel_hist)
   4. SE3Policy.forward → 8-float action
   5. Translate to ControllerState
 """
@@ -31,8 +31,9 @@ sys.path.insert(0, str(_REPO / 'training'))
 
 from encoder import FIELD_X, FIELD_Y, CEILING_Z, MAX_VEL, MAX_ANG_VEL, MAX_BOOST, MAX_SCORE, MAX_TIME
 from se3_field import (
-    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM,
-    euler_to_quaternion, make_initial_coefficients, pack_observation,
+    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, ACCEL_HIST_DIM,
+    euler_to_quaternion, make_initial_coefficients, make_initial_accel_hist,
+    pack_observation,
     _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF,
     _PREV_VEL_OFF, _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
     _PREV_ANG_VEL_OFF, _PREV_EGO_ANG_VEL_OFF, _PREV_OPP_ANG_VEL_OFF,
@@ -55,6 +56,7 @@ class SE3Bot(Bot):
         self.encoder: SE3Encoder = None
         self.policy: SE3Policy = None
         self._prev_coeff: np.ndarray = None
+        self._prev_accel_hist: np.ndarray = None
         self._prev_ball_vel: np.ndarray = None
         self._prev_ego_vel: np.ndarray = None
         self._prev_opp_vel: np.ndarray = None
@@ -80,6 +82,7 @@ class SE3Bot(Bot):
         self.policy.eval()
 
         self._prev_coeff = make_initial_coefficients()
+        self._prev_accel_hist = make_initial_accel_hist()
         self._prev_ball_vel = np.zeros(3, dtype=np.float32)
         self._prev_ego_vel = np.zeros(3, dtype=np.float32)
         self._prev_opp_vel = np.zeros(3, dtype=np.float32)
@@ -91,12 +94,13 @@ class SE3Bot(Bot):
 
     def get_output(self, packet: GamePacket) -> ControllerState:
         raw_state = self._extract_raw_state(packet)
-        packed = pack_observation(raw_state, self._prev_coeff)
+        packed = pack_observation(raw_state, self._prev_coeff, self._prev_accel_hist)
 
         with torch.no_grad():
             packed_t = torch.tensor(packed[np.newaxis], dtype=torch.float32)
-            embed = self.encoder.encode_for_policy(packed_t)
-            coeff = self.encoder(packed_t).numpy()[0]
+            embed, coeff_flat, new_accel_hist = self.encoder.encode_for_policy(packed_t)
+            coeff = coeff_flat.numpy()[0]
+            self._prev_accel_hist = new_accel_hist.numpy()[0].copy()
 
         self._prev_coeff = coeff.copy()
         # Cache velocities

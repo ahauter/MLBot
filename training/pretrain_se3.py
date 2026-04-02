@@ -38,9 +38,9 @@ sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 from se3_field import (
-    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, D_AMP,
-    N_OBJECTS, K, N_CHANNELS,
-    make_initial_coefficients, pack_observation,
+    SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, ACCEL_HIST_DIM,
+    D_AMP, N_OBJECTS, K, N_CHANNELS,
+    make_initial_coefficients, make_initial_accel_hist, pack_observation,
     _BALL_OFF, _EGO_OFF, _OPP_OFF,
 )
 from trajectory_dataset import TrajectoryDataset
@@ -172,8 +172,9 @@ def pretrain(args):
             batch_windows = batch_windows.to(device)
             B, W, _ = batch_windows.shape
 
-            # Initialise coefficients to zero
+            # Initialise coefficients and accel history to zero
             coefficients = torch.zeros(B, COEFF_DIM, device=device)
+            accel_hist = torch.zeros(B, ACCEL_HIST_DIM, device=device)
 
             total_loss = torch.tensor(0.0, device=device)
             total_pos = 0.0
@@ -182,10 +183,11 @@ def pretrain(args):
 
             for t in range(W):
                 raw_t = batch_windows[:, t, :]
-                packed = torch.cat([raw_t, coefficients], dim=-1)
+                packed = torch.cat([raw_t, coefficients, accel_hist], dim=-1)
 
                 # Differentiable encoder forward
-                new_coeff, basis_cos, basis_sin, _, coeff_5d = encoder._update_coefficients(packed)
+                (new_coeff, basis_cos, basis_sin, _, coeff_5d,
+                 _, _, new_accel_hist) = encoder._update_coefficients(packed)
 
                 # Reconstruction loss
                 targets = build_amplitude_targets(raw_t)
@@ -205,6 +207,7 @@ def pretrain(args):
 
                 # Detach between steps (truncated BPTT depth 1)
                 coefficients = new_coeff.detach()
+                accel_hist = new_accel_hist.detach()
 
             avg_loss = total_loss / W
             optimizer.zero_grad()
