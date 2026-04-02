@@ -327,9 +327,24 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
         nx = newton['x']
 
-        # Shift ball wavepacket to match Newtonian position
-        delta_b = nx - b_ball.x
-        b_ball.shift(delta_b)
+        # Increment phase: shift wavepacket by velocity * dt each frame.
+        # On bounce frames, decompose into two shifts (to wall + reflection)
+        # so every frequency accumulates the correct total phase theta.
+        if bounced:
+            # Pre-bounce position before reflection
+            if newton['v'] > 0:
+                # Bounced off left wall, now moving right
+                wall_pos = wall_left
+            else:
+                # Bounced off right wall, now moving left
+                wall_pos = wall_right
+            delta_to_wall = wall_pos - b_ball.x
+            delta_from_wall = nx - wall_pos
+            b_ball.shift(delta_to_wall)
+            b_ball.shift(delta_from_wall)
+        else:
+            delta_b = nx - b_ball.x
+            b_ball.shift(delta_b)
         b_ball.x = nx
 
         # LMS: learn wall field from bounce contact positions
