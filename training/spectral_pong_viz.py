@@ -31,6 +31,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, FancyBboxPatch
 from matplotlib.animation import FuncAnimation
+from matplotlib.gridspec import GridSpecFromSubplotSpec
 
 # -- constants ----------------------------------------------------------------
 
@@ -280,6 +281,10 @@ class SimpleRLController:
         self.gamma = gamma
         self.std = std
         self._reset_traces()
+        # Diagnostics (updated each act() call)
+        self.last_h1 = np.zeros(hidden_dim)
+        self.last_mean = 0.0
+        self.last_action = 0.0
 
     def _reset_traces(self) -> None:
         self.trace_W1 = np.zeros_like(self.W1)
@@ -336,6 +341,11 @@ class SimpleRLController:
         # Weight decay — prevent tanh saturation
         self.W1 *= self.WEIGHT_DECAY
         self.W2 *= self.WEIGHT_DECAY
+
+        # Store diagnostics for debug display
+        self.last_h1 = h1.copy()
+        self.last_mean = mean
+        self.last_action = action
 
         return action
 
@@ -450,20 +460,44 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- figure layout --------------------------------------------------------
     # Layout:  Y-domain (left) | X-domain (top-right)
     #                          | Court    (bottom-right)
-    fig = plt.figure(figsize=(15, 9))
-    fig.patch.set_facecolor(BG_COLOR)
-    fig.suptitle('Spectral Pong — 2D Amplitude Wavepackets',
-                 color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
+    #          [Debug strip — only when spectral_paddle]
+    if spectral_paddle:
+        fig = plt.figure(figsize=(15, 11))
+        fig.patch.set_facecolor(BG_COLOR)
+        fig.suptitle('Spectral Pong — 2D Amplitude Wavepackets',
+                     color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
+        gs = fig.add_gridspec(3, 2, width_ratios=[1, 3],
+                              height_ratios=[1, 2, 0.6],
+                              hspace=0.3, wspace=0.2,
+                              left=0.06, right=0.97, top=0.93, bottom=0.04)
+        ax_y = fig.add_subplot(gs[0:2, 0])
+        ax_x = fig.add_subplot(gs[0, 1])
+        ax_court = fig.add_subplot(gs[1, 1])
 
-    gs = fig.add_gridspec(2, 2, width_ratios=[1, 3], height_ratios=[1, 2],
-                          hspace=0.25, wspace=0.2,
-                          left=0.06, right=0.97, top=0.93, bottom=0.05)
+        # Debug strip: [input heatmap | L hidden | L out | R hidden | R out]
+        gs_dbg = GridSpecFromSubplotSpec(
+            1, 5, subplot_spec=gs[2, :],
+            width_ratios=[4, 2, 1, 2, 1], wspace=0.4)
+        ax_input = fig.add_subplot(gs_dbg[0, 0])
+        ax_hid_l = fig.add_subplot(gs_dbg[0, 1])
+        ax_out_l = fig.add_subplot(gs_dbg[0, 2])
+        ax_hid_r = fig.add_subplot(gs_dbg[0, 3])
+        ax_out_r = fig.add_subplot(gs_dbg[0, 4])
+        debug_axes = [ax_input, ax_hid_l, ax_out_l, ax_hid_r, ax_out_r]
+    else:
+        fig = plt.figure(figsize=(15, 9))
+        fig.patch.set_facecolor(BG_COLOR)
+        fig.suptitle('Spectral Pong — 2D Amplitude Wavepackets',
+                     color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
+        gs = fig.add_gridspec(2, 2, width_ratios=[1, 3], height_ratios=[1, 2],
+                              hspace=0.25, wspace=0.2,
+                              left=0.06, right=0.97, top=0.93, bottom=0.05)
+        ax_y = fig.add_subplot(gs[:, 0])
+        ax_x = fig.add_subplot(gs[0, 1])
+        ax_court = fig.add_subplot(gs[1, 1])
+        debug_axes = []
 
-    ax_y = fig.add_subplot(gs[:, 0])   # Y-domain (left, full height)
-    ax_x = fig.add_subplot(gs[0, 1])   # X-domain (top-right)
-    ax_court = fig.add_subplot(gs[1, 1])  # Court (bottom-right)
-
-    for ax in [ax_y, ax_x, ax_court]:
+    for ax in [ax_y, ax_x, ax_court] + debug_axes:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
@@ -562,6 +596,82 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     frame_text = ax_court.text(0.98, 0.02, '', transform=ax_court.transAxes,
                                color='#555', fontsize=8,
                                horizontalalignment='right')
+
+    # -- debug strip artists (only when spectral_paddle) ----------------------
+    debug_heatmap = None
+    debug_bars_l = []
+    debug_bars_r = []
+    debug_mean_l = debug_act_l = debug_text_l = None
+    debug_mean_r = debug_act_r = debug_text_r = None
+
+    if spectral_paddle:
+        hidden_dim = rl_left.W1.shape[0]
+        K_coeff = K
+
+        # Input heatmap: 5 wavepackets × 32 coefficients (cos|sin × 2 axes)
+        init_data = np.zeros((5, K_coeff * 4))
+        debug_heatmap = ax_input.imshow(
+            init_data, aspect='auto', cmap='coolwarm',
+            vmin=-COEFF_CLIP, vmax=COEFF_CLIP, interpolation='nearest')
+        ax_input.set_yticks(range(5))
+        ax_input.set_yticklabels(['Ball', 'PadL', 'PadR', 'Env', 'Rew'],
+                                 fontsize=7, color=LABEL_COLOR)
+        ax_input.axvline(K_coeff * 2 - 0.5, color='#555', lw=0.5, ls='--')
+        ax_input.set_xticks([])
+        ax_input.set_title('Encoder State  (cos | sin)',
+                           color=TITLE_COLOR, fontsize=9)
+
+        # Hidden bars — left controller
+        bars_l = ax_hid_l.barh(range(hidden_dim), np.zeros(hidden_dim),
+                               color=PADDLE_COLOR_L, height=0.7)
+        debug_bars_l = list(bars_l)
+        ax_hid_l.set_xlim(0, 2.0)
+        ax_hid_l.set_yticks(range(hidden_dim))
+        ax_hid_l.set_yticklabels([str(i) for i in range(hidden_dim)],
+                                 fontsize=6, color=LABEL_COLOR)
+        ax_hid_l.set_title('L Hidden', color=PADDLE_COLOR_L, fontsize=9)
+        ax_hid_l.invert_yaxis()
+
+        # Hidden bars — right controller
+        bars_r = ax_hid_r.barh(range(hidden_dim), np.zeros(hidden_dim),
+                               color=PADDLE_COLOR_R, height=0.7)
+        debug_bars_r = list(bars_r)
+        ax_hid_r.set_xlim(0, 2.0)
+        ax_hid_r.set_yticks(range(hidden_dim))
+        ax_hid_r.set_yticklabels([str(i) for i in range(hidden_dim)],
+                                 fontsize=6, color=LABEL_COLOR)
+        ax_hid_r.set_title('R Hidden', color=PADDLE_COLOR_R, fontsize=9)
+        ax_hid_r.invert_yaxis()
+
+        # Output gauge — left: bar for mean, dot for action
+        ax_out_l.set_xlim(-1.2, 1.2)
+        ax_out_l.set_ylim(-0.5, 0.5)
+        ax_out_l.axvline(0, color='#333', lw=0.5)
+        debug_mean_l, = ax_out_l.plot([0], [0], 's', color=PADDLE_COLOR_L,
+                                      markersize=12, alpha=0.4)
+        debug_act_l, = ax_out_l.plot([0], [0], 'o', color=PADDLE_COLOR_L,
+                                     markersize=8, zorder=5)
+        debug_text_l = ax_out_l.text(0, -0.35, '0.00', color=PADDLE_COLOR_L,
+                                     fontsize=8, ha='center')
+        ax_out_l.set_yticks([])
+        ax_out_l.set_xticks([-1, 0, 1])
+        ax_out_l.tick_params(labelsize=6)
+        ax_out_l.set_title('L Act', color=PADDLE_COLOR_L, fontsize=9)
+
+        # Output gauge — right
+        ax_out_r.set_xlim(-1.2, 1.2)
+        ax_out_r.set_ylim(-0.5, 0.5)
+        ax_out_r.axvline(0, color='#333', lw=0.5)
+        debug_mean_r, = ax_out_r.plot([0], [0], 's', color=PADDLE_COLOR_R,
+                                      markersize=12, alpha=0.4)
+        debug_act_r, = ax_out_r.plot([0], [0], 'o', color=PADDLE_COLOR_R,
+                                     markersize=8, zorder=5)
+        debug_text_r = ax_out_r.text(0, -0.35, '0.00', color=PADDLE_COLOR_R,
+                                     fontsize=8, ha='center')
+        ax_out_r.set_yticks([])
+        ax_out_r.set_xticks([-1, 0, 1])
+        ax_out_r.tick_params(labelsize=6)
+        ax_out_r.set_title('R Act', color=PADDLE_COLOR_R, fontsize=9)
 
     # -- keyboard -------------------------------------------------------------
     def on_key_press(event):
@@ -812,6 +922,30 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 xytext=(ball['x'], ball['y']),
                 arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
                                 lw=2.5, mutation_scale=15), zorder=6)
+
+        # -- update debug strip -------------------------------------------
+        if spectral_paddle and debug_heatmap is not None:
+            # Input heatmap: reshape wavepacket coeffs to (5, 4K)
+            coeff_dim = K * 4  # c_cos(K×2) + c_sin(K×2)
+            input_mat = rl_state[:5 * coeff_dim].reshape(5, coeff_dim)
+            debug_heatmap.set_array(input_mat)
+
+            # Hidden activations
+            for i, bar in enumerate(debug_bars_l):
+                bar.set_width(rl_left.last_h1[i])
+            for i, bar in enumerate(debug_bars_r):
+                bar.set_width(rl_right.last_h1[i])
+
+            # Output gauges
+            debug_mean_l.set_xdata([rl_left.last_mean])
+            debug_act_l.set_xdata([rl_left.last_action])
+            debug_text_l.set_text(f'{rl_left.last_action:+.2f}')
+            debug_text_l.set_x(rl_left.last_action)
+
+            debug_mean_r.set_xdata([rl_right.last_mean])
+            debug_act_r.set_xdata([rl_right.last_action])
+            debug_text_r.set_text(f'{rl_right.last_action:+.2f}')
+            debug_text_r.set_x(rl_right.last_action)
 
         return ()
 
