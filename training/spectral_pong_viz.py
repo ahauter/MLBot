@@ -57,6 +57,11 @@ COURT_RIGHT = 5.0
 COURT_TOP = 3.0
 COURT_BOTTOM = -3.0
 
+WORLD_BOUNDS = [
+    (COURT_LEFT, COURT_RIGHT),   # axis 0 (x)
+    (COURT_BOTTOM, COURT_TOP),   # axis 1 (y)
+]
+
 PADDLE_X_OFFSET = 0.5
 PADDLE_WIDTH = 0.15
 PADDLE_HEIGHT = 1.0
@@ -106,6 +111,8 @@ class WavepacketObject2D:
                 self.c_cos[:, d] = envelope * np.cos(self.k * self.pos[d])
                 self.c_sin[:, d] = envelope * np.sin(self.k * self.pos[d])
 
+        self.normalize()
+
     def _basis(self, x: float) -> np.ndarray:
         """1D Fourier basis at scalar domain position x. Returns (2K,)."""
         return np.concatenate([np.cos(self.k * x), np.sin(self.k * x)])
@@ -127,6 +134,22 @@ class WavepacketObject2D:
     def predict(self, x: float, axis: int) -> float:
         """Predict field value at domain position x for one axis."""
         return float(self._c_flat(axis) @ self._basis(x))
+
+    def integrate(self, axis: int) -> float:
+        """Analytical integral of F_d over world bounds."""
+        a, b = WORLD_BOUNDS[axis]
+        int_cos = (np.sin(self.k * b) - np.sin(self.k * a)) / self.k  # (K,)
+        int_sin = (np.cos(self.k * a) - np.cos(self.k * b)) / self.k  # (K,)
+        return float(self.c_cos[:, axis] @ int_cos +
+                     self.c_sin[:, axis] @ int_sin)
+
+    def normalize(self) -> None:
+        """Rescale coefficients so each axis integrates to 1 over world."""
+        for d in range(2):
+            I = self.integrate(d)
+            if abs(I) > 1e-10:
+                self.c_cos[:, d] /= I
+                self.c_sin[:, d] /= I
 
     def gradient(self, x: float, axis: int) -> float:
         """Analytical derivative dF_d/dx at domain position x.
@@ -246,7 +269,7 @@ def reset_ball(ball: dict, toward: str = 'random',
 def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 dt: float, ball_speed: float, interval: int,
                 max_frames: int | None, auto_paddle: bool,
-                ball_sigma: float, ball_amplitude: float,
+                ball_sigma: float,
                 env_lr: float, spectral_paddle: bool = False,
                 alpha_paddle: float = 0.5,
                 paddle_damping: float = 0.85,
@@ -261,7 +284,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1.0,
-        sigma=ball_sigma, amplitude=ball_amplitude,
+        sigma=ball_sigma,
         lr=ball_lr, lr_tracking=lr_tracking)
 
     wp_paddle_l = WavepacketObject2D(
@@ -339,7 +362,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- X-domain panel -------------------------------------------------------
     x_dom = np.linspace(COURT_LEFT - 1, COURT_RIGHT + 1, 400)
     ax_x.set_xlim(x_dom[0], x_dom[-1])
-    ax_x.set_ylim(-5, 5)
+    ax_x.set_ylim(-1.0, 1.0)
     ax_x.set_title('X-domain spectral fields', color=TITLE_COLOR, fontsize=10)
     ax_x.set_ylabel('F_x(x)', color=LABEL_COLOR, fontsize=8)
     ax_x.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
@@ -361,7 +384,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- Y-domain panel -------------------------------------------------------
     y_dom = np.linspace(COURT_BOTTOM - 1, COURT_TOP + 1, 400)
     ax_y.set_ylim(y_dom[0], y_dom[-1])
-    ax_y.set_xlim(-5, 5)
+    ax_y.set_xlim(-1.5, 1.5)
     ax_y.set_title('Y-domain', color=TITLE_COLOR, fontsize=10)
     ax_y.set_xlabel('F_y(y)', color=LABEL_COLOR, fontsize=8)
     ax_y.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
@@ -578,10 +601,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             # Re-init ball wavepacket on score
             wp_ball.__init__(K, frequencies, pos0=(ball['x'], ball['y']),
                              mass=1.0, sigma=ball_sigma,
-                             amplitude=ball_amplitude,
                              lr=ball_lr, lr_tracking=lr_tracking)
 
-        # -- update wavepackets: shift + attention-weighted LMS -----------
+        # -- update wavepackets: shift + LMS + PMF deviation learning ----
         ball_pos = np.array([ball['x'], ball['y']])
         paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
         paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
@@ -596,46 +618,57 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if abs(delta_r) > 1e-12:
             wp_paddle_r.shift(delta_r, axis=1)
 
-        # 2. Normalized inner products (attention weights)
-        nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
-        nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
-        nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
-        nip_ball_reward = abs(wp_ball.normalized_inner_product(wp_reward))
-
-        # 3. Attention-weighted LMS correction
+        # 2. Attention-weighted LMS correction (shape only, target=1.0)
         if not scored:
+            nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
+            nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
+            nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
+
+            unity = np.array([1.0, 1.0])
             wp_ball.update_with_attention(
-                ball_pos, ball_pos,
+                ball_pos, unity,
                 [nip_ball_env, nip_ball_padL, nip_ball_padR])
             wp_paddle_l.update_with_attention(
-                paddle_l_pos, paddle_l_pos,
-                [nip_ball_padL])
+                paddle_l_pos, unity, [nip_ball_padL])
             wp_paddle_r.update_with_attention(
-                paddle_r_pos, paddle_r_pos,
-                [nip_ball_padR])
-            wp_env.update_with_attention(
-                ball_pos, ball_pos,
-                [nip_ball_env])
-            wp_reward.update_with_attention(
-                ball_pos, np.array([reward, reward]),
-                [nip_ball_reward])
+                paddle_r_pos, unity, [nip_ball_padR])
 
-        # 4. Update stored positions for cross_product usage
+        # 3. Measure integral deviation BEFORE normalizing
+        #    Deviation from PMF=1 reveals environmental interaction
+        ball_deviation = np.array([wp_ball.integrate(d) - 1.0
+                                   for d in range(2)])
+
+        # 4. Normalize observed objects back to PMF
+        wp_ball.normalize()
+        wp_paddle_l.normalize()
+        wp_paddle_r.normalize()
+
+        # 5. Feed deviation into env field — "something here pushed
+        #    the ball off its PMF constraint"
+        deviation_mag = np.linalg.norm(ball_deviation)
+        if not scored and deviation_mag > 1e-8:
+            wp_env.update_lms(ball_pos, ball_deviation,
+                              anomaly_scale=deviation_mag)
+            wp_env.normalize()
+
+        # 6. Reward field learns from goal events
+        if scored:
+            wp_reward.update_lms(
+                np.array([ball['x'], ball['y']]),
+                np.array([reward, reward]), anomaly_scale=1.0)
+            wp_reward.normalize()
+
+        # Decay reward field so old goals fade
+        wp_reward.c_cos *= reward_decay
+        wp_reward.c_sin *= reward_decay
+
+        # 7. Update stored positions
         wp_ball.pos[:] = ball_pos
         wp_paddle_l.pos[:] = paddle_l_pos
         wp_paddle_r.pos[:] = paddle_r_pos
 
-        # 5. Anomaly for display only
-        if not scored:
-            a_actual = np.array([(vx_after - vx_before) / dt,
-                                 (vy_after - vy_before) / dt])
-            a_residual = a_actual
-        else:
-            a_residual = np.zeros(2)
-
-        # Decay reward field so old goals fade and coefficients stay bounded
-        wp_reward.c_cos *= reward_decay
-        wp_reward.c_sin *= reward_decay
+        # Deviation magnitude for display (replaces old anomaly)
+        a_residual = ball_deviation
 
         state['anomaly'] = a_residual
         state['max_anomaly'] = max(np.linalg.norm(a_residual),
@@ -773,7 +806,6 @@ def main():
         max_frames=args.frames,
         auto_paddle=args.auto_paddle,
         ball_sigma=0.8,
-        ball_amplitude=1.5,
         env_lr=args.lr,
         spectral_paddle=args.spectral_paddle,
         alpha_paddle=args.alpha_paddle,
