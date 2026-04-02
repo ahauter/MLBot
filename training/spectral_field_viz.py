@@ -224,11 +224,12 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_a.axvline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
     ax_a.axvline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
 
-    la_ball_field, = ax_a.plot([], [], color=BALL_COLOR, lw=2, label='Ball field')
+    la_ball_field, = ax_a.plot(
+        [], [], color=BALL_COLOR, lw=2, label='Ball field')
     la_wall_field, = ax_a.plot([], [], color=WALL_COLOR, lw=1.5, alpha=0.8,
-                                label='Wall field')
+                               label='Wall field')
     la_dot, = ax_a.plot([], [], 'o', color=BALL_COLOR, markersize=12,
-                         zorder=5, markeredgecolor='white', markeredgewidth=1.5)
+                        zorder=5, markeredgecolor='white', markeredgewidth=1.5)
     la_arrow = [None]
 
     ax_a.text(0.02, 0.97,
@@ -253,11 +254,11 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_b.axvspan(pad_left, pad_right, color=PAD_COLOR, alpha=0.12, zorder=0)
 
     lb_ball_field, = ax_b.plot([], [], color=BALL_COLOR, lw=2, alpha=0.9,
-                                label='Ball wavepacket (shifted)')
+                               label='Ball wavepacket (shifted)')
     lb_env_field, = ax_b.plot([], [], color=ENV_FIELD_COLOR, lw=1.5,
-                               alpha=0.8, label='Learned env field')
+                              alpha=0.8, label='Learned env field')
     lb_dot, = ax_b.plot([], [], 'o', color=NEWTON_COLOR, markersize=12,
-                         zorder=5, markeredgecolor='white', markeredgewidth=1.5)
+                        zorder=5, markeredgecolor='white', markeredgewidth=1.5)
     lb_arrow = [None]
     lb_residual_arrow = [None]
 
@@ -281,23 +282,24 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_track.axhline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
-    ax_track.axhspan(pad_left, pad_right, color=PAD_COLOR, alpha=0.08, zorder=0)
+    ax_track.axhspan(pad_left, pad_right, color=PAD_COLOR,
+                     alpha=0.08, zorder=0)
 
     lt_spectral, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
-                                  label='A: Spectral ball')
+                                 label='A: Spectral ball')
     lt_newton, = ax_track.plot([], [], color=NEWTON_COLOR, lw=1.5,
-                                alpha=0.8, label='B: Newtonian ball')
+                               alpha=0.8, label='B: Newtonian ball')
     ax_track.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
 
     frame_text = ax_a.text(0.98, 0.02, '', transform=ax_a.transAxes,
-                            color='#555', fontsize=8,
-                            horizontalalignment='right')
+                           color='#555', fontsize=8,
+                           horizontalalignment='right')
     lb_vel_text = ax_b.text(0.98, 0.97, '', transform=ax_b.transAxes,
-                             color=NEWTON_COLOR, fontsize=10,
-                             fontweight='bold',
-                             horizontalalignment='right',
-                             verticalalignment='top')
+                            color=NEWTON_COLOR, fontsize=10,
+                            fontweight='bold',
+                            horizontalalignment='right',
+                            verticalalignment='top')
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -337,8 +339,10 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         newton['x'] += newton['v'] * dt
 
         # Friction pad: decelerate proportional to velocity
+        """l""
         if pad_left <= newton['x'] <= pad_right:
-            newton['v'] -= pad_friction * newton['v'] * dt
+            newton['v'] += pad_friction * newton['v'] * dt
+            """
 
         # Wall bounces
         if newton['x'] >= wall_right:
