@@ -350,7 +350,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # LMS: update env field at ball position, scaled by anomaly magnitude.
         # Every frame — no gate. Big anomaly = big update, free flight = tiny update.
         # Basis evaluated at x + v*dt (predicted next pos) — encodes velocity.
-        anomaly_mag = abs(a_residual)
+        anomaly_mag = abs(0.01 * a_residual)
         x_pred = nx + newton['v'] * dt
         basis = b_env._basis(x_pred)
         pred = float(b_env._c @ basis)
