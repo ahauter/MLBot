@@ -44,6 +44,7 @@ WALL_COLOR = '#f87171'
 INTERACT_COLOR = '#a78bfa'
 NEWTON_COLOR = '#4ade80'
 RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall
+RESIDUAL_COLOR = '#facc15'   # yellow for LMS residual
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -100,16 +101,17 @@ class WavepacketObject:
         return float(np.sum(self.c_cos * other.c_cos +
                             self.c_sin * other.c_sin))
 
-    def update(self, x_target: float) -> None:
-        """LMS update: train field to predict x_target at x_target."""
+    def update(self, x_target: float) -> float:
+        """LMS update: train field to predict x_target at x_target.  Returns residual."""
         if self.lr <= 0:
-            return
+            return 0.0
         basis = self._basis(x_target)
         pred = float(self._c @ basis)
         residual = x_target - pred
         c = self._c + self.lr * basis * residual
         np.clip(c, -COEFF_CLIP, COEFF_CLIP, out=c)
         self._c = c
+        return residual
 
     def shift(self, delta: float) -> None:
         for j in range(self.K):
@@ -189,7 +191,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     # Shared
     history_t = deque(maxlen=window)
-    state = {'t': 0}
+    state = {'t': 0, 'residual': 0.0, 'residual_wall_x': 0.0, 'residual_age': 999}
 
     # ── figure: 2 field panels + position comparison ──────────────────
     fig, (ax_a, ax_b, ax_track) = plt.subplots(
@@ -249,6 +251,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     lb_dot, = ax_b.plot([], [], 'o', color=NEWTON_COLOR, markersize=12,
                          zorder=5, markeredgecolor='white', markeredgewidth=1.5)
     lb_arrow = [None]
+    lb_residual_arrow = [None]
 
     ax_b.text(0.02, 0.97,
               'Ball: wavepacket shifted to Newtonian position'
@@ -350,6 +353,12 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # LMS: learn wall field from bounce contact positions
         if bounced:
             wall_pos = wall_right if newton['v'] < 0 else wall_left
+            # Capture pre-update residual (before LMS corrects it)
+            basis = b_wall._basis(wall_pos)
+            pred = float(b_wall._c @ basis)
+            state['residual'] = wall_pos - pred
+            state['residual_wall_x'] = wall_pos
+            state['residual_age'] = 0
             for _ in range(10):
                 b_wall.update(wall_pos)
 
@@ -399,6 +408,24 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                 lw=2.5, mutation_scale=15), zorder=6)
         else:
             lb_arrow[0] = None
+
+        # LMS residual arrow (vertical, at wall contact point)
+        if lb_residual_arrow[0] is not None:
+            lb_residual_arrow[0].remove()
+            lb_residual_arrow[0] = None
+        age = state['residual_age']
+        if age < 15:
+            r = state['residual']
+            wx = state['residual_wall_x']
+            fade = max(0.0, 1.0 - age / 15.0)
+            rdy = np.clip(r * 2.0, -4.0, 4.0)
+            if abs(rdy) > 0.02:
+                lb_residual_arrow[0] = ax_b.annotate(
+                    '', xy=(wx, rdy), xytext=(wx, 0),
+                    arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
+                                    lw=2.5, alpha=fade, mutation_scale=15),
+                    zorder=7)
+            state['residual_age'] = age + 1
 
         # ── draw panel 3: position comparison ────────────────────
         ts = np.array(history_t)
