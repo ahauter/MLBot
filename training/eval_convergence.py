@@ -4,8 +4,8 @@ SE3 Spectral Convergence Evaluation
 Evaluate how well the SE3 spectral field's LMS filter tracks real Rocket League
 trajectories from parsed replay data.
 
-Loads replay .npz files via TrajectoryDataset, runs the numpy coefficient update
-loop, and reports per-object / per-dimension reconstruction residuals.
+Loads replay .npz files in chunks, runs the real SE3Encoder._update_coefficients
+on GPU in batches, and reports per-object / per-dimension reconstruction residuals.
 
 Usage:
     # Random-init encoder on replay data
@@ -29,9 +29,11 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Generator, Optional
 
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
 
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO / "src"))
@@ -41,129 +43,58 @@ from se3_field import (
     SE3Encoder,
     COEFF_DIM,
     D_AMP,
-    K,
-    N_CHANNELS,
     N_OBJECTS,
     OBJECTS,
-    RAW_STATE_DIM,
-    _BALL,
-    _BALL_OFF,
-    _EGO,
-    _EGO_OFF,
-    _OPP,
-    _OPP_OFF,
-    _STADIUM,
     _TEAM,
-    make_initial_coefficients,
-    update_coefficients_np,
 )
 from trajectory_dataset import TrajectoryDataset
+from pretrain_se3 import build_amplitude_targets, reconstruct_amplitudes
 
 # Amplitude dimension labels for reporting
 AMP_DIM_NAMES = [
-    "pos_x",
-    "pos_y",
-    "pos_z",
-    "ang_vel_x",
-    "ang_vel_y",
-    "ang_vel_z",
-    "boost",
-    "has_flip",
-    "on_ground",
+    "pos_x", "pos_y", "pos_z",
+    "ang_vel_x", "ang_vel_y", "ang_vel_z",
+    "boost", "has_flip", "on_ground",
 ]
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── data loading ──────────────────────────────────────────────────────────────
 
 
-def extract_encoder_params(encoder: SE3Encoder) -> Dict[str, np.ndarray]:
-    """Extract SE3Encoder's learned parameters as numpy arrays."""
-    import torch
+def stream_dataset_chunks(
+    data_dir: str,
+    window_len: int,
+    stride: int,
+    files_per_chunk: int = 10,
+) -> Generator[TrajectoryDataset, None, None]:
+    """Yield TrajectoryDataset instances one chunk of .npz files at a time.
 
-    with torch.no_grad():
-        q = encoder.quaternions / encoder.quaternions.norm(
-            dim=-1, keepdim=True
-        ).clamp(min=1e-8)
-        return {
-            "k_spatial": encoder.k_spatial.cpu().numpy(),
-            "quaternions": q.cpu().numpy(),
-            "lr": np.exp(encoder.log_lr.cpu().numpy()),
-            "W_interact": encoder.W_interact.cpu().numpy(),
-        }
-
-
-def numpy_amplitude_targets(raw_state: np.ndarray) -> np.ndarray:
-    """Extract (N_OBJECTS, D_AMP) amplitude targets from a single raw state.
-
-    Mirrors pretrain_se3.build_amplitude_targets but in pure numpy.
+    Avoids loading all replay files into memory simultaneously.
     """
-    targets = np.zeros((N_OBJECTS, D_AMP), dtype=np.float32)
-
-    # Ball: pos(3) + ang_vel(3) + zeros(3)
-    targets[_BALL, :3] = raw_state[_BALL_OFF : _BALL_OFF + 3]
-    targets[_BALL, 3:6] = raw_state[_BALL_OFF + 6 : _BALL_OFF + 9]
-
-    # Ego: pos(3) + ang_vel(3) + boost + has_flip + on_ground
-    targets[_EGO, :3] = raw_state[_EGO_OFF : _EGO_OFF + 3]
-    targets[_EGO, 3:6] = raw_state[_EGO_OFF + 10 : _EGO_OFF + 13]
-    targets[_EGO, 6] = raw_state[_EGO_OFF + 13]
-    targets[_EGO, 7] = raw_state[_EGO_OFF + 14]
-    targets[_EGO, 8] = raw_state[_EGO_OFF + 15]
-
-    # Team = ego in 1v1
-    targets[_TEAM] = targets[_EGO]
-
-    # Opponent
-    targets[_OPP, :3] = raw_state[_OPP_OFF : _OPP_OFF + 3]
-    targets[_OPP, 3:6] = raw_state[_OPP_OFF + 10 : _OPP_OFF + 13]
-    targets[_OPP, 6] = raw_state[_OPP_OFF + 13]
-    targets[_OPP, 7] = raw_state[_OPP_OFF + 14]
-    targets[_OPP, 8] = raw_state[_OPP_OFF + 15]
-
-    # Stadium: all zeros (already initialized)
-    return targets
+    paths = sorted(Path(data_dir).glob("*.npz"))
+    for i in range(0, len(paths), files_per_chunk):
+        yield TrajectoryDataset(
+            data_dir,
+            window_len=window_len,
+            stride=stride,
+            npz_files=paths[i : i + files_per_chunk],
+        )
 
 
-def numpy_reconstruct(
-    coeff: np.ndarray,
-    k_spatial: np.ndarray,
-    quaternions: np.ndarray,
-    raw_state: np.ndarray,
-) -> np.ndarray:
-    """Reconstruct amplitude predictions from coefficients.
-
-    Returns (N_OBJECTS, D_AMP) predicted amplitudes via
-    Re[f] = sum_k (a_k * cos(phase_k) * orient_k - b_k * sin(phase_k) * orient_k)
-    """
-    c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
-    targets = numpy_amplitude_targets(raw_state)
-
-    id_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    orientations = np.tile(id_q, (N_OBJECTS, 1))
-    orientations[_EGO] = raw_state[_EGO_OFF + 6 : _EGO_OFF + 10]
-    orientations[_TEAM] = orientations[_EGO]
-    orientations[_OPP] = raw_state[_OPP_OFF + 6 : _OPP_OFF + 10]
-
-    predicted = np.zeros((N_OBJECTS, D_AMP), dtype=np.float32)
-    for obj in range(N_OBJECTS):
-        phase = k_spatial[obj] @ targets[obj]  # (K,)
-        orient = (quaternions[obj] * orientations[obj]).sum(axis=-1)  # (K,)
-        bc = (np.cos(phase) * orient)[:, np.newaxis]  # (K, 1)
-        bs = (np.sin(phase) * orient)[:, np.newaxis]
-        predicted[obj] = (bc * c[obj, :, :, 0] - bs * c[obj, :, :, 1]).sum(axis=0)
-
-    return predicted
-
-
-# ── core evaluation ──────────────────────────────────────────────────────────
+# ── core evaluation ───────────────────────────────────────────────────────────
 
 
 def evaluate_convergence(
-    params: Dict[str, np.ndarray],
-    dataset: TrajectoryDataset,
-    max_windows: int = 200,
+    encoder: SE3Encoder,
+    data_dir: str,
+    window_len: int,
+    stride: int,
+    max_windows: int,
+    batch_size: int,
+    files_per_chunk: int,
+    device: torch.device,
 ) -> Dict[str, np.ndarray]:
-    """Run LMS update on trajectory windows and collect per-step residuals.
+    """Run SE3Encoder._update_coefficients on trajectory windows and collect residuals.
 
     Returns dict:
         residual_curve: (W, N_OBJECTS, D_AMP) — mean MSE per step
@@ -173,49 +104,62 @@ def evaluate_convergence(
         object_summary: (N_OBJECTS,)          — final residual per object
         dim_summary: (D_AMP,)                 — final residual per dimension
     """
-    k_np = params["k_spatial"]
-    q_np = params["quaternions"]
-    lr_np = params["lr"]
-    W_np = params["W_interact"]
+    encoder.eval().to(device)
 
-    n_windows = min(max_windows, len(dataset))
-    if n_windows == 0:
-        raise ValueError("Dataset is empty — no trajectory windows to evaluate.")
-
-    # Get window length from first item
-    first_window = dataset[0].numpy()
-    W = first_window.shape[0]
-
-    # Accumulate residuals: (W, N_OBJECTS, D_AMP)
-    residual_sum = np.zeros((W, N_OBJECTS, D_AMP), dtype=np.float64)
-
+    residual_sum = torch.zeros(window_len, N_OBJECTS, D_AMP, device=device)
+    n_windows = 0
     t0 = time.time()
-    for wi in range(n_windows):
-        window = dataset[wi].numpy()  # (W, RAW_STATE_DIM)
-        coeff = make_initial_coefficients()
 
-        for t in range(W):
-            raw_t = window[t]
-            coeff = update_coefficients_np(k_np, q_np, lr_np, coeff, raw_t, W_interact=W_np)
+    for chunk_ds in stream_dataset_chunks(data_dir, window_len, stride, files_per_chunk):
+        if n_windows >= max_windows:
+            break
+        loader = DataLoader(chunk_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+        for batch in loader:
+            if n_windows >= max_windows:
+                break
+            batch = batch.to(device)                # (B, W, RAW_STATE_DIM)
+            B = batch.shape[0]
+            coefficients = torch.zeros(B, COEFF_DIM, device=device)
+            batch_start = n_windows
 
-            # Compute reconstruction and residual
-            targets = numpy_amplitude_targets(raw_t)
-            predicted = numpy_reconstruct(coeff, k_np, q_np, raw_t)
-            residual_sum[t] += (targets - predicted) ** 2
+            for t in range(window_len):
+                t_step = time.time()
+                raw_t = batch[:, t, :]              # (B, RAW_STATE_DIM)
+                packed = torch.cat([raw_t, coefficients], dim=-1)
 
-        if (wi + 1) % 50 == 0:
+                with torch.no_grad():
+                    new_coeff, basis_cos, basis_sin, _, coeff_5d = \
+                        encoder._update_coefficients(packed)
+
+                targets   = build_amplitude_targets(raw_t)
+                predicted = reconstruct_amplitudes(coeff_5d, basis_cos, basis_sin)
+                step_residual = (targets - predicted).pow(2)    # (B, N_OBJECTS, D_AMP)
+                residual_sum[t] += step_residual.mean(dim=0)
+
+                coefficients = new_coeff.detach()
+
+                step_ms = (time.time() - t_step) * 1000
+                print(
+                    f"  windows {batch_start + 1}–{batch_start + B}/{max_windows}"
+                    f"  step {t + 1}/{window_len}"
+                    f"  mse={step_residual.mean().item():.6f}"
+                    f"  ({step_ms:.2f}ms)"
+                )
+
+            n_windows += B
             elapsed = time.time() - t0
-            print(f"  [{wi + 1}/{n_windows}] windows processed ({elapsed:.1f}s)")
+            print(f"  [{n_windows}/{max_windows}] windows processed ({elapsed:.1f}s)")
 
-    # Average over windows
-    residual_curve = (residual_sum / n_windows).astype(np.float32)
+    if n_windows == 0:
+        raise ValueError("No trajectory windows found — check --data-dir.")
+
+    residual_curve = (residual_sum / n_windows).cpu().numpy().astype(np.float32)
     final_residual = residual_curve[-1]
-    steady_start = int(W * 0.75)
+    steady_start = int(window_len * 0.75)
     steady_state = residual_curve[steady_start:].mean(axis=0)
 
-    # Convergence step: first step where per-object mean MSE < 0.01
-    object_curve = residual_curve.mean(axis=-1)  # (W, N_OBJECTS)
-    convergence_step = np.full(N_OBJECTS, W, dtype=np.int32)
+    object_curve = residual_curve.mean(axis=-1)     # (W, N_OBJECTS)
+    convergence_step = np.full(N_OBJECTS, window_len, dtype=np.int32)
     for obj in range(N_OBJECTS):
         below = np.where(object_curve[:, obj] < 0.01)[0]
         if len(below) > 0:
@@ -229,18 +173,18 @@ def evaluate_convergence(
         "object_summary": final_residual.mean(axis=-1),
         "dim_summary": final_residual.mean(axis=0),
         "n_windows": n_windows,
-        "window_len": W,
+        "window_len": window_len,
     }
 
 
-# ── reporting ────────────────────────────────────────────────────────────────
+# ── reporting ─────────────────────────────────────────────────────────────────
 
 
 def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
     """Print a formatted convergence report."""
     W = results["window_len"]
     n = results["n_windows"]
-    header = f"SE3 Spectral Convergence Report"
+    header = "SE3 Spectral Convergence Report"
     if label:
         header += f" ({label})"
 
@@ -250,24 +194,19 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
     print(f"Windows evaluated: {n}")
     print(f"Window length: {W} steps")
 
-    # Per-object final residual
     print(f"\nPer-Object Final Residual (MSE):")
     for obj in range(N_OBJECTS):
         name = OBJECTS[obj]
         mse = results["object_summary"][obj]
         step = results["convergence_step"][obj]
         conv_str = f"converged at step {step}" if step < W else "did not converge"
-        extra = ""
-        if obj == _TEAM:
-            extra = " (= ego)"
+        extra = " (= ego)" if obj == _TEAM else ""
         print(f"  {name:<12s} {mse:.6f}  ({conv_str}){extra}")
 
-    # Per-dimension final residual
     print(f"\nPer-Dimension Final Residual (MSE, avg over objects):")
     for d in range(D_AMP):
         print(f"  {AMP_DIM_NAMES[d]:<12s} {results['dim_summary'][d]:.6f}")
 
-    # Steady-state
     print(f"\nSteady-State Residual (last 25% of window):")
     ss = results["steady_state"]
     for obj in range(N_OBJECTS):
@@ -276,7 +215,10 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
 
     overall = results["final_residual"].mean()
     n_converged = (results["convergence_step"] < W).sum()
-    print(f"\nOverall: {overall:.6f} MSE | Converged: {n_converged}/{N_OBJECTS} objects within {W} steps")
+    print(
+        f"\nOverall: {overall:.6f} MSE"
+        f" | Converged: {n_converged}/{N_OBJECTS} objects within {W} steps"
+    )
     print(f"{'=' * 60}\n")
 
 
@@ -288,24 +230,22 @@ def save_plot(
     """Save convergence curve plot."""
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib not installed — skipping plot")
         return
 
-    curve = results["residual_curve"]  # (W, N_OBJECTS, D_AMP)
+    curve = results["residual_curve"]   # (W, N_OBJECTS, D_AMP)
     W = curve.shape[0]
     steps = np.arange(W)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Left: per-object convergence
     ax = axes[0]
     for obj in range(N_OBJECTS):
         obj_mse = curve[:, obj, :].mean(axis=-1)
-        style = "-" if obj != _TEAM else "--"
+        style = "--" if obj == _TEAM else "-"
         ax.plot(steps, obj_mse, style, label=OBJECTS[obj], linewidth=1.5)
 
     if compare_results is not None:
@@ -323,7 +263,6 @@ def save_plot(
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
 
-    # Right: per-dimension convergence (averaged over objects)
     ax = axes[1]
     groups = [("position", slice(0, 3)), ("ang_vel", slice(3, 6)), ("scalars", slice(6, 9))]
     for name, sl in groups:
@@ -349,7 +288,7 @@ def save_plot(
     plt.close()
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 
 def main():
@@ -357,85 +296,74 @@ def main():
         description="Evaluate SE3 spectral field convergence on replay data"
     )
     parser.add_argument(
-        "--data-dir",
-        type=str,
-        default="training/data/parsed/",
+        "--data-dir", type=str, default="training/data/parsed/",
         help="Directory with parsed .npz replay files",
     )
     parser.add_argument(
-        "--encoder",
-        type=str,
-        default=None,
-        help="Path to pretrained encoder state_dict (.pt)",
+        "--encoder", type=str, default=None,
+        help="Path to pretrained SE3Encoder state_dict (.pt)",
     )
     parser.add_argument(
-        "--compare-random",
-        action="store_true",
+        "--compare-random", action="store_true",
         help="Also evaluate a random-init encoder for comparison",
     )
     parser.add_argument(
-        "--max-windows",
-        type=int,
-        default=200,
+        "--max-windows", type=int, default=200,
         help="Max trajectory windows to evaluate",
     )
     parser.add_argument(
-        "--window-len",
-        type=int,
-        default=64,
+        "--window-len", type=int, default=64,
         help="Trajectory window length",
     )
     parser.add_argument(
-        "--stride",
-        type=int,
-        default=32,
+        "--stride", type=int, default=32,
         help="Stride between windows",
     )
     parser.add_argument(
-        "--plot",
-        type=str,
-        default=None,
+        "--batch-size", type=int, default=32,
+        help="Windows per GPU batch",
+    )
+    parser.add_argument(
+        "--files-per-chunk", type=int, default=10,
+        help="Number of .npz files to load at a time",
+    )
+    parser.add_argument(
+        "--plot", type=str, default=None,
         help="Save convergence plot to this path (e.g. convergence.png)",
     )
     args = parser.parse_args()
 
-    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    # Load dataset
-    print(f"Loading trajectories from {args.data_dir}...")
-    dataset = TrajectoryDataset(
-        args.data_dir,
-        window_len=args.window_len,
-        stride=args.stride,
-    )
-    print(f"  {len(dataset)} windows available")
-
-    if len(dataset) == 0:
-        print("No trajectory data found. Make sure --data-dir points to parsed .npz files.")
-        print("  To generate: python training/data/collect_replays.py --help")
-        sys.exit(1)
-
-    # Build encoder and extract params
     encoder = SE3Encoder()
     if args.encoder:
         print(f"Loading encoder from {args.encoder}...")
         state = torch.load(args.encoder, map_location="cpu", weights_only=True)
         encoder.load_state_dict(state)
-    params = extract_encoder_params(encoder)
 
     label = Path(args.encoder).stem if args.encoder else "random init"
+    print(f"Hello i am done loading replays, i am now starting {label}...")
+
+    eval_kwargs = dict(
+        data_dir=args.data_dir,
+        window_len=args.window_len,
+        stride=args.stride,
+        max_windows=args.max_windows,
+        batch_size=args.batch_size,
+        files_per_chunk=args.files_per_chunk,
+        device=device,
+    )
+
     print(f"\nEvaluating ({label})...")
-    results = evaluate_convergence(params, dataset, max_windows=args.max_windows)
+    results = evaluate_convergence(encoder, **eval_kwargs)
     print_report(results, label=label)
 
     compare_results = None
     if args.compare_random and args.encoder:
         print("Evaluating (random init)...")
         random_encoder = SE3Encoder()
-        random_params = extract_encoder_params(random_encoder)
-        compare_results = evaluate_convergence(
-            random_params, dataset, max_windows=args.max_windows
-        )
+        compare_results = evaluate_convergence(random_encoder, **eval_kwargs)
         print_report(compare_results, label="random init")
 
     if args.plot:

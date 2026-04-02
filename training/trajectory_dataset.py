@@ -70,13 +70,15 @@ class TrajectoryDataset(Dataset):
         window_len: int = 64,
         stride: int = 32,
         min_episode_len: int = 100,
+        npz_files: List[Path] | None = None,
     ):
         self.window_len = window_len
         self.stride = stride
         self.windows: List[np.ndarray] = []
 
         parsed_dir = Path(parsed_dir)
-        npz_files = sorted(parsed_dir.glob('*.npz'))
+        if npz_files is None:
+            npz_files = sorted(parsed_dir.glob('*.npz'))
 
         for path in npz_files:
             data = np.load(path)
