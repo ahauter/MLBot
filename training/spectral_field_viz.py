@@ -266,7 +266,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     # ── middle panel: interaction density ────────────────────────────────
     ax_interact.set_xlim(-6, 6)
-    ax_interact.set_ylim(-3, 3)
+    ax_interact.set_ylim(-25, 25)
     ax_interact.set_xlabel('x (spatial domain)', color=LABEL_COLOR, fontsize=9)
     ax_interact.set_ylabel('Interaction', color=LABEL_COLOR, fontsize=9)
     ax_interact.set_title(r'Interaction Density  $F_{ball}(x) \cdot F_{wall}(x)$'
