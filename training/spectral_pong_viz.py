@@ -144,6 +144,21 @@ class WavepacketObject2D:
             for d in range(2)
         ])
 
+    def cross_product_2d(self, other: 'WavepacketObject2D') -> np.ndarray:
+        """Imaginary part of complex inner product per axis. Returns (2,).
+
+        cross[d] = sum_j (self.c_cos[j,d] * other.c_sin[j,d]
+                        - self.c_sin[j,d] * other.c_cos[j,d])
+
+        Proportional to sin(k_j * (self.pos[d] - other.pos[d])) — encodes
+        signed displacement between the two wavepackets.
+        """
+        return np.array([
+            float(np.sum(self.c_cos[:, d] * other.c_sin[:, d] -
+                         self.c_sin[:, d] * other.c_cos[:, d]))
+            for d in range(2)
+        ])
+
     def shift(self, delta: float, axis: int) -> None:
         """Fourier-domain phase rotation for one axis."""
         for j in range(self.K):
@@ -206,7 +221,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 ball_sigma: float, ball_amplitude: float,
                 env_lr: float, spectral_paddle: bool = False,
                 alpha_paddle: float = 0.5,
-                paddle_damping: float = 0.85):
+                paddle_damping: float = 0.85,
+                beta_paddle: float = 0.3):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
@@ -386,14 +402,19 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         half_h = PADDLE_HEIGHT / 2
         if auto_paddle:
             if spectral_paddle:
-                # Gradient ascent on ball's spectral field —
-                # paddle follows the gradient uphill toward the ball's peak
-                grad_l = wp_ball.gradient(left_paddle['y'], axis=1)
-                paddle_vel['l'] = paddle_damping * paddle_vel['l'] + alpha_paddle * grad_l * dt
+                # Two-term spectral rule:
+                #   tracking    = cross(ball, paddle)  — signed displacement
+                #   anticipation = -cross(ball, env)   — pre-correct for wall bounce
+                #   force = alpha * tracking + beta * anticipation
+                tracking_l = wp_paddle_l.cross_product_2d(wp_ball)[1]
+                wall_signal = wp_ball.cross_product_2d(wp_env)[1]
+                force_l = alpha_paddle * tracking_l - beta_paddle * wall_signal
+                paddle_vel['l'] = paddle_damping * paddle_vel['l'] + force_l * dt
                 left_paddle['y'] += paddle_vel['l'] * dt
 
-                grad_r = wp_ball.gradient(right_paddle['y'], axis=1)
-                paddle_vel['r'] = paddle_damping * paddle_vel['r'] + alpha_paddle * grad_r * dt
+                tracking_r = wp_paddle_r.cross_product_2d(wp_ball)[1]
+                force_r = alpha_paddle * tracking_r - beta_paddle * wall_signal
+                paddle_vel['r'] = paddle_damping * paddle_vel['r'] + force_r * dt
                 right_paddle['y'] += paddle_vel['r'] * dt
             else:
                 # Simple tracking AI
@@ -596,6 +617,9 @@ def main():
     parser.add_argument('--paddle-damping', type=float, default=0.85,
                         help='Paddle velocity damping per frame '
                              '(default: 0.85)')
+    parser.add_argument('--beta-paddle', type=float, default=0.3,
+                        help='Wall-anticipation coupling strength '
+                             '(default: 0.3)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -630,6 +654,7 @@ def main():
         spectral_paddle=args.spectral_paddle,
         alpha_paddle=args.alpha_paddle,
         paddle_damping=args.paddle_damping,
+        beta_paddle=args.beta_paddle,
     )
 
     if args.save:
