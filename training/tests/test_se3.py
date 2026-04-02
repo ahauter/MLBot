@@ -2027,54 +2027,61 @@ class TestAccelMomentum:
 
 class TestMomentumAblation:
 
-    def _make_encoder_pair(self, mode: str):
-        """Create a 'both' encoder and a masked encoder with same weights."""
+    def _make_encoder_pair(self, mode_a: str, mode_b: str):
+        """Create two encoders with same weights but different modes."""
         torch.manual_seed(42)
-        enc_both = SE3Encoder(momentum_mode='both')
+        enc_a = SE3Encoder(momentum_mode=mode_a)
         torch.manual_seed(42)
-        enc_mode = SE3Encoder(momentum_mode=mode)
-        return enc_both, enc_mode
+        enc_b = SE3Encoder(momentum_mode=mode_b)
+        return enc_a, enc_b
 
-    def test_delta_only_differs_from_both(self):
-        """delta_only mode produces different embed than both (surprise is masked)."""
-        enc_both, enc_delta = self._make_encoder_pair('delta_only')
+    def test_correction_produces_valid_output(self):
+        """correction mode produces valid (batch, EMBED_DIM) embed."""
+        encoder = SE3Encoder(momentum_mode='correction')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        embed, coeff, ah = encoder.encode_for_policy(obs)
+        assert embed.shape == (2, EMBED_DIM)
+        assert coeff.shape == (2, COEFF_DIM)
+        assert ah.shape == (2, ACCEL_HIST_DIM)
+        assert torch.isfinite(embed).all()
+
+    def test_correction_differs_from_additive(self):
+        """correction and additive modes produce different embeds."""
+        enc_corr, enc_add = self._make_encoder_pair('correction', 'additive')
         obs = torch.randn(2, SE3_OBS_DIM)
         with torch.no_grad():
-            embed_both, _, _ = enc_both.encode_for_policy(obs)
-            embed_delta, _, _ = enc_delta.encode_for_policy(obs)
-        assert not torch.allclose(embed_both, embed_delta, atol=1e-6), \
-            "delta_only should differ from both (surprise contribution is masked)"
+            embed_corr, _, _ = enc_corr.encode_for_policy(obs)
+            embed_add, _, _ = enc_add.encode_for_policy(obs)
+        assert not torch.allclose(embed_corr, embed_add, atol=1e-6), \
+            "correction and additive should produce different embeds"
 
-    def test_surprise_only_differs_from_both(self):
-        """surprise_only mode produces different embed than both (delta is masked)."""
-        enc_both, enc_surprise = self._make_encoder_pair('surprise_only')
+    def test_correction_differs_from_none(self):
+        """correction mode produces different embed than 'none'."""
+        enc_corr, enc_none = self._make_encoder_pair('correction', 'none')
         obs = torch.randn(2, SE3_OBS_DIM)
         with torch.no_grad():
-            embed_both, _, _ = enc_both.encode_for_policy(obs)
-            embed_surp, _, _ = enc_surprise.encode_for_policy(obs)
-        assert not torch.allclose(embed_both, embed_surp, atol=1e-6), \
-            "surprise_only should differ from both (delta contribution is masked)"
-
-    def test_none_differs_from_both(self):
-        """'none' mode produces different embed than both (all momentum masked)."""
-        enc_both, enc_none = self._make_encoder_pair('none')
-        obs = torch.randn(2, SE3_OBS_DIM)
-        with torch.no_grad():
-            embed_both, _, _ = enc_both.encode_for_policy(obs)
+            embed_corr, _, _ = enc_corr.encode_for_policy(obs)
             embed_none, _, _ = enc_none.encode_for_policy(obs)
-        assert not torch.allclose(embed_both, embed_none, atol=1e-6), \
-            "'none' should differ from both"
+        assert not torch.allclose(embed_corr, embed_none, atol=1e-6)
 
-    def test_both_matches_default(self):
-        """momentum_mode='both' produces identical output to default encoder."""
-        enc_both, enc_default = self._make_encoder_pair('both')
+    def test_both_aliases_additive(self):
+        """momentum_mode='both' is an alias for 'additive'."""
+        enc_both, enc_add = self._make_encoder_pair('both', 'additive')
         obs = torch.randn(2, SE3_OBS_DIM)
         with torch.no_grad():
-            embed_d, coeff_d, ah_d = enc_default.encode_for_policy(obs)
             embed_b, coeff_b, ah_b = enc_both.encode_for_policy(obs)
-        torch.testing.assert_close(embed_d, embed_b)
-        torch.testing.assert_close(coeff_d, coeff_b)
-        torch.testing.assert_close(ah_d, ah_b)
+            embed_a, coeff_a, ah_a = enc_add.encode_for_policy(obs)
+        torch.testing.assert_close(embed_b, embed_a)
+        torch.testing.assert_close(coeff_b, coeff_a)
+
+    def test_additive_differs_from_none(self):
+        """additive mode produces different embed than 'none'."""
+        enc_add, enc_none = self._make_encoder_pair('additive', 'none')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed_add, _, _ = enc_add.encode_for_policy(obs)
+            embed_none, _, _ = enc_none.encode_for_policy(obs)
+        assert not torch.allclose(embed_add, embed_none, atol=1e-6)
 
     def test_accel_hist_still_updates_when_masked(self):
         """Even with signals disabled, accel_hist must update (EMA state persists)."""
@@ -2085,12 +2092,20 @@ class TestMomentumAblation:
         assert not (accel_hist == 0).all(), \
             "accel_hist should update even when momentum signals are masked"
 
-    def test_param_count_unchanged(self):
-        """Ablation flags don't add parameters."""
-        enc_both = SE3Encoder(momentum_mode='both')
+    def test_correction_accel_hist_updates(self):
+        """In correction mode, accel_hist still updates."""
+        encoder = SE3Encoder(momentum_mode='correction')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            _, _, accel_hist = encoder.encode_for_policy(obs)
+        assert not (accel_hist == 0).all()
+
+    def test_param_count_under_limit(self):
+        """All modes have same param count, under 30K."""
+        enc_corr = SE3Encoder(momentum_mode='correction')
         enc_none = SE3Encoder(momentum_mode='none')
-        n_both = sum(p.numel() for p in enc_both.parameters())
+        n_corr = sum(p.numel() for p in enc_corr.parameters())
         n_none = sum(p.numel() for p in enc_none.parameters())
-        assert n_both == n_none, \
-            f"Parameter counts differ: both={n_both}, none={n_none}"
-        assert n_both < 30000, f"Encoder has {n_both} params, exceeds 30K limit"
+        assert n_corr == n_none, \
+            f"Parameter counts differ: correction={n_corr}, none={n_none}"
+        assert n_corr < 30000, f"Encoder has {n_corr} params, exceeds 30K limit"

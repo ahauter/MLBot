@@ -187,7 +187,7 @@ def pretrain(args):
 
                 # Differentiable encoder forward
                 (new_coeff, basis_cos, basis_sin, _, coeff_5d,
-                 _, _, new_accel_hist) = encoder._update_coefficients(packed)
+                 _, _, new_accel_hist, _) = encoder._update_coefficients(packed)
 
                 # Reconstruction loss
                 targets = build_amplitude_targets(raw_t)

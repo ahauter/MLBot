@@ -240,8 +240,12 @@ class SE3Encoder(nn.Module):
             EMA state always updates regardless (needed for accel_hist persistence).
         """
         super().__init__()
-        assert momentum_mode in ('both', 'delta_only', 'surprise_only', 'none'), \
+        _VALID_MODES = ('correction', 'additive', 'surprise_only', 'delta_only', 'none',
+                        'both')  # 'both' is alias for 'additive'
+        assert momentum_mode in _VALID_MODES, \
             f"Invalid momentum_mode: {momentum_mode!r}"
+        if momentum_mode == 'both':
+            momentum_mode = 'additive'
         self.momentum_mode = momentum_mode
 
         # Learned frequency vectors in R^D_AMP — phase = k · amplitude
@@ -275,8 +279,9 @@ class SE3Encoder(nn.Module):
         )
 
         # Acceleration momentum projections
-        self.delta_proj = nn.Linear(D_AMP, D_FIELD)      # accel delta → field dim
-        self.surprise_proj = nn.Linear(D_AMP, D_FIELD)   # accel surprise → field dim
+        self.correction_proj = nn.Linear(D_AMP, D_FIELD)  # EMA → field correction
+        self.delta_proj = nn.Linear(D_AMP, D_FIELD)       # accel delta → field dim (additive mode)
+        self.surprise_proj = nn.Linear(D_AMP, D_FIELD)    # accel surprise → field dim (additive mode)
         self.log_accel_alpha = nn.Parameter(              # learned EMA decay per object
             torch.full((N_OBJECTS,), 0.0))                # sigmoid(0) = 0.5
 
@@ -292,7 +297,7 @@ class SE3Encoder(nn.Module):
         """Core coefficient update with D_AMP=9 amplitude vectors.
 
         Returns (new_coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d,
-                 accel_delta, accel_surprise, new_accel_hist).
+                 accel_delta, accel_surprise, new_accel_hist, prev_accel_ema).
 
         new_coeff_flat:   (batch, COEFF_DIM=1080) for env persistence
         basis_cos/sin:    (batch, N_OBJECTS, K) scalar basis per component
@@ -301,6 +306,7 @@ class SE3Encoder(nn.Module):
         accel_delta:      (batch, N_OBJECTS, D_AMP) simple diff of accel residual
         accel_surprise:   (batch, N_OBJECTS, D_AMP) residual vs EMA prediction
         new_accel_hist:   (batch, ACCEL_HIST_DIM=90) updated history for env persistence
+        prev_accel_ema:   (batch, N_OBJECTS, D_AMP) EMA from previous tick (for correction)
         """
         batch = packed_obs.shape[0]
         device = packed_obs.device
@@ -505,7 +511,7 @@ class SE3Encoder(nn.Module):
         ], dim=-1)                                           # (batch, ACCEL_HIST_DIM)
 
         return (new_coeff.reshape(batch, COEFF_DIM), basis_cos, basis_sin, raw, new_coeff,
-                accel_delta, accel_surprise, new_accel_hist)
+                accel_delta, accel_surprise, new_accel_hist, prev_accel_ema)
 
     def forward(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Update coefficients (for env persistence / buffer storage).
@@ -513,7 +519,7 @@ class SE3Encoder(nn.Module):
         packed_obs: (batch, SE3_OBS_DIM=1244)
         returns:    (coeff_flat (batch, COEFF_DIM), new_accel_hist (batch, ACCEL_HIST_DIM))
         """
-        coeff_flat, _, _, _, _, _, _, new_accel_hist = self._update_coefficients(packed_obs)
+        coeff_flat, _, _, _, _, _, _, new_accel_hist, _ = self._update_coefficients(packed_obs)
         return coeff_flat, new_accel_hist
 
     def encode_for_policy(self, packed_obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -525,7 +531,8 @@ class SE3Encoder(nn.Module):
                      new_accel_hist (batch, ACCEL_HIST_DIM=90))
         """
         (coeff_flat, basis_cos, basis_sin, raw, new_coeff_5d,
-         accel_delta, accel_surprise, new_accel_hist) = self._update_coefficients(packed_obs)
+         accel_delta, accel_surprise, new_accel_hist,
+         prev_accel_ema) = self._update_coefficients(packed_obs)
         batch = packed_obs.shape[0]
         device = packed_obs.device
 
@@ -536,17 +543,17 @@ class SE3Encoder(nn.Module):
         # Project to per-object field vectors
         f = self.field_proj(f_flat)                            # (batch, N_OBJECTS, D_FIELD)
 
-        # Project action momentum signals and fuse additively
-        f_delta = self.delta_proj(accel_delta)                 # (batch, N_OBJECTS, D_FIELD)
-        f_surprise = self.surprise_proj(accel_surprise)        # (batch, N_OBJECTS, D_FIELD)
-
-        # Ablation masking (momentum_mode)
-        if self.momentum_mode in ('surprise_only', 'none'):
-            f_delta = f_delta * 0.0
-        if self.momentum_mode in ('delta_only', 'none'):
-            f_surprise = f_surprise * 0.0
-
-        f_combined = f + f_delta + f_surprise                  # (batch, N_OBJECTS, D_FIELD)
+        # Mode-dependent fusion
+        if self.momentum_mode == 'correction':
+            # Correct field using momentum prediction (EMA = expected action)
+            f_correction = self.correction_proj(prev_accel_ema)  # (batch, N_OBJECTS, D_FIELD)
+            f_combined = f + f_correction
+            # accel_surprise IS the extra error (what correction got wrong)
+        elif self.momentum_mode == 'additive':
+            # Legacy: all three signals as peers
+            f_combined = f + self.delta_proj(accel_delta) + self.surprise_proj(accel_surprise)
+        else:  # 'surprise_only', 'delta_only', 'none'
+            f_combined = f
 
         # Inner product matrix: spectral alignment
         inner = torch.bmm(f_combined, f_combined.transpose(1, 2))  # (batch, N_OBJECTS, N_OBJECTS)
@@ -580,6 +587,7 @@ class SE3Encoder(nn.Module):
         opp_surprise_norm = accel_surprise[:, _OPP].norm(dim=-1, keepdim=True) # (batch, 1)
 
         # Ablation masking for context norms
+        # 'correction' and 'additive' keep all 4 norms active
         if self.momentum_mode in ('surprise_only', 'none'):
             ego_delta_norm = ego_delta_norm * 0.0
             opp_delta_norm = opp_delta_norm * 0.0

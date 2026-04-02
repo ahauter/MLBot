@@ -120,7 +120,7 @@ class SE3PPOAlgorithm(Algorithm):
             'dream_entropy_high': 2.0,
             'dream_entropy_low': 0.1,
             'dream_ratio': 0.25,
-            'momentum_mode': 'both',
+            'momentum_mode': 'correction',
         }
 
     @classmethod

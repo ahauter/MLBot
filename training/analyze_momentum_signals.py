@@ -92,7 +92,7 @@ def collect_momentum_signals(
 
                 with torch.no_grad():
                     (new_coeff, _, _, _, _,
-                     accel_delta, accel_surprise, new_accel_hist) = \
+                     accel_delta, accel_surprise, new_accel_hist, _) = \
                         encoder._update_coefficients(packed)
 
                 # Extract accel_residual from the new_accel_hist (first half)

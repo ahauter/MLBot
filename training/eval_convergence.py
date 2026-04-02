@@ -135,7 +135,7 @@ def evaluate_convergence(
 
                 with torch.no_grad():
                     (new_coeff, basis_cos, basis_sin, _, coeff_5d,
-                     accel_delta, accel_surprise, new_accel_hist) = \
+                     accel_delta, accel_surprise, new_accel_hist, _) = \
                         encoder._update_coefficients(packed)
 
                 targets   = build_amplitude_targets(raw_t)
