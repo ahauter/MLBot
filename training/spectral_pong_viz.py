@@ -554,19 +554,23 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             np.array([paddle_rx, right_paddle['y']]))
 
         # -- LMS wall learning from acceleration anomaly ------------------
-        # Subtract contributions from ALL known sources (env + paddles)
-        # so the env field only learns from truly unexplained anomalies.
-        a_actual = np.array([(vx_after - vx_before) / dt,
-                             (vy_after - vy_before) / dt])
-        force_env = -alpha * wp_ball.inner_product_2d(wp_env)
-        force_pad_l = -alpha * wp_ball.inner_product_2d(wp_paddle_l)
-        force_pad_r = -alpha * wp_ball.inner_product_2d(wp_paddle_r)
-        a_predicted = (force_env + force_pad_l + force_pad_r) / wp_ball.mass
-        a_residual = a_actual - a_predicted
+        # Skip on scoring frames — ball teleport creates a bogus anomaly.
+        if not scored:
+            # Subtract contributions from ALL known sources (env + paddles)
+            # so the env field only learns from truly unexplained anomalies.
+            a_actual = np.array([(vx_after - vx_before) / dt,
+                                 (vy_after - vy_before) / dt])
+            force_env = -alpha * wp_ball.inner_product_2d(wp_env)
+            force_pad_l = -alpha * wp_ball.inner_product_2d(wp_paddle_l)
+            force_pad_r = -alpha * wp_ball.inner_product_2d(wp_paddle_r)
+            a_predicted = (force_env + force_pad_l + force_pad_r) / wp_ball.mass
+            a_residual = a_actual - a_predicted
 
-        anomaly_mag = np.linalg.norm(a_residual) * 0.01
-        ball_next = ball_pos + np.array([ball['vx'], ball['vy']]) * dt
-        wp_env.update_lms(ball_next, ball_pos, anomaly_scale=anomaly_mag)
+            anomaly_mag = np.linalg.norm(a_residual) * 0.01
+            ball_next = ball_pos + np.array([ball['vx'], ball['vy']]) * dt
+            wp_env.update_lms(ball_next, ball_pos, anomaly_scale=anomaly_mag)
+        else:
+            a_residual = np.zeros(2)
 
         # Decay reward field so old goals fade and coefficients stay bounded
         wp_reward.c_cos *= reward_decay
