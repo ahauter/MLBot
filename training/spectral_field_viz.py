@@ -347,13 +347,15 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         a_predicted = force_b / b_ball.mass
         a_residual = a_actual - a_predicted
 
-        # LMS: update env field at ball position, scaled by anomaly
-        # No knowledge of walls or pads — only the velocity anomaly
+        # LMS: update env field at ball position, scaled by anomaly magnitude.
+        # Every frame — no gate. Big anomaly = big update, free flight = tiny update.
         anomaly_mag = abs(a_residual)
-        if anomaly_mag > 0.1:
-            n_lms = int(np.clip(anomaly_mag * 0.5, 1, 10))
-            for _ in range(n_lms):
-                b_env.update(nx)
+        basis = b_env._basis(nx)
+        pred = float(b_env._c @ basis)
+        pos_residual = nx - pred
+        c = b_env._c + (b_env.lr * anomaly_mag) * basis * pos_residual
+        np.clip(c, -COEFF_CLIP, COEFF_CLIP, out=c)
+        b_env._c = c
 
         # Store residual for visualization
         state['residual'] = a_residual
