@@ -255,6 +255,86 @@ class WavepacketObject2D:
         return residual
 
 
+# -- Simple RL paddle controller -----------------------------------------------
+
+class SimpleRLController:
+    """Single wide hidden layer trained with REINFORCE + eligibility traces.
+
+    State: flattened wavepacket coefficients + ball pos/vel + paddle positions.
+    Action: 2 floats in [-1, 1] → scaled to paddle velocities.
+    Reward: sparse ±1 on goals.
+    """
+
+    def __init__(self, state_dim: int, hidden_dim: int = 256,
+                 lr: float = 3e-3, gamma: float = 0.99, std: float = 0.5):
+        scale1 = np.sqrt(2.0 / state_dim)
+        scale2 = np.sqrt(2.0 / hidden_dim)
+        self.W1 = np.random.randn(hidden_dim, state_dim) * scale1
+        self.b1 = np.zeros(hidden_dim)
+        self.W2 = np.random.randn(2, hidden_dim) * scale2
+        self.b2 = np.zeros(2)
+        self.lr = lr
+        self.gamma = gamma
+        self.std = std
+        self._reset_traces()
+
+    def _reset_traces(self) -> None:
+        self.trace_W1 = np.zeros_like(self.W1)
+        self.trace_b1 = np.zeros_like(self.b1)
+        self.trace_W2 = np.zeros_like(self.W2)
+        self.trace_b2 = np.zeros_like(self.b2)
+
+    @staticmethod
+    def build_state(wavepackets: list, ball: dict,
+                    left_paddle: dict, right_paddle: dict) -> np.ndarray:
+        parts = []
+        for wp in wavepackets:
+            parts.extend([wp.c_cos.ravel(), wp.c_sin.ravel()])
+        parts.append(np.array([ball['x'], ball['y'],
+                               ball['vx'], ball['vy'],
+                               left_paddle['y'], right_paddle['y']]))
+        return np.concatenate(parts)
+
+    def act(self, state: np.ndarray) -> np.ndarray:
+        """Forward pass + sample from Gaussian policy. Returns action in [-1,1]."""
+        # Forward
+        z1 = self.W1 @ state + self.b1
+        h1 = np.maximum(z1, 0)                          # ReLU
+        z2 = self.W2 @ h1 + self.b2
+        mean = np.tanh(z2)                               # bounded mean
+
+        # Sample
+        action = np.clip(mean + self.std * np.random.randn(2), -1, 1)
+
+        # ∇ log π  (Gaussian + tanh chain rule)
+        d_logpi = (action - mean) / (self.std ** 2)
+        d_z2 = d_logpi * (1 - mean ** 2)                 # through tanh
+        grad_W2 = d_z2[:, None] * h1[None, :]
+        grad_b2 = d_z2
+        d_h1 = self.W2.T @ d_z2
+        d_z1 = d_h1 * (z1 > 0)                           # through ReLU
+        grad_W1 = d_z1[:, None] * state[None, :]
+        grad_b1 = d_z1
+
+        # Accumulate eligibility traces
+        self.trace_W1 = self.gamma * self.trace_W1 + grad_W1
+        self.trace_b1 = self.gamma * self.trace_b1 + grad_b1
+        self.trace_W2 = self.gamma * self.trace_W2 + grad_W2
+        self.trace_b2 = self.gamma * self.trace_b2 + grad_b2
+
+        return action
+
+    def update(self, reward: float) -> None:
+        """REINFORCE update on sparse reward signal."""
+        if abs(reward) < 1e-10:
+            return
+        self.W1 += self.lr * reward * self.trace_W1
+        self.b1 += self.lr * reward * self.trace_b1
+        self.W2 += self.lr * reward * self.trace_W2
+        self.b2 += self.lr * reward * self.trace_b2
+        self._reset_traces()
+
+
 
 # -- helpers ------------------------------------------------------------------
 
@@ -325,6 +405,13 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, pos0=(0.0, 0.0), mass=1.0,
         c_cos=reward_c_cos, c_sin=np.zeros((K, 2)),
         lr=reward_lr, lr_tracking=0.0)
+
+    # -- RL paddle controller (when spectral_paddle is True) -----------------
+    rl_controller = None
+    if spectral_paddle:
+        # State: 5 wavepackets × (K×2 cos + K×2 sin) + 6 game-state floats
+        state_dim = 5 * (K * 2 * 2) + 6
+        rl_controller = SimpleRLController(state_dim, hidden_dim=256)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -489,27 +576,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         # -- move paddles -------------------------------------------------
         half_h = PADDLE_HEIGHT / 2
         if auto_paddle:
-            if spectral_paddle:
-                # Three-term spectral rule:
-                #   tracking     = cross(paddle, ball) — signed displacement
-                #   anticipation = -cross(ball, env)   — pre-correct for wall bounce
-                #   reward_grad  = dR/dy at paddle pos — move toward higher reward
-                tracking_l = wp_paddle_l.cross_product_2d(wp_ball)[1]
-                wall_signal = wp_ball.cross_product_2d(wp_env)[1]
-                reward_grad_l = np.tanh(wp_reward.gradient(left_paddle['y'], axis=1))
-                force_l = (alpha_paddle * tracking_l
-                           - beta_paddle * wall_signal
-                           + gamma_paddle * reward_grad_l)
-                paddle_vel['l'] = paddle_damping * paddle_vel['l'] + force_l * dt
-                left_paddle['y'] += paddle_vel['l'] * dt
-
-                tracking_r = wp_paddle_r.cross_product_2d(wp_ball)[1]
-                reward_grad_r = np.tanh(wp_reward.gradient(right_paddle['y'], axis=1))
-                force_r = (alpha_paddle * tracking_r
-                           - beta_paddle * wall_signal
-                           + gamma_paddle * reward_grad_r)
-                paddle_vel['r'] = paddle_damping * paddle_vel['r'] + force_r * dt
-                right_paddle['y'] += paddle_vel['r'] * dt
+            if spectral_paddle and rl_controller is not None:
+                # RL policy: wavepacket state → paddle velocities
+                rl_state = SimpleRLController.build_state(
+                    [wp_ball, wp_paddle_l, wp_paddle_r, wp_env, wp_reward],
+                    ball, left_paddle, right_paddle)
+                action = rl_controller.act(rl_state)  # [-1, 1]
+                left_paddle['y'] += action[0] * PADDLE_SPEED * dt
+                right_paddle['y'] += action[1] * PADDLE_SPEED * dt
             else:
                 # Simple tracking AI
                 track_speed = PADDLE_SPEED * dt * 0.8
@@ -537,13 +611,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
         right_paddle['y'] = np.clip(right_paddle['y'],
                                      COURT_BOTTOM + half_h, COURT_TOP - half_h)
-
-        # Zero paddle velocity when clamped to court edge
-        if spectral_paddle and auto_paddle:
-            if left_paddle['y'] <= COURT_BOTTOM + half_h or left_paddle['y'] >= COURT_TOP - half_h:
-                paddle_vel['l'] = 0.0
-            if right_paddle['y'] <= COURT_BOTTOM + half_h or right_paddle['y'] >= COURT_TOP - half_h:
-                paddle_vel['r'] = 0.0
 
         # -- Newtonian ball step ------------------------------------------
         vx_before, vy_before = ball['vx'], ball['vy']
@@ -600,6 +667,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
+            # RL update on sparse reward
+            if rl_controller is not None:
+                rl_controller.update(reward)
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
