@@ -220,6 +220,7 @@ class PPOAlgorithm(Algorithm):
 
         self.num_envs = config.get('num_envs', 1)
         self.t_window = config.get('t_window', 8)
+        self._inference_only = config.get('inference', False)
 
         _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(_device)
@@ -230,21 +231,22 @@ class PPOAlgorithm(Algorithm):
         self.encoder.to(self.device)
         self.policy.to(self.device)
 
-        # Optimizer over both encoder and policy
-        self.optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) + list(self.policy.parameters()),
-            lr=self.lr,
-        )
+        if not self._inference_only:
+            # Optimizer over both encoder and policy
+            self.optimizer = torch.optim.Adam(
+                list(self.encoder.parameters()) + list(self.policy.parameters()),
+                lr=self.lr,
+            )
 
-        # Rollout buffer
-        obs_dim = self.t_window * N_TOKENS * TOKEN_FEATURES
-        self.buffer = RolloutBuffer(
-            capacity=self.rollout_steps,
-            num_envs=self.num_envs,
-            obs_dim=obs_dim,
-            gamma=self.gamma,
-            gae_lambda=self.gae_lambda,
-        )
+            # Rollout buffer
+            obs_dim = self.t_window * N_TOKENS * TOKEN_FEATURES
+            self.buffer = RolloutBuffer(
+                capacity=self.rollout_steps,
+                num_envs=self.num_envs,
+                obs_dim=obs_dim,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
 
         self._entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=self.device)
 
@@ -446,6 +448,18 @@ class PPOAlgorithm(Algorithm):
             'encoder': {k: v.clone() for k, v in self.encoder.state_dict().items()},
             'policy': {k: v.clone() for k, v in self.policy.state_dict().items()},
         }
+
+    def load_weights(self, weights: dict) -> None:
+        self.encoder.load_state_dict(weights['encoder'])
+        self.policy.load_state_dict(weights['policy'])
+        self.encoder.eval()
+        self.policy.eval()
+
+    @torch.no_grad()
+    def infer(self, obs: np.ndarray) -> np.ndarray:
+        emb = self._encode(obs)
+        action, _ = self.policy.act_deterministic(emb)
+        return action.cpu().numpy()
 
     def clone_from(self, other: 'PPOAlgorithm', noise_scale: float = 0.0) -> None:
         """Copy weights from another PPO agent, optionally with noise."""

@@ -145,7 +145,6 @@ Save as `training/my_opponent_pool.py`.
 | Algorithm | Axis 1 (Simulation) | How the agent learns | PPOAlgorithm (`training/ppo.py`) |
 | MetricLogger | -- | Where metrics are logged | WandbLogger (`training/logger.py`) |
 | RewardFunction | Axis 4 (Reward) | What signal drives learning | SparseRewardFunction |
-| EnvironmentProvider | Axis 1 (Simulation) | How envs are created | DefaultEnvironmentProvider |
 | ReplayProvider | Axis 2 (Data) | Expert demonstration data | NullReplayProvider |
 | FeedbackProvider | Axis 3 (Feedback) | Human reward signal | NullFeedbackProvider |
 | EvaluationHook | -- | When to stop training | PsyonixEvaluationHook |

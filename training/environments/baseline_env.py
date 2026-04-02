@@ -85,9 +85,8 @@ class BaselineGymEnv(gym.Env):
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
         )
 
-        # Opponent model (PPO encoder+policy or None for random)
-        self._opponent_encoder = None
-        self._opponent_policy = None
+        # Opponent algorithm instance (Algorithm ABC or None for random)
+        self._opponent_algo = None
 
         self._env = None
         self._blue_buf: deque = deque(maxlen=t_window)
@@ -97,27 +96,38 @@ class BaselineGymEnv(gym.Env):
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def load_ppo_opponent(self, snap_path: str) -> None:
-        """Load a PPO opponent from a snapshot directory.
+    def load_ppo_opponent(self, snap_path: str,
+                          algo_class=None, algo_config=None) -> None:
+        """Load an opponent from a snapshot directory.
 
         Parameters
         ----------
         snap_path : str or Path
             Path to snapshot directory containing encoder.pt and policy.pt.
+        algo_class : type, optional
+            Algorithm class to use. Defaults to PPOAlgorithm.
+        algo_config : dict, optional
+            Config for Algorithm construction (inference-only mode).
         """
-        import torch
-        from encoder import SharedTransformerEncoder, D_MODEL
-        from policy_head import StochasticPolicyHead
         from training.opponents.pool import load_opponent_from_snapshot
 
         weights = load_opponent_from_snapshot(snap_path, device='cpu')
-        if self._opponent_encoder is None:
-            self._opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL)
-            self._opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
-        self._opponent_encoder.load_state_dict(weights['encoder'])
-        self._opponent_policy.load_state_dict(weights['policy'])
-        self._opponent_encoder.eval()
-        self._opponent_policy.eval()
+
+        if self._opponent_algo is None:
+            if algo_class is None:
+                from training.algorithms.ppo import PPOAlgorithm
+                algo_class = PPOAlgorithm
+            if algo_config is None:
+                algo_config = {}
+            self._opponent_algo = algo_class({
+                **algo_config, 'inference': True, 'device': 'cpu',
+                't_window': self.t_window,
+            })
+        self._opponent_algo.load_weights(weights)
+
+    def set_opponent_algo(self, algo) -> None:
+        """Set an existing Algorithm instance as the opponent."""
+        self._opponent_algo = algo
 
     def reset(
         self,
@@ -380,20 +390,10 @@ class BaselineGymEnv(gym.Env):
         return stacked.ravel().astype(np.float32)
 
     def _get_opponent_action(self) -> np.ndarray:
-        """Get opponent action from frozen PPO model or random."""
-        if self._opponent_encoder is None:
+        """Get opponent action from frozen algorithm or random."""
+        if self._opponent_algo is None:
             return np.random.uniform(-1, 1, size=8).astype(np.float32)
-
-        import torch
-        from encoder import ENTITY_TYPE_IDS_1V1
 
         stacked = np.stack(list(self._orange_buf), axis=0)  # (T, N, F)
         flat_obs = stacked.ravel().astype(np.float32)       # (T*N*F,)
-
-        with torch.no_grad():
-            x = torch.tensor(flat_obs[np.newaxis], dtype=torch.float32)
-            tokens = x.view(1, self.t_window, N_TOKENS, TOKEN_FEATURES)
-            eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
-            emb = self._opponent_encoder(tokens, eids)
-            action, _ = self._opponent_policy.act_deterministic(emb)
-        return action[0].cpu().numpy().astype(np.float32)
+        return self._opponent_algo.infer(flat_obs[np.newaxis])[0]

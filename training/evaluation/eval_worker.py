@@ -3,9 +3,10 @@ Evaluation Worker — Subprocess Entry Point
 ============================================
 Runs the full evaluation suite for a single checkpoint in an isolated process.
 
-Called by SimEvaluationHook.spawn_eval() via multiprocessing.Process.
-Loads the checkpoint, creates environments, runs episodes, writes results
-to a JSON file. Never touches W&B — the training process handles logging.
+Called by SimEvaluationHook.evaluate() via direct invocation.
+Loads the checkpoint, creates an Algorithm instance for inference,
+runs episodes, writes results to a JSON file.
+Never touches W&B — the training process handles logging.
 """
 from __future__ import annotations
 
@@ -26,15 +27,13 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO))
 
-from encoder import (
-    SharedTransformerEncoder,
-    D_MODEL,
-    N_TOKENS,
-    TOKEN_FEATURES,
-    ENTITY_TYPE_IDS_1V1,
-)
-from policy_head import StochasticPolicyHead
 from training.evaluation.eval_config import EvalConfig
+
+
+def _load_class(dotted_path: str):
+    """Resolve a class from a dotted import path."""
+    module_path, class_name = dotted_path.rsplit('.', 1)
+    return getattr(importlib.import_module(module_path), class_name)
 
 
 def _load_env_class(dotted_path: Optional[str]):
@@ -45,8 +44,7 @@ def _load_env_class(dotted_path: Optional[str]):
     if dotted_path is None:
         from training.environments.baseline_env import BaselineGymEnv
         return BaselineGymEnv
-    module_path, class_name = dotted_path.rsplit('.', 1)
-    return getattr(importlib.import_module(module_path), class_name)
+    return _load_class(dotted_path)
 
 
 def _episode_seed(step: int, tier: str, episode_idx: int) -> int:
@@ -56,25 +54,16 @@ def _episode_seed(step: int, tier: str, episode_idx: int) -> int:
 
 def _run_episode(
     env,
-    encoder: SharedTransformerEncoder,
-    policy: StochasticPolicyHead,
-    entity_ids: torch.Tensor,
-    t_window: int,
+    algorithm,
     seed: int,
 ) -> int:
-    """Run a single episode with deterministic policy. Returns +1, -1, or 0."""
+    """Run a single episode with deterministic inference. Returns +1, -1, or 0."""
     obs, _info = env.reset(seed=seed)
 
     done = False
     score = 0
     while not done:
-        with torch.no_grad():
-            x = torch.tensor(obs[np.newaxis], dtype=torch.float32)
-            tokens = x.view(1, t_window, N_TOKENS, TOKEN_FEATURES)
-            emb = encoder(tokens, entity_ids)
-            action, _ = policy.act_deterministic(emb)
-        action_np = action[0].cpu().numpy().astype(np.float32)
-
+        action_np = algorithm.infer(obs[np.newaxis])[0]
         obs, _reward, done, _trunc, info = env.step(action_np)
         if done:
             score = info.get('goal', 0)
@@ -85,9 +74,7 @@ def _run_episode(
 def _eval_tier(
     tier: str,
     opponent_path: Optional[str],
-    encoder: SharedTransformerEncoder,
-    policy: StochasticPolicyHead,
-    entity_ids: torch.Tensor,
+    algorithm,
     step: int,
     episodes: int,
     timeout_steps: int,
@@ -108,7 +95,7 @@ def _eval_tier(
     scores: List[int] = []
     for ep_idx in range(episodes):
         seed = _episode_seed(step, tier, ep_idx)
-        score = _run_episode(env, encoder, policy, entity_ids, t_window, seed)
+        score = _run_episode(env, algorithm, seed)
         scores.append(score)
 
     env.close()
@@ -132,6 +119,8 @@ def run_eval_worker(
     result_path: str,
     error_log_path: str,
     eval_config_dict: dict,
+    algo_class: str = '',
+    algo_config: Optional[dict] = None,
 ) -> None:
     """
     Main entry point for the eval subprocess.
@@ -146,9 +135,14 @@ def run_eval_worker(
         Where to append error tracebacks on failure.
     eval_config_dict : dict
         Serialized EvalConfig fields.
+    algo_class : str
+        Dotted path to the Algorithm class (e.g. 'training.algorithms.ppo.PPOAlgorithm').
+    algo_config : dict, optional
+        Config dict for Algorithm construction (inference-only mode).
     """
     try:
-        _run(checkpoint_path, result_path, eval_config_dict)
+        _run(checkpoint_path, result_path, eval_config_dict,
+             algo_class, algo_config or {})
     except Exception:
         tb = traceback.format_exc()
         print(f'[eval_worker] FAILED on {checkpoint_path}:\n{tb}',
@@ -163,7 +157,8 @@ def run_eval_worker(
             pass  # can't even log the error — nothing more to do
 
 
-def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None:
+def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict,
+         algo_class: str, algo_config: dict) -> None:
     cfg = EvalConfig(**eval_config_dict)
     t0 = time.monotonic()
 
@@ -171,14 +166,15 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     step = ckpt['step']
 
-    # Build models on CPU
-    encoder = SharedTransformerEncoder(d_model=D_MODEL)
-    policy = StochasticPolicyHead(d_model=D_MODEL)
-    encoder.load_state_dict(ckpt['encoder'])
-    policy.load_state_dict(ckpt['policy'])
-    encoder.eval()
-    policy.eval()
-    entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
+    # Build algorithm in inference-only mode
+    if algo_class:
+        AlgoCls = _load_class(algo_class)
+    else:
+        from training.algorithms.ppo import PPOAlgorithm
+        AlgoCls = PPOAlgorithm
+    algo = AlgoCls({**algo_config, 'inference': True, 'device': 'cpu',
+                    't_window': cfg.t_window})
+    algo.load_weights({'encoder': ckpt['encoder'], 'policy': ckpt['policy']})
 
     # Run all tiers
     tier_results = {}
@@ -191,9 +187,7 @@ def _run(checkpoint_path: str, result_path: str, eval_config_dict: dict) -> None
         tier_results[tier] = _eval_tier(
             tier=tier,
             opponent_path=opponent_path,
-            encoder=encoder,
-            policy=policy,
-            entity_ids=entity_ids,
+            algorithm=algo,
             step=step,
             episodes=cfg.episodes_per_tier,
             timeout_steps=cfg.episode_timeout_steps,
