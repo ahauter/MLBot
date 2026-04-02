@@ -175,10 +175,10 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     # ════════════════════════════════════════════════════════════════════
     newton = {'x': 0.0, 'v': ball_v0}
 
-    # Ball field: starts empty, learns from Newtonian positions via LMS
+    # Ball field: Gaussian wavepacket, shifted to match Newtonian position
     b_ball = WavepacketObject(
         K, frequencies, x0=0.0, mass=1.0,
-        c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
+        sigma=ball_sigma, amplitude=ball_amplitude)
 
     # Wall field: starts empty, learns from bounce contact positions via LMS
     b_wall = WavepacketObject(
@@ -189,18 +189,17 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     # Shared
     history_t = deque(maxlen=window)
-    state = {'t': 0, 'fft_ymax': 1.0}
+    state = {'t': 0}
 
-    # ── figure: 2 field panels + position comparison + 2 FFT panels ──
-    fig, (ax_a, ax_b, ax_track,
-          ax_fft_a, ax_fft_b) = plt.subplots(
-        5, 1, figsize=(12, 14),
-        gridspec_kw={'height_ratios': [2, 2, 1, 1, 1]})
+    # ── figure: 2 field panels + position comparison ──────────────────
+    fig, (ax_a, ax_b, ax_track) = plt.subplots(
+        3, 1, figsize=(12, 11),
+        gridspec_kw={'height_ratios': [2, 2, 1]})
     fig.patch.set_facecolor(BG_COLOR)
     fig.suptitle('Spectral Field — Two Directions',
                  color=TITLE_COLOR, fontsize=13, fontweight='bold', y=0.98)
 
-    for ax in [ax_a, ax_b, ax_track, ax_fft_a, ax_fft_b]:
+    for ax in [ax_a, ax_b, ax_track]:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
@@ -244,7 +243,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_b.axvline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
 
     lb_ball_field, = ax_b.plot([], [], color=BALL_COLOR, lw=2, alpha=0.9,
-                                label='Learned ball field')
+                                label='Ball wavepacket (shifted)')
     lb_wall_field, = ax_b.plot([], [], color=RECON_WALL_COLOR, lw=1.5,
                                 alpha=0.8, label='Learned wall field')
     lb_dot, = ax_b.plot([], [], 'o', color=NEWTON_COLOR, markersize=12,
@@ -252,9 +251,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     lb_arrow = [None]
 
     ax_b.text(0.02, 0.97,
-              r'LMS: $c \leftarrow c + \eta\,b(x)(x - c^T b(x))$'
+              'Ball: wavepacket shifted to Newtonian position'
               '\n'
-              r'Wall learned from bounce contacts',
+              'Wall: LMS learned from bounce contacts',
               transform=ax_b.transAxes, color='#ccc', fontsize=9,
               verticalalignment='top',
               bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -279,21 +278,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_track.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
 
-    # ── Panel 4: FFT — spectral ball ────────────────────────────────
-    nyquist = 1.0 / (2.0 * dt)
-    for ax_fft, title, color in [
-        (ax_fft_a, 'FFT — Spectral Ball (Panel A)', BALL_COLOR),
-        (ax_fft_b, 'FFT — Newtonian Ball (Panel B)', NEWTON_COLOR)]:
-        ax_fft.set_xlim(0, nyquist)
-        ax_fft.set_ylim(0, 50)
-        ax_fft.set_xlabel('Frequency (Hz)', color=LABEL_COLOR, fontsize=9)
-        ax_fft.set_ylabel('|FFT|', color=LABEL_COLOR, fontsize=9)
-        ax_fft.set_title(title, color=color, fontsize=10,
-                         fontweight='bold', pad=6)
-
-    lf_a, = ax_fft_a.plot([], [], color=BALL_COLOR, lw=1.5)
-    lf_b, = ax_fft_b.plot([], [], color=NEWTON_COLOR, lw=1.5)
-
     frame_text = ax_a.text(0.98, 0.02, '', transform=ax_a.transAxes,
                             color='#555', fontsize=8,
                             horizontalalignment='right')
@@ -305,7 +289,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     def init():
         for line in [la_ball_field, la_wall_field,
                      lb_ball_field, lb_wall_field,
-                     lt_spectral, lt_newton, lf_a, lf_b]:
+                     lt_spectral, lt_newton]:
             line.set_data([], [])
         la_dot.set_data([], [])
         lb_dot.set_data([], [])
@@ -343,19 +327,18 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
         nx = newton['x']
 
-        # LMS: learn ball field from current position
-        b_ball.update(nx)
+        # Shift ball wavepacket to match Newtonian position
+        delta_b = nx - b_ball.x
+        b_ball.shift(delta_b)
+        b_ball.x = nx
 
         # LMS: learn wall field from bounce contact positions
-        # Each bounce tells us a wall is at that boundary
         if bounced:
-            # The wall the ball just hit
             wall_pos = wall_right if newton['v'] < 0 else wall_left
-            # Multiple LMS steps on contact (wall position is high-value info)
             for _ in range(10):
                 b_wall.update(wall_pos)
 
-        # Compute the reconstructed inner product force
+        # Inner product force from reconstructed spectral fields
         overlap_b = b_ball.inner_product(b_wall)
         force_b = -alpha * overlap_b
 
@@ -408,29 +391,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         lt_newton.set_data(ts, np.array(b_hist_x))
         if len(ts) > 1:
             ax_track.set_xlim(ts[0], ts[-1] + 1)
-
-        # ── panels 4-5: FFT ─────────────────────────────────────
-        n = len(a_hist_x)
-        if n >= 64:
-            win = np.hanning(n)
-
-            arr_a = np.array(a_hist_x)
-            arr_a = arr_a - arr_a.mean()
-            arr_b = np.array(b_hist_x)
-            arr_b = arr_b - arr_b.mean()
-
-            fft_a = np.abs(np.fft.rfft(arr_a * win))
-            fft_b = np.abs(np.fft.rfft(arr_b * win))
-            freqs = np.fft.rfftfreq(n, d=dt)
-
-            lf_a.set_data(freqs, fft_a)
-            lf_b.set_data(freqs, fft_b)
-
-            ymax = max(fft_a.max(), fft_b.max(), 1.0) * 1.1
-            ymax = max(ymax, state['fft_ymax'] * 0.95)
-            state['fft_ymax'] = ymax
-            ax_fft_a.set_ylim(0, ymax)
-            ax_fft_b.set_ylim(0, ymax)
 
         return ()
 
