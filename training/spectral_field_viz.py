@@ -339,10 +339,8 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         newton['x'] += newton['v'] * dt
 
         # Friction pad: decelerate proportional to velocity
-        """l""
         if pad_left <= newton['x'] <= pad_right:
-            newton['v'] += pad_friction * newton['v'] * dt
-            """
+            newton['v'] -= pad_friction * newton['v'] * dt
 
         # Wall bounces
         if newton['x'] >= wall_right:
