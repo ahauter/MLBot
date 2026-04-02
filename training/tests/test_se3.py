@@ -27,11 +27,14 @@ from se3_field import (
     normalise_quaternion, quaternion_inner, quaternion_exponential,
     detect_contact, detect_contact_np,
     SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, EMBED_DIM,
-    N_OBJECTS, K, N_CHANNELS, GRAVITY_DV_Z,
+    N_OBJECTS, K, D_AMP, N_CHANNELS, GRAVITY_DV_Z,
     make_initial_coefficients, update_coefficients_np, pack_observation,
-    _BALL, _EGO, _OPP, _GOAL_TEAM, _GOAL_OPP,
-    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _PREV_VEL_OFF,
+    _BALL, _EGO, _OPP, _STADIUM,
+    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF, _PREV_VEL_OFF,
     _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
+    _PREV_ANG_VEL_OFF, _PREV_EGO_ANG_VEL_OFF, _PREV_OPP_ANG_VEL_OFF,
+    _PREV_SCALARS_OFF, _PREV_OPP_SCALARS_OFF,
+    D_FIELD, D_OUTER, CONV_OUT, CONTEXT_DIM,
 )
 from se3_policy import SE3Policy, StochasticSE3Policy
 
@@ -131,7 +134,7 @@ class TestContactDetection:
 class TestSE3Encoder:
 
     def test_forward_shape(self):
-        """forward() returns (batch, COEFF_DIM=576)."""
+        """forward() returns (batch, COEFF_DIM=1080)."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
         out = encoder(obs)
@@ -182,9 +185,9 @@ class TestSE3Encoder:
         # Set current ball vel to something huge (offset 3-5)
         obs[0, 3] = 10.0  # ball vx huge (normalised)
         obs[0, 4] = 10.0  # ball vy huge
-        # prev_ball_vel at offset 54 stays zero → huge Δv/dt → contact
+        # prev_ball_vel at _PREV_VEL_OFF stays zero → huge Δv/dt → contact
         # Give some non-zero prev coefficients for ball
-        ball_coeff_size = K * 3 * N_CHANNELS
+        ball_coeff_size = K * D_AMP * N_CHANNELS
         obs[0, RAW_STATE_DIM:RAW_STATE_DIM + ball_coeff_size] = 1.0
 
         with torch.no_grad():
@@ -232,15 +235,15 @@ class TestCoefficientHelpers:
 
     def test_update_coefficients_modifies(self):
         """Coefficients should change after update with non-zero state."""
-        k = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 0.1
+        k = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32) * 0.1
         q = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         q /= np.maximum(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
         coeff = make_initial_coefficients()
         raw = np.random.randn(RAW_STATE_DIM).astype(np.float32) * 0.1
         # Set valid quaternions in raw state
-        raw[6 + 6:6 + 10] = [1.0, 0.0, 0.0, 0.0]  # ego quat
-        raw[17 + 6:17 + 10] = [1.0, 0.0, 0.0, 0.0]  # opp quat
+        raw[_EGO_OFF + 6:_EGO_OFF + 10] = [1.0, 0.0, 0.0, 0.0]  # ego quat
+        raw[_OPP_OFF + 6:_OPP_OFF + 10] = [1.0, 0.0, 0.0, 0.0]  # opp quat
 
         new_coeff = update_coefficients_np(k, q, lr, coeff, raw)
         assert new_coeff.shape == (COEFF_DIM,)
@@ -261,22 +264,24 @@ class TestSpectralMath:
     """Verify the spectral field update math is correct."""
 
     def _make_raw_state(self, seed: int = 0) -> np.ndarray:
-        """Build a plausible raw state (63-dim) with valid unit quaternions."""
+        """Build a plausible raw state (74-dim) with valid unit quaternions."""
         rng = np.random.default_rng(seed)
         raw = rng.uniform(-0.5, 0.5, RAW_STATE_DIM).astype(np.float32)
-        # Ego quaternion (offset 12-15): unit norm
+        # Ego quaternion: unit norm
         eq = rng.standard_normal(4).astype(np.float32)
         raw[_EGO_OFF + 6:_EGO_OFF + 10] = eq / np.linalg.norm(eq)
         # Opp quaternion: unit norm
         oq = rng.standard_normal(4).astype(np.float32)
         raw[_OPP_OFF + 6:_OPP_OFF + 10] = oq / np.linalg.norm(oq)
-        # Pad active flags: clamp to [0,1]
+        # Pad active flags: clamp to [0,1] — each is a single flag
         for i in range(6):
-            raw[_PAD_OFF + i * 4 + 3] = np.clip(raw[_PAD_OFF + i * 4 + 3], 0.0, 1.0)
+            raw[_PAD_OFF + i] = np.clip(raw[_PAD_OFF + i], 0.0, 1.0)
         # Zero prev velocities so contact is not triggered
-        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = 0.0
-        raw[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = 0.0
-        raw[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = 0.0
+        raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 9] = 0.0
+        # Zero prev angular velocities
+        raw[_PREV_ANG_VEL_OFF:_PREV_ANG_VEL_OFF + 9] = 0.0
+        # Zero prev scalars
+        raw[_PREV_SCALARS_OFF:_PREV_SCALARS_OFF + 6] = 0.0
         raw[_BALL_OFF + 3:_BALL_OFF + 6] = 0.0
         return raw
 
@@ -311,7 +316,7 @@ class TestSpectralMath:
     def test_coefficient_convergence_real(self):
         """Real coefficients converge: repeated updates on a fixed state drive residual → 0."""
         rng = np.random.default_rng(42)
-        k = rng.standard_normal((N_OBJECTS, K, 3)).astype(np.float32) * 0.3
+        k = rng.standard_normal((N_OBJECTS, K, D_AMP)).astype(np.float32) * 0.3
         q = rng.standard_normal((N_OBJECTS, K, 4)).astype(np.float32)
         q /= np.linalg.norm(q, axis=-1, keepdims=True)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
@@ -320,26 +325,35 @@ class TestSpectralMath:
         coeff = make_initial_coefficients()
 
         def residual_real(coeff, obj):
-            """Mean absolute real-part residual over x/y/z for one object."""
-            c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
-            pos = np.zeros(3, dtype=np.float32)
-            if obj == 0:    pos = raw[_BALL_OFF:_BALL_OFF + 3]
-            elif obj == 1:  pos = raw[_EGO_OFF:_EGO_OFF + 3]
-            elif obj == 2:  pos = raw[_EGO_OFF:_EGO_OFF + 3]
-            elif obj == 3:  pos = raw[_OPP_OFF:_OPP_OFF + 3]
-            elif obj == 5:  pos = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-            elif obj == 6:  pos = np.array([0.0,  1.0, 0.0], dtype=np.float32)
-            phase = k[obj] @ pos
+            """Mean absolute real-part residual over D_AMP dims for one object."""
+            c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
+            amp = np.zeros(D_AMP, dtype=np.float32)
+            if obj == _BALL:
+                amp[:3] = raw[_BALL_OFF:_BALL_OFF + 3]
+                amp[3:6] = raw[_BALL_OFF + 6:_BALL_OFF + 9]
+            elif obj == _EGO:
+                amp[:3] = raw[_EGO_OFF:_EGO_OFF + 3]
+                amp[3:6] = raw[_EGO_OFF + 10:_EGO_OFF + 13]
+                amp[6] = raw[_EGO_OFF + 13]
+                amp[7] = raw[_EGO_OFF + 14]
+                amp[8] = raw[_EGO_OFF + 15]
+            elif obj == _OPP:
+                amp[:3] = raw[_OPP_OFF:_OPP_OFF + 3]
+                amp[3:6] = raw[_OPP_OFF + 10:_OPP_OFF + 13]
+                amp[6] = raw[_OPP_OFF + 13]
+                amp[7] = raw[_OPP_OFF + 14]
+                amp[8] = raw[_OPP_OFF + 15]
+            phase = k[obj] @ amp
             s_cos = np.cos(phase)
-            if obj == 1:
+            if obj == _EGO:
                 ori = raw[_EGO_OFF + 6:_EGO_OFF + 10]
-            elif obj == 3:
+            elif obj == _OPP:
                 ori = raw[_OPP_OFF + 6:_OPP_OFF + 10]
             else:
                 ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             orient = (q[obj] * ori).sum(axis=-1)          # (K,)
-            pred = (s_cos * orient) @ c[obj, :, :, 0]    # (K,)@(K,3) → (3,)
-            return np.abs(pos - pred).mean()
+            pred = (s_cos * orient) @ c[obj, :, :, 0]    # (K,)@(K,D_AMP) → (D_AMP,)
+            return np.abs(amp - pred).mean()
 
         # Measure initial residual for ball (obj 0)
         res_before = residual_real(coeff, obj=0)
@@ -355,7 +369,7 @@ class TestSpectralMath:
     def test_complex_field_convergence(self):
         """Complex reconstruction Re[f] = Σ(a·cos - b·sin) converges toward position."""
         rng = np.random.default_rng(99)
-        k = rng.standard_normal((N_OBJECTS, K, 3)).astype(np.float32) * 0.3
+        k = rng.standard_normal((N_OBJECTS, K, D_AMP)).astype(np.float32) * 0.3
         q = rng.standard_normal((N_OBJECTS, K, 4)).astype(np.float32)
         q /= np.linalg.norm(q, axis=-1, keepdims=True)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
@@ -364,17 +378,19 @@ class TestSpectralMath:
         coeff = make_initial_coefficients()
 
         def complex_residual(coeff):
-            """Mean abs complex reconstruction error for ball."""
-            c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
-            pos = raw[_BALL_OFF:_BALL_OFF + 3]
-            phase = k[_BALL] @ pos
+            """Mean abs complex reconstruction error for ball (D_AMP=9)."""
+            c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
+            amp = np.zeros(D_AMP, dtype=np.float32)
+            amp[:3] = raw[_BALL_OFF:_BALL_OFF + 3]
+            amp[3:6] = raw[_BALL_OFF + 6:_BALL_OFF + 9]
+            phase = k[_BALL] @ amp
             ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             orient = (q[_BALL] * ori).sum(axis=-1)
             basis_cos = np.cos(phase) * orient
             basis_sin = np.sin(phase) * orient
             # Re[f] = Σ_k (a_k·cos·q - b_k·sin·q)
             pred = basis_cos @ c[_BALL, :, :, 0] - basis_sin @ c[_BALL, :, :, 1]
-            return np.abs(pos - pred).mean()
+            return np.abs(amp - pred).mean()
 
         res_before = complex_residual(coeff)
 
@@ -401,7 +417,7 @@ class TestSpectralMath:
         with torch.no_grad():
             out = encoder(obs)
 
-        coeff = out[0].reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        coeff = out[0].reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
 
         # Ball must be zeroed
         assert coeff[_BALL].abs().sum().item() < 1e-5, \
@@ -871,7 +887,7 @@ class TestCoefficientClipping:
     def test_numpy_clipping(self):
         """update_coefficients_np output stays within [-COEFF_CLIP, COEFF_CLIP]."""
         from se3_field import COEFF_CLIP
-        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32)
+        k_sp = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32)
         quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
@@ -926,7 +942,7 @@ class TestComplexCoupling:
 
         # Set imaginary coefficients to nonzero
         obs2 = obs.clone()
-        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, 3, N_CHANNELS)
+        prev = obs2[:, RAW_STATE_DIM:].reshape(2, N_OBJECTS, K, D_AMP, N_CHANNELS)
         prev[:, :, :, :, 1] = 0.5  # imag channel
         obs2[:, RAW_STATE_DIM:] = prev.reshape(2, -1)
         with torch.no_grad():
@@ -939,19 +955,19 @@ class TestComplexCoupling:
     def test_complex_velocity_derivative(self):
         """Analytical velocity (Im[f]) should approximate finite-difference velocity."""
         # Set up known coefficients and positions
-        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 0.5
+        k_sp = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32) * 0.5
         quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
 
-        pos = np.random.randn(N_OBJECTS, 3).astype(np.float32) * 0.3
+        amp = np.random.randn(N_OBJECTS, D_AMP).astype(np.float32) * 0.3
         ori = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (N_OBJECTS, 1))
 
         # Known coefficients
-        coeff = np.random.randn(N_OBJECTS, K, 3, N_CHANNELS).astype(np.float32) * 0.1
+        coeff = np.random.randn(N_OBJECTS, K, D_AMP, N_CHANNELS).astype(np.float32) * 0.1
 
-        # Compute Re[f] at pos
-        def recon_at(p, obj):
-            phase = k_sp[obj] @ p
+        # Compute Re[f] at amp
+        def recon_at(a, obj):
+            phase = k_sp[obj] @ a
             s_cos = np.cos(phase)
             s_sin = np.sin(phase)
             orient = (quats[obj] * ori[obj]).sum(axis=-1)
@@ -962,14 +978,14 @@ class TestComplexCoupling:
         # Finite difference velocity for object 0
         eps = 1e-4
         obj = 0
-        fd_vel = np.zeros(3, dtype=np.float32)
-        for d in range(3):
-            p_plus = pos[obj].copy(); p_plus[d] += eps
-            p_minus = pos[obj].copy(); p_minus[d] -= eps
-            fd_vel[d] = (recon_at(p_plus, obj) - recon_at(p_minus, obj))[d] / (2 * eps)
+        fd_vel = np.zeros(D_AMP, dtype=np.float32)
+        for d in range(D_AMP):
+            a_plus = amp[obj].copy(); a_plus[d] += eps
+            a_minus = amp[obj].copy(); a_minus[d] -= eps
+            fd_vel[d] = (recon_at(a_plus, obj) - recon_at(a_minus, obj))[d] / (2 * eps)
 
-        # Analytical: Im[f] = Σ_k (a·sin + b·cos) — this is the imaginary part
-        phase = k_sp[obj] @ pos[obj]
+        # Analytical: Im[f] = Sigma_k (a*sin + b*cos) -- this is the imaginary part
+        phase = k_sp[obj] @ amp[obj]
         s_cos = np.cos(phase)
         s_sin = np.sin(phase)
         orient = (quats[obj] * ori[obj]).sum(axis=-1)
@@ -995,7 +1011,7 @@ class TestWInteract:
 
     def test_zero_W_preserves_output(self):
         """W_interact=0 should produce identical output to W_interact=None."""
-        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
+        k_sp = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32) * 1.0
         quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
@@ -1011,7 +1027,7 @@ class TestWInteract:
 
     def test_nonzero_W_changes_output(self):
         """Non-zero W_interact should change the coefficient update."""
-        k_sp = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
+        k_sp = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32) * 1.0
         quats = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         quats /= np.linalg.norm(quats, axis=-1, keepdims=True)
         lr = np.full(N_OBJECTS, 0.05, dtype=np.float32)
@@ -1219,25 +1235,28 @@ class TestPhysicsConvergence:
         coeff_tensor: (1, COEFF_DIM)
         positions_tensor: (1, 3, 3)  — positions of ball, ego, opp
         """
-        c = coeff_tensor.reshape(1, N_OBJECTS, K, 3, N_CHANNELS)
-        full_pos = torch.zeros(1, N_OBJECTS, 3, device=coeff_tensor.device)
-        full_pos[0, _BALL] = positions_tensor[0, 0]
-        full_pos[0, _EGO] = positions_tensor[0, 1]
-        full_pos[0, _OPP] = positions_tensor[0, 2]
-        full_pos[0, _GOAL_TEAM, 1] = -1.0
-        full_pos[0, _GOAL_OPP, 1] = 1.0
+        c = coeff_tensor.reshape(1, N_OBJECTS, K, D_AMP, N_CHANNELS)
+        # Build 9d amplitude targets (only position dims filled for this test)
+        full_amp = torch.zeros(1, N_OBJECTS, D_AMP, device=coeff_tensor.device)
+        full_amp[0, _BALL, :3] = positions_tensor[0, 0]
+        full_amp[0, _EGO, :3] = positions_tensor[0, 1]
+        full_amp[0, _OPP, :3] = positions_tensor[0, 2]
+        # _TEAM = _EGO in 1v1, _STADIUM stays zero
 
         q_basis = encoder.quaternions / encoder.quaternions.norm(
             dim=-1, keepdim=True).clamp(min=1e-8)
-        phase = torch.einsum('okd,bod->bok', encoder.k_spatial, full_pos)
+        # k_spatial: (N_OBJECTS, K, D_AMP), full_amp: (1, N_OBJECTS, D_AMP) -> phase: (1, N_OBJECTS, K)
+        phase = torch.einsum('okd,bod->bok', encoder.k_spatial, full_amp)
         orient = torch.einsum('okd,bod->bok', q_basis,
                               torch.tensor([1, 0, 0, 0.], device=coeff_tensor.device)
                               .unsqueeze(0).unsqueeze(0).expand(1, N_OBJECTS, 4))
-        basis_cos = (torch.cos(phase) * orient).unsqueeze(-1)
+        basis_cos = (torch.cos(phase) * orient).unsqueeze(-1)   # (1, N_OBJECTS, K, 1)
         basis_sin = (torch.sin(phase) * orient).unsqueeze(-1)
+        # c[:, :, :, :, 0] is (1, N_OBJECTS, K, D_AMP)
         predicted = (basis_cos * c[:, :, :, :, 0]
-                     - basis_sin * c[:, :, :, :, 1]).sum(dim=2)
-        return ((full_pos[:, :3] - predicted[:, :3]) ** 2).mean()
+                     - basis_sin * c[:, :, :, :, 1]).sum(dim=2)  # (1, N_OBJECTS, D_AMP)
+        # Compare only position dims (:3) for the 3 moving objects
+        return ((full_amp[:, :3, :3] - predicted[:, :3, :3]) ** 2).mean()
 
     def test_encoder_converges_on_bouncing_balls(self):
         """Train encoder on next-step prediction: given coeff[t], predict pos[t+1].
@@ -1473,7 +1492,7 @@ class TestPhysicsConvergence:
 class TestEncodeForPolicy:
 
     def test_embed_shape(self):
-        """encode_for_policy() returns (batch, EMBED_DIM=82)."""
+        """encode_for_policy() returns (batch, EMBED_DIM=26)."""
         encoder = SE3Encoder()
         obs = torch.randn(4, SE3_OBS_DIM)
         embed = encoder.encode_for_policy(obs)
@@ -1481,15 +1500,19 @@ class TestEncodeForPolicy:
 
     def test_embed_gradients(self):
         """Gradients from encode_for_policy reach k_spatial, quaternions, W_interact."""
+        torch.manual_seed(42)
         encoder = SE3Encoder()
         obs = torch.randn(2, SE3_OBS_DIM)
         embed = encoder.encode_for_policy(obs)
-        loss = embed.sum()
+        loss = (embed ** 2).sum()
         loss.backward()
         assert encoder.k_spatial.grad is not None
         assert encoder.k_spatial.grad.abs().sum() > 0
         assert encoder.quaternions.grad is not None
         assert encoder.W_interact.grad is not None
+        # Interaction conv parameters should also have gradients
+        assert encoder.field_proj.weight.grad is not None
+        assert encoder.interaction_conv[0].weight.grad is not None
 
     def test_output_layernorm_normalizes(self):
         """Output should have approximately zero mean and unit variance per sample."""
@@ -1553,7 +1576,7 @@ class TestAccelerationChannel:
                 coeff = encoder(obs)
 
         # Accel channel coefficients (channel 2) for ball should be small
-        c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
         ball_accel = c[_BALL, :, :, 2].abs().mean().item()
         assert ball_accel < 0.5, (
             f"Freefall accel residual should be near zero, got {ball_accel:.4f}")
@@ -1583,7 +1606,7 @@ class TestAccelerationChannel:
         with torch.no_grad():
             coeff2 = encoder(obs2)
 
-        c = coeff2.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        c = coeff2.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
         ego_accel = c[_EGO, :, :, 2].abs().mean().item()
         assert ego_accel > 1e-5, (
             f"Ego accel channel should be nonzero after impulse, got {ego_accel:.6f}")
@@ -1593,25 +1616,25 @@ class TestAccelerationChannel:
 
 class TestParameterCount:
 
-    def test_parameter_count_under_24k(self):
-        """Total encoder + policy params must fit under 24K tournament limit."""
+    def test_parameter_count_under_30k(self):
+        """Total encoder + policy params must fit under 30K limit."""
         encoder = SE3Encoder()
         policy = SE3Policy()
         enc_params = sum(p.numel() for p in encoder.parameters())
         pol_params = sum(p.numel() for p in policy.parameters())
         total = enc_params + pol_params
-        assert total < 24000, (
-            f"Total params {total} exceeds 24K limit "
+        assert total < 30000, (
+            f"Total params {total} exceeds 30K limit "
             f"(encoder={enc_params}, policy={pol_params})")
 
-    def test_stochastic_policy_under_24k(self):
+    def test_stochastic_policy_under_30k(self):
         """StochasticSE3Policy variant also under limit."""
         encoder = SE3Encoder()
         policy = StochasticSE3Policy()
         enc_params = sum(p.numel() for p in encoder.parameters())
         pol_params = sum(p.numel() for p in policy.parameters())
         total = enc_params + pol_params
-        assert total < 24000, f"Total params {total} exceeds 24K"
+        assert total < 30000, f"Total params {total} exceeds 30K"
 
 
 # ── 4500-step toy simulation stability test ─────────────────────────────────
@@ -1662,7 +1685,7 @@ class TestLongSimulation:
 
         # Final reconstruction error should be finite and reasonable
         # (we can't train during this test, but tracking should work)
-        c = coeff.reshape(N_OBJECTS, K, 3, N_CHANNELS)
+        c = coeff.reshape(N_OBJECTS, K, D_AMP, N_CHANNELS)
         assert np.isfinite(c).all(), "Final coefficients have non-finite values"
 
     def test_rlgym_4500_step_integration(self):
@@ -1689,3 +1712,124 @@ class TestLongSimulation:
                 obs, _ = env.reset()
 
         env.close()
+
+
+# ── Interaction conv shape tests ──────────────────────────────────────────────
+
+class TestInteractionConvShapes:
+
+    def test_field_proj_output(self):
+        """field_proj maps per-object coeff to (batch, N_OBJECTS, D_FIELD=16)."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        batch = 3
+        # Create fake per-object flattened coefficients
+        coeff_flat = torch.randn(batch, N_OBJECTS, K * D_AMP * N_CHANNELS)
+        with torch.no_grad():
+            f = encoder.field_proj(coeff_flat)
+        assert f.shape == (batch, N_OBJECTS, D_FIELD), \
+            f"Expected ({batch}, {N_OBJECTS}, {D_FIELD}), got {f.shape}"
+
+    def test_inner_product_shape(self):
+        """Inner product matrix is (batch, 1, N_OBJECTS, N_OBJECTS)."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        batch = 2
+        f = torch.randn(batch, N_OBJECTS, D_FIELD)
+        inner = torch.bmm(f, f.transpose(1, 2)).unsqueeze(1)
+        assert inner.shape == (batch, 1, N_OBJECTS, N_OBJECTS)
+
+    def test_outer_product_shape(self):
+        """Rank-reduced outer products are (batch, D_OUTER^2, N_OBJECTS, N_OBJECTS)."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        batch = 2
+        f = torch.randn(batch, N_OBJECTS, D_FIELD)
+        with torch.no_grad():
+            left = encoder.proj_left(f)
+            right = encoder.proj_right(f)
+        assert left.shape == (batch, N_OBJECTS, D_OUTER)
+        assert right.shape == (batch, N_OBJECTS, D_OUTER)
+        left_outer = torch.einsum('bid,bjc->bijdc', left, left)
+        left_outer = left_outer.reshape(batch, N_OBJECTS, N_OBJECTS, D_OUTER * D_OUTER)
+        left_outer = left_outer.permute(0, 3, 1, 2)
+        assert left_outer.shape == (batch, D_OUTER * D_OUTER, N_OBJECTS, N_OBJECTS)
+
+    def test_conv_output_shape(self):
+        """Interaction conv produces (batch, CONV_OUT=16)."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        batch = 2
+        # 33 = 1 (inner) + 16 (left outer) + 16 (right outer)
+        conv_in = torch.randn(batch, 1 + D_OUTER * D_OUTER + D_OUTER * D_OUTER,
+                              N_OBJECTS, N_OBJECTS)
+        with torch.no_grad():
+            out = encoder.interaction_conv(conv_in)
+        out = out.squeeze(-1).squeeze(-1)
+        assert out.shape == (batch, CONV_OUT), \
+            f"Expected ({batch}, {CONV_OUT}), got {out.shape}"
+
+    def test_encode_for_policy_full_pipeline(self):
+        """Full encode_for_policy pipeline produces (batch, EMBED_DIM=26)."""
+        encoder = SE3Encoder()
+        encoder.eval()
+        obs = torch.randn(4, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed = encoder.encode_for_policy(obs)
+        assert embed.shape == (4, EMBED_DIM)
+        assert EMBED_DIM == CONV_OUT + CONTEXT_DIM == 26
+
+
+# ── D_AMP=9 phase computation test ──────────────────────────────────────────
+
+class TestDAmp9Phase:
+
+    def test_phase_with_full_9d_state(self):
+        """Phase = k_spatial @ amplitude where both are 9-dimensional."""
+        encoder = SE3Encoder()
+        k = encoder.k_spatial.detach()  # (N_OBJECTS, K, D_AMP=9)
+        assert k.shape == (N_OBJECTS, K, D_AMP)
+
+        # Build a full 9d amplitude vector for ego
+        amp = torch.zeros(D_AMP)
+        amp[:3] = torch.tensor([0.1, -0.2, 0.05])     # position
+        amp[3:6] = torch.tensor([0.01, -0.02, 0.03])   # angular velocity
+        amp[6] = 0.5                                     # boost
+        amp[7] = 1.0                                     # has_flip
+        amp[8] = 1.0                                     # on_ground
+
+        # Phase for ego object
+        phase = k[_EGO] @ amp  # (K,)
+        assert phase.shape == (K,)
+        assert torch.isfinite(phase).all()
+
+    def test_phase_position_only_vs_full(self):
+        """Phase with full 9d amplitude differs from position-only 3d amplitude."""
+        encoder = SE3Encoder()
+        k = encoder.k_spatial.detach()
+
+        amp_full = torch.zeros(D_AMP)
+        amp_full[:3] = torch.tensor([0.1, -0.2, 0.05])
+        amp_full[3:6] = torch.tensor([0.5, -0.3, 0.1])
+        amp_full[6] = 0.8
+        amp_full[7] = 1.0
+        amp_full[8] = 0.0
+
+        amp_pos_only = torch.zeros(D_AMP)
+        amp_pos_only[:3] = amp_full[:3]
+
+        phase_full = k[_EGO] @ amp_full
+        phase_pos = k[_EGO] @ amp_pos_only
+
+        # Unless k_spatial[:, 3:] happens to be exactly zero (vanishingly unlikely),
+        # the phases should differ
+        assert not torch.allclose(phase_full, phase_pos, atol=1e-6), \
+            "Full 9d phase should differ from position-only phase"
+
+    def test_all_objects_have_9d_k_spatial(self):
+        """Every object's k_spatial has shape (K, D_AMP=9)."""
+        encoder = SE3Encoder()
+        k = encoder.k_spatial.detach()
+        for obj in range(N_OBJECTS):
+            assert k[obj].shape == (K, D_AMP), \
+                f"Object {obj} k_spatial shape mismatch: {k[obj].shape}"

@@ -4,14 +4,14 @@ SE3 Gymnasium Environment
 Wraps rlgym-sim as a gymnasium.Env for SE(3) spectral field training.
 
 The env maintains SE3 field state (coefficients) internally and produces
-SE3_OBS_DIM-dim observations: [raw_state (63) | coefficients (576)].
+SE3_OBS_DIM-dim observations: [raw_state (74) | coefficients (1080)].
 
 The SE3Encoder in the algorithm recomputes the coefficient update
 differentiably during training.  The env's numpy update is used only
 during rollout collection (no grad needed).
 
-Observation: (639,) float32
-Action:      (8,)   float32 — 5 analog [-1,1] + 3 binary (threshold 0.5)
+Observation: (1154,) float32
+Action:      (8,)    float32 — 5 analog [-1,1] + 3 binary (threshold 0.5)
 """
 from __future__ import annotations
 
@@ -34,14 +34,23 @@ from encoder import (
     TOKEN_FEATURES, N_TOKENS,
 )
 from se3_field import (
-    SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, N_OBJECTS, K,
+    SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM, N_OBJECTS, K, D_AMP,
     make_initial_coefficients, update_coefficients_np,
     pack_observation, euler_to_quaternion_batch,
-    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF, _PREV_VEL_OFF,
-    _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
+    _BALL_OFF, _EGO_OFF, _OPP_OFF, _PAD_OFF, _GS_OFF,
+    _PREV_VEL_OFF, _PREV_EGO_VEL_OFF, _PREV_OPP_VEL_OFF,
+    _PREV_ANG_VEL_OFF, _PREV_EGO_ANG_VEL_OFF, _PREV_OPP_ANG_VEL_OFF,
+    _PREV_SCALARS_OFF, _PREV_OPP_SCALARS_OFF,
 )
 
 _GOAL_Y = 5124.0
+
+# Approximate on_ground threshold (normalised z)
+_ON_GROUND_Z_THRESH = 17.5 / CEILING_Z
+
+
+def _zero_vel3() -> np.ndarray:
+    return np.zeros(3, dtype=np.float32)
 
 
 class SE3GymEnv(gym.Env):
@@ -85,19 +94,34 @@ class SE3GymEnv(gym.Env):
 
         # SE3 field state (blue / agent perspective)
         self._coefficients: np.ndarray = make_initial_coefficients()
-        self._prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
-        self._prev_ego_vel: np.ndarray = np.zeros(3, dtype=np.float32)
-        self._prev_opp_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._prev_ball_vel = _zero_vel3()
+        self._prev_ego_vel = _zero_vel3()
+        self._prev_opp_vel = _zero_vel3()
+        self._prev_ball_ang_vel = _zero_vel3()
+        self._prev_ego_ang_vel = _zero_vel3()
+        self._prev_opp_ang_vel = _zero_vel3()
+        self._prev_ego_scalars = np.zeros(3, dtype=np.float32)
+        self._prev_opp_scalars = np.zeros(3, dtype=np.float32)
+        # Previous Euler angles for angular velocity derivation
+        self._prev_ego_euler = _zero_vel3()
+        self._prev_opp_euler = _zero_vel3()
 
         # SE3 field state (orange / opponent perspective)
         self._orange_coefficients: np.ndarray = make_initial_coefficients()
-        self._orange_prev_ball_vel: np.ndarray = np.zeros(3, dtype=np.float32)
-        self._orange_prev_ego_vel: np.ndarray = np.zeros(3, dtype=np.float32)
-        self._orange_prev_opp_vel: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ball_vel = _zero_vel3()
+        self._orange_prev_ego_vel = _zero_vel3()
+        self._orange_prev_opp_vel = _zero_vel3()
+        self._orange_prev_ball_ang_vel = _zero_vel3()
+        self._orange_prev_ego_ang_vel = _zero_vel3()
+        self._orange_prev_opp_ang_vel = _zero_vel3()
+        self._orange_prev_ego_scalars = np.zeros(3, dtype=np.float32)
+        self._orange_prev_opp_scalars = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ego_euler = _zero_vel3()
+        self._orange_prev_opp_euler = _zero_vel3()
         self._last_orange_obs: np.ndarray = np.zeros(SE3_OBS_DIM, dtype=np.float32)
 
         # Encoder params (numpy, synced from algorithm)
-        self._k_spatial: np.ndarray = np.random.randn(N_OBJECTS, K, 3).astype(np.float32) * 1.0
+        self._k_spatial: np.ndarray = np.random.randn(N_OBJECTS, K, D_AMP).astype(np.float32) * 1.0
         self._quaternions: np.ndarray = np.random.randn(N_OBJECTS, K, 4).astype(np.float32)
         norms = np.linalg.norm(self._quaternions, axis=-1, keepdims=True)
         self._quaternions /= np.maximum(norms, 1e-8)
@@ -130,25 +154,46 @@ class SE3GymEnv(gym.Env):
 
         # Reset field state
         self._coefficients = make_initial_coefficients()
-        self._prev_ball_vel = np.zeros(3, dtype=np.float32)
-        self._prev_ego_vel = np.zeros(3, dtype=np.float32)
-        self._prev_opp_vel = np.zeros(3, dtype=np.float32)
+        self._prev_ball_vel = _zero_vel3()
+        self._prev_ego_vel = _zero_vel3()
+        self._prev_opp_vel = _zero_vel3()
+        self._prev_ball_ang_vel = _zero_vel3()
+        self._prev_ego_ang_vel = _zero_vel3()
+        self._prev_opp_ang_vel = _zero_vel3()
+        self._prev_ego_scalars = np.zeros(3, dtype=np.float32)
+        self._prev_opp_scalars = np.zeros(3, dtype=np.float32)
+        self._prev_ego_euler = _zero_vel3()
+        self._prev_opp_euler = _zero_vel3()
 
         # Reset orange field state
         self._orange_coefficients = make_initial_coefficients()
-        self._orange_prev_ball_vel = np.zeros(3, dtype=np.float32)
-        self._orange_prev_ego_vel = np.zeros(3, dtype=np.float32)
-        self._orange_prev_opp_vel = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ball_vel = _zero_vel3()
+        self._orange_prev_ego_vel = _zero_vel3()
+        self._orange_prev_opp_vel = _zero_vel3()
+        self._orange_prev_ball_ang_vel = _zero_vel3()
+        self._orange_prev_ego_ang_vel = _zero_vel3()
+        self._orange_prev_opp_ang_vel = _zero_vel3()
+        self._orange_prev_ego_scalars = np.zeros(3, dtype=np.float32)
+        self._orange_prev_opp_scalars = np.zeros(3, dtype=np.float32)
+        self._orange_prev_ego_euler = _zero_vel3()
+        self._orange_prev_opp_euler = _zero_vel3()
 
         # Build raw state from rlgym obs
         raw_state = self._token_obs_to_raw_state(
-            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel,
+            self._prev_ball_ang_vel, self._prev_ego_ang_vel, self._prev_opp_ang_vel,
+            self._prev_ego_scalars, self._prev_opp_scalars,
+            self._prev_ego_euler, self._prev_opp_euler)
         obs = pack_observation(raw_state, self._coefficients)
 
         # Cache orange obs
         orange_raw = self._token_obs_to_raw_state(
             orange_obs, self._orange_prev_ball_vel,
-            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel,
+            self._orange_prev_ball_ang_vel, self._orange_prev_ego_ang_vel,
+            self._orange_prev_opp_ang_vel,
+            self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
+            self._orange_prev_ego_euler, self._orange_prev_opp_euler)
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         return obs, {}
@@ -166,30 +211,33 @@ class SE3GymEnv(gym.Env):
 
         # Build raw state from rlgym tokens
         raw_state = self._token_obs_to_raw_state(
-            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel,
+            self._prev_ball_ang_vel, self._prev_ego_ang_vel, self._prev_opp_ang_vel,
+            self._prev_ego_scalars, self._prev_opp_scalars,
+            self._prev_ego_euler, self._prev_opp_euler)
 
         # Update coefficients (numpy, no grad)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._coefficients, raw_state, W_interact=self._W_interact)
 
-        # Cache prev velocities for next step
-        self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
-        self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
-        self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+        # Cache prev state for next step
+        self._cache_prev_state(raw_state, blue_obs, is_orange=False)
 
         obs = pack_observation(raw_state, self._coefficients)
 
         # Update orange perspective
         orange_raw = self._token_obs_to_raw_state(
             orange_obs, self._orange_prev_ball_vel,
-            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel,
+            self._orange_prev_ball_ang_vel, self._orange_prev_ego_ang_vel,
+            self._orange_prev_opp_ang_vel,
+            self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
+            self._orange_prev_ego_euler, self._orange_prev_opp_euler)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._orange_coefficients, orange_raw, W_interact=self._W_interact)
-        self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
-        self._orange_prev_ego_vel = orange_raw[_EGO_OFF + 3:_EGO_OFF + 6].copy()
-        self._orange_prev_opp_vel = orange_raw[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+        self._cache_prev_state(orange_raw, orange_obs, is_orange=True)
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         blue_reward = float(rewards[0])
@@ -228,24 +276,27 @@ class SE3GymEnv(gym.Env):
         self._step_count += 1
 
         raw_state = self._token_obs_to_raw_state(
-            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel)
+            blue_obs, self._prev_ball_vel, self._prev_ego_vel, self._prev_opp_vel,
+            self._prev_ball_ang_vel, self._prev_ego_ang_vel, self._prev_opp_ang_vel,
+            self._prev_ego_scalars, self._prev_opp_scalars,
+            self._prev_ego_euler, self._prev_opp_euler)
         self._coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._coefficients, raw_state, W_interact=self._W_interact)
-        self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
-        self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
-        self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+        self._cache_prev_state(raw_state, blue_obs, is_orange=False)
         obs = pack_observation(raw_state, self._coefficients)
 
         orange_raw = self._token_obs_to_raw_state(
             orange_obs, self._orange_prev_ball_vel,
-            self._orange_prev_ego_vel, self._orange_prev_opp_vel)
+            self._orange_prev_ego_vel, self._orange_prev_opp_vel,
+            self._orange_prev_ball_ang_vel, self._orange_prev_ego_ang_vel,
+            self._orange_prev_opp_ang_vel,
+            self._orange_prev_ego_scalars, self._orange_prev_opp_scalars,
+            self._orange_prev_ego_euler, self._orange_prev_opp_euler)
         self._orange_coefficients = update_coefficients_np(
             self._k_spatial, self._quaternions, self._lr,
             self._orange_coefficients, orange_raw, W_interact=self._W_interact)
-        self._orange_prev_ball_vel = orange_raw[_BALL_OFF + 3:_BALL_OFF + 6].copy()
-        self._orange_prev_ego_vel = orange_raw[_EGO_OFF + 3:_EGO_OFF + 6].copy()
-        self._orange_prev_opp_vel = orange_raw[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+        self._cache_prev_state(orange_raw, orange_obs, is_orange=True)
         self._last_orange_obs = pack_observation(orange_raw, self._orange_coefficients)
 
         blue_reward = float(rewards[0])
@@ -330,13 +381,51 @@ class SE3GymEnv(gym.Env):
             return obs_result[0], obs_result[1]
         raise ValueError(f'Unexpected obs format: {type(obs_result)}')
 
+    def _cache_prev_state(self, raw_state: np.ndarray, flat_obs: np.ndarray,
+                          is_orange: bool) -> None:
+        """Cache previous-frame values for next step's acceleration computation."""
+        tokens = flat_obs.reshape(N_TOKENS, TOKEN_FEATURES)
+        if is_orange:
+            self._orange_prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+            self._orange_prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+            self._orange_prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+            self._orange_prev_ball_ang_vel = raw_state[_BALL_OFF + 6:_BALL_OFF + 9].copy()
+            self._orange_prev_ego_ang_vel = raw_state[_EGO_OFF + 10:_EGO_OFF + 13].copy()
+            self._orange_prev_opp_ang_vel = raw_state[_OPP_OFF + 10:_OPP_OFF + 13].copy()
+            self._orange_prev_ego_scalars = raw_state[_EGO_OFF + 13:_EGO_OFF + 16].copy()
+            self._orange_prev_opp_scalars = raw_state[_OPP_OFF + 13:_OPP_OFF + 16].copy()
+            self._orange_prev_ego_euler = np.array(
+                [tokens[1, 6], tokens[1, 7], tokens[1, 8]], dtype=np.float32)
+            self._orange_prev_opp_euler = np.array(
+                [tokens[2, 6], tokens[2, 7], tokens[2, 8]], dtype=np.float32)
+        else:
+            self._prev_ball_vel = raw_state[_BALL_OFF + 3:_BALL_OFF + 6].copy()
+            self._prev_ego_vel = raw_state[_EGO_OFF + 3:_EGO_OFF + 6].copy()
+            self._prev_opp_vel = raw_state[_OPP_OFF + 3:_OPP_OFF + 6].copy()
+            self._prev_ball_ang_vel = raw_state[_BALL_OFF + 6:_BALL_OFF + 9].copy()
+            self._prev_ego_ang_vel = raw_state[_EGO_OFF + 10:_EGO_OFF + 13].copy()
+            self._prev_opp_ang_vel = raw_state[_OPP_OFF + 10:_OPP_OFF + 13].copy()
+            self._prev_ego_scalars = raw_state[_EGO_OFF + 13:_EGO_OFF + 16].copy()
+            self._prev_opp_scalars = raw_state[_OPP_OFF + 13:_OPP_OFF + 16].copy()
+            self._prev_ego_euler = np.array(
+                [tokens[1, 6], tokens[1, 7], tokens[1, 8]], dtype=np.float32)
+            self._prev_opp_euler = np.array(
+                [tokens[2, 6], tokens[2, 7], tokens[2, 8]], dtype=np.float32)
+
     def _token_obs_to_raw_state(
         self, flat_obs: np.ndarray,
         prev_ball_vel: np.ndarray,
         prev_ego_vel: np.ndarray,
         prev_opp_vel: np.ndarray,
+        prev_ball_ang_vel: np.ndarray,
+        prev_ego_ang_vel: np.ndarray,
+        prev_opp_ang_vel: np.ndarray,
+        prev_ego_scalars: np.ndarray,
+        prev_opp_scalars: np.ndarray,
+        prev_ego_euler: np.ndarray,
+        prev_opp_euler: np.ndarray,
     ) -> np.ndarray:
-        """Convert TokenObsBuilder output (100,) to SE3 raw state (63,).
+        """Convert TokenObsBuilder output (100,) to SE3 raw state (74,).
 
         TokenObsBuilder format (10 tokens × 10 features):
           token 0: ball   [x,y,z, vx,vy,vz, avx,avy,avz, 0]
@@ -350,45 +439,71 @@ class SE3GymEnv(gym.Env):
         tokens = flat_obs.reshape(N_TOKENS, TOKEN_FEATURES)
         raw = np.zeros(RAW_STATE_DIM, dtype=np.float32)
 
-        # Ball: pos(3) + vel(3)  — already normalised
+        # Ball: pos(3) + vel(3) + ang_vel(3)
         raw[_BALL_OFF:_BALL_OFF + 3] = tokens[0, :3]
         raw[_BALL_OFF + 3:_BALL_OFF + 6] = tokens[0, 3:6]
+        raw[_BALL_OFF + 6:_BALL_OFF + 9] = tokens[0, 6:9]  # ball angular velocity
 
-        # Ego: pos(3) + vel(3) + quat(4) + boost(1)
+        # Ego: pos(3) + vel(3) + quat(4) + ang_vel(3) + boost(1) + has_flip(1) + on_ground(1)
         raw[_EGO_OFF:_EGO_OFF + 3] = tokens[1, :3]
         raw[_EGO_OFF + 3:_EGO_OFF + 6] = tokens[1, 3:6]
-        # Convert normalised Euler (yaw/pi, pitch/pi, roll/pi) to quaternion
-        yaw = tokens[1, 6] * math.pi
-        pitch = tokens[1, 7] * math.pi
-        roll = tokens[1, 8] * math.pi
+        # Quaternion from Euler
+        ego_euler = np.array([tokens[1, 6], tokens[1, 7], tokens[1, 8]], dtype=np.float32)
+        yaw = ego_euler[0] * math.pi
+        pitch = ego_euler[1] * math.pi
+        roll = ego_euler[2] * math.pi
         ego_q = euler_to_quaternion_batch(
             np.array([yaw]), np.array([pitch]), np.array([roll]))[0]
         raw[_EGO_OFF + 6:_EGO_OFF + 10] = ego_q
-        raw[_EGO_OFF + 10] = tokens[1, 9]  # boost (already normalised)
+        # Angular velocity from Euler angle finite differences
+        ego_d_euler = (ego_euler - prev_ego_euler) * math.pi  # back to radians
+        ego_ang_vel = ego_d_euler / (MAX_ANG_VEL * (1.0 / 120.0))  # normalise like MAX_ANG_VEL
+        # Clamp to prevent huge spikes at episode boundaries
+        ego_ang_vel = np.clip(ego_ang_vel, -1.0, 1.0)
+        raw[_EGO_OFF + 10:_EGO_OFF + 13] = ego_ang_vel
+        raw[_EGO_OFF + 13] = tokens[1, 9]  # boost (already normalised)
+        ego_on_ground = float(tokens[1, 2] < _ON_GROUND_Z_THRESH)
+        raw[_EGO_OFF + 14] = ego_on_ground  # has_flip ≈ on_ground
+        raw[_EGO_OFF + 15] = ego_on_ground
 
-        # Opponent: pos(3) + vel(3) + quat(4)
+        # Opponent: same layout
         raw[_OPP_OFF:_OPP_OFF + 3] = tokens[2, :3]
         raw[_OPP_OFF + 3:_OPP_OFF + 6] = tokens[2, 3:6]
-        opp_yaw = tokens[2, 6] * math.pi
-        opp_pitch = tokens[2, 7] * math.pi
-        opp_roll = tokens[2, 8] * math.pi
+        opp_euler = np.array([tokens[2, 6], tokens[2, 7], tokens[2, 8]], dtype=np.float32)
+        opp_yaw = opp_euler[0] * math.pi
+        opp_pitch = opp_euler[1] * math.pi
+        opp_roll = opp_euler[2] * math.pi
         opp_q = euler_to_quaternion_batch(
             np.array([opp_yaw]), np.array([opp_pitch]), np.array([opp_roll]))[0]
         raw[_OPP_OFF + 6:_OPP_OFF + 10] = opp_q
+        opp_d_euler = (opp_euler - prev_opp_euler) * math.pi
+        opp_ang_vel = opp_d_euler / (MAX_ANG_VEL * (1.0 / 120.0))
+        opp_ang_vel = np.clip(opp_ang_vel, -1.0, 1.0)
+        raw[_OPP_OFF + 10:_OPP_OFF + 13] = opp_ang_vel
+        raw[_OPP_OFF + 13] = 0.0  # opponent boost hidden
+        opp_on_ground = float(tokens[2, 2] < _ON_GROUND_Z_THRESH)
+        raw[_OPP_OFF + 14] = opp_on_ground
+        raw[_OPP_OFF + 15] = opp_on_ground
 
-        # Boost pads (6): pos(3) + active(1)
+        # Boost pads (6): active flag only
         for i in range(6):
-            tok_idx = 3 + i
-            off = _PAD_OFF + i * 4
-            raw[off:off + 3] = tokens[tok_idx, :3]
-            raw[off + 3] = tokens[tok_idx, 3]
+            raw[_PAD_OFF + i] = tokens[3 + i, 3]
 
         # Game state
         raw[_GS_OFF:_GS_OFF + 3] = tokens[9, :3]
 
-        # Previous velocities (for contact detection + acceleration channel)
+        # Previous velocities
         raw[_PREV_VEL_OFF:_PREV_VEL_OFF + 3] = prev_ball_vel
         raw[_PREV_EGO_VEL_OFF:_PREV_EGO_VEL_OFF + 3] = prev_ego_vel
         raw[_PREV_OPP_VEL_OFF:_PREV_OPP_VEL_OFF + 3] = prev_opp_vel
+
+        # Previous angular velocities
+        raw[_PREV_ANG_VEL_OFF:_PREV_ANG_VEL_OFF + 3] = prev_ball_ang_vel
+        raw[_PREV_EGO_ANG_VEL_OFF:_PREV_EGO_ANG_VEL_OFF + 3] = prev_ego_ang_vel
+        raw[_PREV_OPP_ANG_VEL_OFF:_PREV_OPP_ANG_VEL_OFF + 3] = prev_opp_ang_vel
+
+        # Previous scalars (boost, has_flip, on_ground)
+        raw[_PREV_SCALARS_OFF:_PREV_SCALARS_OFF + 3] = prev_ego_scalars
+        raw[_PREV_OPP_SCALARS_OFF:_PREV_OPP_SCALARS_OFF + 3] = prev_opp_scalars
 
         return raw

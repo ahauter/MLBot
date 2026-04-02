@@ -27,7 +27,7 @@ sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO / 'training'))
 
 from se3_field import (SE3Encoder, SE3_OBS_DIM, RAW_STATE_DIM, COEFF_DIM,
-                       EMBED_DIM, N_OBJECTS, K, N_CHANNELS, DT, GRAVITY_DV_Z,
+                       EMBED_DIM, N_OBJECTS, K, D_AMP, N_CHANNELS, DT, GRAVITY_DV_Z,
                        _BALL_OFF, _EGO_OFF, _OPP_OFF)
 from se3_policy import StochasticSE3Policy
 from training.abstractions import Algorithm, ActionResult
@@ -38,9 +38,9 @@ class SE3PPOAlgorithm(Algorithm):
     """
     PPO-Clip with SE3Encoder (learned field geometry) + StochasticSE3Policy.
 
-    obs_dim = SE3_OBS_DIM = raw_state (63) + prev_coefficients (576).
-    encoder.encode_for_policy() produces EMBED_DIM (82) policy input.
-    encoder.forward() produces COEFF_DIM (576) for buffer/env persistence.
+    obs_dim = SE3_OBS_DIM = raw_state (74) + prev_coefficients (1080).
+    encoder.encode_for_policy() produces EMBED_DIM (26) policy input.
+    encoder.forward() produces COEFF_DIM (1080) for buffer/env persistence.
     """
 
     def __init__(self, config: dict):
@@ -214,8 +214,8 @@ class SE3PPOAlgorithm(Algorithm):
             coeff_t = self.encoder(obs_t)   # (1, COEFF_DIM)
 
             # Spectral entropy check (use all N_CHANNELS for energy)
-            emb = coeff_t.reshape(1, N_OBJECTS, K, 3, N_CHANNELS)
-            energy = emb.pow(2).sum(dim=-1)              # (1, N_OBJECTS, K, 3)
+            emb = coeff_t.reshape(1, N_OBJECTS, K, D_AMP, N_CHANNELS)
+            energy = emb.pow(2).sum(dim=-1)              # (1, N_OBJECTS, K, D_AMP)
             energy_k = energy.sum(dim=-1)                # (1, N_OBJECTS, K)
             p = energy_k / (energy_k.sum(dim=-1, keepdim=True) + 1e-8)
             H_intra = -(p * (p + 1e-8).log()).sum(dim=-1).mean().item()
@@ -268,10 +268,10 @@ class SE3PPOAlgorithm(Algorithm):
                 not_done = torch.tensor(1.0 - flat_dones[_idx], dtype=torch.float32, device=self.device)
 
                 # Encoder output at t: these are the coefficients the policy sees
-                coeff_t = self.encoder(obs_t)  # (N, 384)
+                coeff_t = self.encoder(obs_t)  # (N, COEFF_DIM)
 
                 # Actual next-step coefficients (computed by the env's numpy mirror)
-                coeff_tp1_actual = obs_tp1[:, RAW_STATE_DIM:]  # (N, 384)
+                coeff_tp1_actual = obs_tp1[:, RAW_STATE_DIM:]  # (N, COEFF_DIM)
 
                 # Encoder prediction: if we fed obs_tp1's raw state + coeff_t as prev,
                 # how close would it be? This measures tracking quality.
@@ -325,8 +325,8 @@ class SE3PPOAlgorithm(Algorithm):
                 value_loss = nn.functional.mse_loss(new_values, returns_t)
 
                 # Spectral entropy regularization (from live encoder output for gradient flow)
-                coeff = coeff_live.reshape(coeff_live.shape[0], N_OBJECTS, K, 3, N_CHANNELS)
-                energy = coeff.pow(2).sum(dim=-1)              # (mb, N_OBJECTS, K, 3)
+                coeff = coeff_live.reshape(coeff_live.shape[0], N_OBJECTS, K, D_AMP, N_CHANNELS)
+                energy = coeff.pow(2).sum(dim=-1)              # (mb, N_OBJECTS, K, D_AMP)
 
                 # Intra-object: sum over axes → entropy over K components
                 energy_k = energy.sum(dim=-1)                  # (mb, N_OBJECTS, K)
