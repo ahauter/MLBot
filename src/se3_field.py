@@ -230,8 +230,19 @@ class SE3Encoder(nn.Module):
         Output: (batch, EMBED_DIM=26) normalised physical summary
     """
 
-    def __init__(self):
+    def __init__(self, momentum_mode: str = 'both'):
+        """
+        Parameters
+        ----------
+        momentum_mode : str
+            'both' | 'delta_only' | 'surprise_only' | 'none'
+            Controls which action momentum signals feed into the policy embedding.
+            EMA state always updates regardless (needed for accel_hist persistence).
+        """
         super().__init__()
+        assert momentum_mode in ('both', 'delta_only', 'surprise_only', 'none'), \
+            f"Invalid momentum_mode: {momentum_mode!r}"
+        self.momentum_mode = momentum_mode
 
         # Learned frequency vectors in R^D_AMP — phase = k · amplitude
         self.k_spatial = nn.Parameter(
@@ -528,6 +539,13 @@ class SE3Encoder(nn.Module):
         # Project action momentum signals and fuse additively
         f_delta = self.delta_proj(accel_delta)                 # (batch, N_OBJECTS, D_FIELD)
         f_surprise = self.surprise_proj(accel_surprise)        # (batch, N_OBJECTS, D_FIELD)
+
+        # Ablation masking (momentum_mode)
+        if self.momentum_mode in ('surprise_only', 'none'):
+            f_delta = f_delta * 0.0
+        if self.momentum_mode in ('delta_only', 'none'):
+            f_surprise = f_surprise * 0.0
+
         f_combined = f + f_delta + f_surprise                  # (batch, N_OBJECTS, D_FIELD)
 
         # Inner product matrix: spectral alignment
@@ -560,6 +578,14 @@ class SE3Encoder(nn.Module):
         opp_delta_norm = accel_delta[:, _OPP].norm(dim=-1, keepdim=True)       # (batch, 1)
         ego_surprise_norm = accel_surprise[:, _EGO].norm(dim=-1, keepdim=True) # (batch, 1)
         opp_surprise_norm = accel_surprise[:, _OPP].norm(dim=-1, keepdim=True) # (batch, 1)
+
+        # Ablation masking for context norms
+        if self.momentum_mode in ('surprise_only', 'none'):
+            ego_delta_norm = ego_delta_norm * 0.0
+            opp_delta_norm = opp_delta_norm * 0.0
+        if self.momentum_mode in ('delta_only', 'none'):
+            ego_surprise_norm = ego_surprise_norm * 0.0
+            opp_surprise_norm = opp_surprise_norm * 0.0
 
         # Context scalars from raw state
         ego_boost_ctx = raw[:, _EGO_OFF + 13:_EGO_OFF + 14]   # (batch, 1)

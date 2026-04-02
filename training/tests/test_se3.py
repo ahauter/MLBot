@@ -2021,3 +2021,76 @@ class TestAccelMomentum:
             "surprise_proj should have gradient"
         assert encoder.surprise_proj.weight.grad.abs().sum() > 0, \
             "surprise_proj gradient should be nonzero"
+
+
+# ── Momentum ablation tests ─────────────────────────────────────────────────
+
+class TestMomentumAblation:
+
+    def _make_encoder_pair(self, mode: str):
+        """Create a 'both' encoder and a masked encoder with same weights."""
+        torch.manual_seed(42)
+        enc_both = SE3Encoder(momentum_mode='both')
+        torch.manual_seed(42)
+        enc_mode = SE3Encoder(momentum_mode=mode)
+        return enc_both, enc_mode
+
+    def test_delta_only_differs_from_both(self):
+        """delta_only mode produces different embed than both (surprise is masked)."""
+        enc_both, enc_delta = self._make_encoder_pair('delta_only')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed_both, _, _ = enc_both.encode_for_policy(obs)
+            embed_delta, _, _ = enc_delta.encode_for_policy(obs)
+        assert not torch.allclose(embed_both, embed_delta, atol=1e-6), \
+            "delta_only should differ from both (surprise contribution is masked)"
+
+    def test_surprise_only_differs_from_both(self):
+        """surprise_only mode produces different embed than both (delta is masked)."""
+        enc_both, enc_surprise = self._make_encoder_pair('surprise_only')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed_both, _, _ = enc_both.encode_for_policy(obs)
+            embed_surp, _, _ = enc_surprise.encode_for_policy(obs)
+        assert not torch.allclose(embed_both, embed_surp, atol=1e-6), \
+            "surprise_only should differ from both (delta contribution is masked)"
+
+    def test_none_differs_from_both(self):
+        """'none' mode produces different embed than both (all momentum masked)."""
+        enc_both, enc_none = self._make_encoder_pair('none')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed_both, _, _ = enc_both.encode_for_policy(obs)
+            embed_none, _, _ = enc_none.encode_for_policy(obs)
+        assert not torch.allclose(embed_both, embed_none, atol=1e-6), \
+            "'none' should differ from both"
+
+    def test_both_matches_default(self):
+        """momentum_mode='both' produces identical output to default encoder."""
+        enc_both, enc_default = self._make_encoder_pair('both')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            embed_d, coeff_d, ah_d = enc_default.encode_for_policy(obs)
+            embed_b, coeff_b, ah_b = enc_both.encode_for_policy(obs)
+        torch.testing.assert_close(embed_d, embed_b)
+        torch.testing.assert_close(coeff_d, coeff_b)
+        torch.testing.assert_close(ah_d, ah_b)
+
+    def test_accel_hist_still_updates_when_masked(self):
+        """Even with signals disabled, accel_hist must update (EMA state persists)."""
+        encoder = SE3Encoder(momentum_mode='none')
+        obs = torch.randn(2, SE3_OBS_DIM)
+        with torch.no_grad():
+            _, _, accel_hist = encoder.encode_for_policy(obs)
+        assert not (accel_hist == 0).all(), \
+            "accel_hist should update even when momentum signals are masked"
+
+    def test_param_count_unchanged(self):
+        """Ablation flags don't add parameters."""
+        enc_both = SE3Encoder(momentum_mode='both')
+        enc_none = SE3Encoder(momentum_mode='none')
+        n_both = sum(p.numel() for p in enc_both.parameters())
+        n_none = sum(p.numel() for p in enc_none.parameters())
+        assert n_both == n_none, \
+            f"Parameter counts differ: both={n_both}, none={n_none}"
+        assert n_both < 30000, f"Encoder has {n_both} params, exceeds 30K limit"

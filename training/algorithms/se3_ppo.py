@@ -68,8 +68,10 @@ class SE3PPOAlgorithm(Algorithm):
         _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(_device)
 
+        self.momentum_mode = params.get('momentum_mode', 'both')
+
         # Networks
-        self.encoder = SE3Encoder()
+        self.encoder = SE3Encoder(momentum_mode=self.momentum_mode)
         self.policy = StochasticSE3Policy(obs_dim=EMBED_DIM)
         self.encoder.to(self.device)
         self.policy.to(self.device)
@@ -118,6 +120,7 @@ class SE3PPOAlgorithm(Algorithm):
             'dream_entropy_high': 2.0,
             'dream_entropy_low': 0.1,
             'dream_ratio': 0.25,
+            'momentum_mode': 'both',
         }
 
     @classmethod
