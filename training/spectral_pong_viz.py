@@ -148,7 +148,7 @@ class WavepacketObject2D:
         a, b = WORLD_BOUNDS[axis]
         grid = np.linspace(a, b, 200)
         vals = self.evaluate(grid, axis)
-        return float(np.trapezoid(vals ** 2, grid))
+        return float(np.trapz(vals ** 2, grid))
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
@@ -195,7 +195,8 @@ class WavepacketObject2D:
         """Spectral alignment score in ~[0, 1]. Attention weight for LMS."""
         ip = self.inner_product_2d(other)  # (2,)
         norm_s = np.sqrt(np.sum(self.c_cos**2 + self.c_sin**2, axis=0))  # (2,)
-        norm_o = np.sqrt(np.sum(other.c_cos**2 + other.c_sin**2, axis=0))  # (2,)
+        norm_o = np.sqrt(
+            np.sum(other.c_cos**2 + other.c_sin**2, axis=0))  # (2,)
         nip = ip / (norm_s * norm_o + 1e-8)  # (2,)
         return float(np.linalg.norm(nip) / np.sqrt(2))
 
@@ -266,7 +267,7 @@ class SimpleRLController:
     """
 
     def __init__(self, state_dim: int, hidden_dim: int = 256,
-                 lr: float = 3e-3, gamma: float = 0.99, std: float = 0.5):
+                 lr: float = 3e-5, gamma: float = 0.99, std: float = 0.5):
         scale1 = np.sqrt(2.0 / state_dim)
         scale2 = np.sqrt(2.0 / hidden_dim)
         self.W1 = np.random.randn(hidden_dim, state_dim) * scale1
@@ -333,7 +334,6 @@ class SimpleRLController:
         self.W2 += self.lr * reward * self.trace_W2
         self.b2 += self.lr * reward * self.trace_b2
         self._reset_traces()
-
 
 
 # -- helpers ------------------------------------------------------------------
@@ -411,7 +411,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     if spectral_paddle:
         # State: 5 wavepackets × (K×2 cos + K×2 sin) + 6 game-state floats
         state_dim = 5 * (K * 2 * 2) + 6
-        rl_controller = SimpleRLController(state_dim, hidden_dim=256)
+        rl_controller = SimpleRLController(state_dim, hidden_dim=8)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -463,15 +463,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
     lx_ball, = ax_x.plot([], [], color=BALL_COLOR, lw=2, label='Ball')
     lx_pad_l, = ax_x.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7,
-                           label='L paddle')
+                          label='L paddle')
     lx_pad_r, = ax_x.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7,
-                           label='R paddle')
+                          label='R paddle')
     lx_env, = ax_x.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
-                         label='Env (learned)')
+                        label='Env (learned)')
     lx_reward, = ax_x.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
-                            ls='--', label='Reward (learned)')
+                           ls='--', label='Reward (learned)')
     lx_dot, = ax_x.plot([], [], 'o', color=BALL_COLOR, markersize=8,
-                         zorder=5, markeredgecolor='white', markeredgewidth=1)
+                        zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_x.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
                 edgecolor='#333', labelcolor='#ccc')
 
@@ -488,15 +488,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
     ly_ball, = ax_y.plot([], [], color=BALL_COLOR, lw=2, label='Ball')
     ly_pad_l, = ax_y.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7,
-                           label='L paddle')
+                          label='L paddle')
     ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7,
-                           label='R paddle')
+                          label='R paddle')
     ly_env, = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
-                         label='Env (learned)')
+                        label='Env (learned)')
     ly_reward, = ax_y.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
-                            ls='--', label='Reward (learned)')
+                           ls='--', label='Reward (learned)')
     ly_dot, = ax_y.plot([], [], 'o', color=BALL_COLOR, markersize=8,
-                         zorder=5, markeredgecolor='white', markeredgewidth=1)
+                        zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_y.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
                 edgecolor='#333', labelcolor='#ccc')
 
@@ -552,11 +552,11 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         key_times[event.key] = time.time()
     fig.canvas.mpl_connect('key_press_event', on_key_press)
 
-
     # -- animation step -------------------------------------------------------
+
     def init():
         for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env, lx_reward,
-                    ly_ball, ly_pad_l, ly_pad_r, ly_env, ly_reward]:
+                   ly_ball, ly_pad_l, ly_pad_r, ly_env, ly_reward]:
             ln.set_data([], [])
         lx_dot.set_data([], [])
         ly_dot.set_data([], [])
@@ -608,9 +608,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 right_paddle['y'] -= PADDLE_SPEED * dt
 
         left_paddle['y'] = np.clip(left_paddle['y'],
-                                    COURT_BOTTOM + half_h, COURT_TOP - half_h)
+                                   COURT_BOTTOM + half_h, COURT_TOP - half_h)
         right_paddle['y'] = np.clip(right_paddle['y'],
-                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
+                                    COURT_BOTTOM + half_h, COURT_TOP - half_h)
 
         # -- Newtonian ball step ------------------------------------------
         vx_before, vy_before = ball['vx'], ball['vy']
@@ -749,7 +749,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
         state['anomaly'] = a_residual
         state['max_anomaly'] = max(np.linalg.norm(a_residual),
-                                    state['max_anomaly'] * 0.98)
+                                   state['max_anomaly'] * 0.98)
 
         anomaly_hist.append(np.linalg.norm(a_residual))
         history_t.append(t)
