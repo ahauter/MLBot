@@ -45,6 +45,8 @@ INTERACT_COLOR = '#a78bfa'
 NEWTON_COLOR = '#4ade80'
 RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall
 RESIDUAL_COLOR = '#facc15'   # yellow for LMS residual
+PAD_COLOR = '#2dd4bf'        # teal for boost pad
+PAD_FIELD_COLOR = '#5eead4'  # light teal for pad field curve
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -151,9 +153,13 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                      wall_right: float, wall_warmup: int,
                      ball_sigma: float, ball_amplitude: float,
                      ball_lr: float, wall_mass: float,
+                     pad_center: float, pad_width: float,
+                     pad_boost: float,
                      interval: int, max_frames: int | None):
     x_domain = np.linspace(-6, 6, 500)
     window = 300
+    pad_left = pad_center - pad_width / 2
+    pad_right = pad_center + pad_width / 2
 
     # ════════════════════════════════════════════════════════════════════
     # PANEL A state: Spectral → Position
@@ -187,11 +193,17 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, x0=0.0, mass=wall_mass,
         c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
 
+    # Pad field: starts empty, learns from ball passing through boost region
+    b_pad = WavepacketObject(
+        K, frequencies, x0=pad_center, mass=wall_mass,
+        c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
+
     b_hist_x = deque(maxlen=window)
 
     # Shared
     history_t = deque(maxlen=window)
-    state = {'t': 0, 'residual': 0.0, 'residual_wall_x': 0.0, 'residual_age': 999}
+    state = {'t': 0, 'residual': 0.0, 'residual_wall_x': 0.0,
+             'residual_age': 999, 'max_residual': 1.0}
 
     # ── figure: 2 field panels + position comparison ──────────────────
     fig, (ax_a, ax_b, ax_track) = plt.subplots(
@@ -243,11 +255,14 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                    color=NEWTON_COLOR, fontsize=11, fontweight='bold', pad=8)
     ax_b.axvline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
     ax_b.axvline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.6)
+    ax_b.axvspan(pad_left, pad_right, color=PAD_COLOR, alpha=0.12, zorder=0)
 
     lb_ball_field, = ax_b.plot([], [], color=BALL_COLOR, lw=2, alpha=0.9,
                                 label='Ball wavepacket (shifted)')
     lb_wall_field, = ax_b.plot([], [], color=RECON_WALL_COLOR, lw=1.5,
                                 alpha=0.8, label='Learned wall field')
+    lb_pad_field, = ax_b.plot([], [], color=PAD_FIELD_COLOR, lw=1.5,
+                               alpha=0.7, ls='--', label='Learned pad field')
     lb_dot, = ax_b.plot([], [], 'o', color=NEWTON_COLOR, markersize=12,
                          zorder=5, markeredgecolor='white', markeredgewidth=1.5)
     lb_arrow = [None]
@@ -256,7 +271,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_b.text(0.02, 0.97,
               'Ball: wavepacket shifted to Newtonian position'
               '\n'
-              'Wall: LMS learned from bounce contacts',
+              'Wall: LMS from bounces | Pad: LMS from boost region',
               transform=ax_b.transAxes, color='#ccc', fontsize=9,
               verticalalignment='top',
               bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -273,6 +288,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_track.axhline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
+    ax_track.axhspan(pad_left, pad_right, color=PAD_COLOR, alpha=0.08, zorder=0)
 
     lt_spectral, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
                                   label='A: Spectral ball')
@@ -284,6 +300,11 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     frame_text = ax_a.text(0.98, 0.02, '', transform=ax_a.transAxes,
                             color='#555', fontsize=8,
                             horizontalalignment='right')
+    lb_vel_text = ax_b.text(0.98, 0.97, '', transform=ax_b.transAxes,
+                             color=NEWTON_COLOR, fontsize=10,
+                             fontweight='bold',
+                             horizontalalignment='right',
+                             verticalalignment='top')
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -291,12 +312,13 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     def init():
         for line in [la_ball_field, la_wall_field,
-                     lb_ball_field, lb_wall_field,
+                     lb_ball_field, lb_wall_field, lb_pad_field,
                      lt_spectral, lt_newton]:
             line.set_data([], [])
         la_dot.set_data([], [])
         lb_dot.set_data([], [])
         frame_text.set_text('')
+        lb_vel_text.set_text('')
         return ()
 
     def step(_frame):
@@ -319,6 +341,11 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # Newtonian step
         bounced = False
         newton['x'] += newton['v'] * dt
+
+        # Boost pad: accelerate ball in direction of travel
+        if pad_left <= newton['x'] <= pad_right:
+            newton['v'] += np.sign(newton['v']) * pad_boost * dt
+
         if newton['x'] >= wall_right:
             newton['x'] = 2 * wall_right - newton['x']
             newton['v'] = -newton['v']
@@ -362,6 +389,10 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
             for _ in range(10):
                 b_wall.update(wall_pos)
 
+        # LMS: learn pad field from ball passing through boost region
+        if pad_left <= nx <= pad_right:
+            b_pad.update(nx)
+
         # Inner product force from reconstructed spectral fields
         overlap_b = b_ball.inner_product(b_wall)
         force_b = -alpha * overlap_b
@@ -393,9 +424,12 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # ── draw panel B ─────────────────────────────────────────
         b_ball_curve = b_ball.evaluate(x_domain)
         b_wall_curve = b_wall.evaluate(x_domain)
+        b_pad_curve = b_pad.evaluate(x_domain)
         lb_ball_field.set_data(x_domain, b_ball_curve)
         lb_wall_field.set_data(x_domain, b_wall_curve)
+        lb_pad_field.set_data(x_domain, b_pad_curve)
         lb_dot.set_data([nx], [0])
+        lb_vel_text.set_text(f'v={newton["v"]:.2f}')
 
         # Force arrow on panel B (reconstructed force)
         if lb_arrow[0] is not None:
@@ -418,8 +452,12 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
             r = state['residual']
             wx = state['residual_wall_x']
             fade = max(0.0, 1.0 - age / 15.0)
-            rdy = np.clip(r * 2.0, -4.0, 4.0)
-            if abs(rdy) > 0.02:
+            # Auto-scale: track max with exponential decay so small residuals
+            # remain visible after the initial large ones fade from memory
+            state['max_residual'] = max(abs(r), state['max_residual'] * 0.98)
+            mr = max(state['max_residual'], 0.01)
+            rdy = np.clip(r / mr * 3.0, -4.0, 4.0)
+            if abs(rdy) > 0.05:
                 lb_residual_arrow[0] = ax_b.annotate(
                     '', xy=(wx, rdy), xytext=(wx, 0),
                     arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
@@ -457,6 +495,12 @@ def main():
                         help='LMS learning rate (default: 0.15)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Frame limit (default: infinite, required for --save)')
+    parser.add_argument('--pad-center', type=float, default=1.5,
+                        help='Boost pad center position (default: 1.5)')
+    parser.add_argument('--pad-width', type=float, default=1.0,
+                        help='Boost pad width (default: 1.0)')
+    parser.add_argument('--pad-boost', type=float, default=0.3,
+                        help='Boost pad acceleration strength (default: 0.3)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -486,6 +530,9 @@ def main():
         ball_amplitude=1.5,
         ball_lr=args.lr,
         wall_mass=1e6,
+        pad_center=args.pad_center,
+        pad_width=args.pad_width,
+        pad_boost=args.pad_boost,
         interval=50,
         max_frames=args.frames,
     )
