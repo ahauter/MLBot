@@ -143,13 +143,20 @@ class WavepacketObject2D:
         return float(self.c_cos[:, axis] @ int_cos +
                      self.c_sin[:, axis] @ int_sin)
 
+    def integrate_squared(self, axis: int) -> float:
+        """∫ F_d(x)² dx over world bounds (numerical trapezoidal)."""
+        a, b = WORLD_BOUNDS[axis]
+        grid = np.linspace(a, b, 200)
+        vals = self.evaluate(grid, axis)
+        return float(np.trapezoid(vals ** 2, grid))
+
     def normalize(self) -> None:
-        """Rescale coefficients so each axis integrates to 1 over world."""
+        """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
         for d in range(2):
-            I = self.integrate(d)
-            if abs(I) > 1e-10:
-                self.c_cos[:, d] /= I
-                self.c_sin[:, d] /= I
+            S = self.integrate_squared(d)
+            if S > 1e-20:
+                self.c_cos[:, d] /= np.sqrt(S)
+                self.c_sin[:, d] /= np.sqrt(S)
 
     def gradient(self, x: float, axis: int) -> float:
         """Analytical derivative dF_d/dx at domain position x.
@@ -362,7 +369,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- X-domain panel -------------------------------------------------------
     x_dom = np.linspace(COURT_LEFT - 1, COURT_RIGHT + 1, 400)
     ax_x.set_xlim(x_dom[0], x_dom[-1])
-    ax_x.set_ylim(-1.0, 1.0)
+    ax_x.set_ylim(-0.05, 1.0)
     ax_x.set_title('X-domain spectral fields', color=TITLE_COLOR, fontsize=10)
     ax_x.set_ylabel('F_x(x)', color=LABEL_COLOR, fontsize=8)
     ax_x.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
@@ -384,7 +391,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- Y-domain panel -------------------------------------------------------
     y_dom = np.linspace(COURT_BOTTOM - 1, COURT_TOP + 1, 400)
     ax_y.set_ylim(y_dom[0], y_dom[-1])
-    ax_y.set_xlim(-1.5, 1.5)
+    ax_y.set_xlim(-0.05, 1.5)
     ax_y.set_title('Y-domain', color=TITLE_COLOR, fontsize=10)
     ax_y.set_xlabel('F_y(y)', color=LABEL_COLOR, fontsize=8)
     ax_y.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
@@ -635,7 +642,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
         # 3. Measure integral deviation BEFORE normalizing
         #    Deviation from PMF=1 reveals environmental interaction
-        ball_deviation = np.array([wp_ball.integrate(d) - 1.0
+        ball_deviation = np.array([wp_ball.integrate_squared(d) - 1.0
                                    for d in range(2)])
 
         # 4. Normalize observed objects back to PMF
@@ -678,20 +685,20 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         history_t.append(t)
         state['t'] = t + 1
 
-        # -- draw X-domain ------------------------------------------------
-        lx_ball.set_data(x_dom, wp_ball.evaluate(x_dom, axis=0))
-        lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0))
-        lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0))
-        lx_env.set_data(x_dom, wp_env.evaluate(x_dom, axis=0))
-        lx_reward.set_data(x_dom, wp_reward.evaluate(x_dom, axis=0))
+        # -- draw X-domain (plot F² = PMF) --------------------------------
+        lx_ball.set_data(x_dom, wp_ball.evaluate(x_dom, axis=0) ** 2)
+        lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0) ** 2)
+        lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0) ** 2)
+        lx_env.set_data(x_dom, wp_env.evaluate(x_dom, axis=0) ** 2)
+        lx_reward.set_data(x_dom, wp_reward.evaluate(x_dom, axis=0) ** 2)
         lx_dot.set_data([ball['x']], [0])
 
-        # -- draw Y-domain (x=field value, y=domain) ---------------------
-        ly_ball.set_data(wp_ball.evaluate(y_dom, axis=1), y_dom)
-        ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1), y_dom)
-        ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1), y_dom)
-        ly_env.set_data(wp_env.evaluate(y_dom, axis=1), y_dom)
-        ly_reward.set_data(wp_reward.evaluate(y_dom, axis=1), y_dom)
+        # -- draw Y-domain (plot F² = PMF, x=field², y=domain) ----------
+        ly_ball.set_data(wp_ball.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_env.set_data(wp_env.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_reward.set_data(wp_reward.evaluate(y_dom, axis=1) ** 2, y_dom)
         ly_dot.set_data([0], [ball['y']])
 
         # -- draw court ---------------------------------------------------
