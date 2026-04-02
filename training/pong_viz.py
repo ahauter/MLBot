@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import time
 from pathlib import Path
 
 import numpy as np
@@ -78,7 +79,7 @@ def create_game(dt: float, interval: int, max_frames: int | None,
 
     left_paddle = {'y': 0.0, 'score': 0}
     right_paddle = {'y': 0.0, 'score': 0}
-    keys_held: set[str] = set()
+    key_times: dict[str, float] = {}
     state = {'freeze': 0}
 
     # ── figure ───────────────────────────────────────────────
@@ -137,13 +138,9 @@ def create_game(dt: float, interval: int, max_frames: int | None,
 
     # ── keyboard ─────────────────────────────────────────────
     def on_key_press(event):
-        keys_held.add(event.key)
-
-    def on_key_release(event):
-        keys_held.discard(event.key)
+        key_times[event.key] = time.time()
 
     fig.canvas.mpl_connect('key_press_event', on_key_press)
-    fig.canvas.mpl_connect('key_release_event', on_key_release)
 
     # ── animation ────────────────────────────────────────────
 
@@ -157,13 +154,16 @@ def create_game(dt: float, interval: int, max_frames: int | None,
             return ()
 
         # ── move paddles ─────────────────────────────────
-        if 'a' in keys_held:
+        now = time.time()
+        held_thresh = 0.15  # seconds — key considered held if pressed within this window
+
+        if now - key_times.get('a', 0) < held_thresh:
             left_paddle['y'] += PADDLE_SPEED * dt
-        if 'd' in keys_held:
+        if now - key_times.get('d', 0) < held_thresh:
             left_paddle['y'] -= PADDLE_SPEED * dt
-        if 'up' in keys_held:
+        if now - key_times.get('up', 0) < held_thresh:
             right_paddle['y'] += PADDLE_SPEED * dt
-        if 'down' in keys_held:
+        if now - key_times.get('down', 0) < held_thresh:
             right_paddle['y'] -= PADDLE_SPEED * dt
 
         # Clamp paddles
