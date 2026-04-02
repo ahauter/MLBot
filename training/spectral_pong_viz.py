@@ -261,9 +261,8 @@ class WavepacketObject2D:
 class SimpleRLController:
     """Single wide hidden layer trained with REINFORCE + eligibility traces.
 
-    State: flattened wavepacket coefficients + ball pos/vel + paddle positions.
-    Action: 2 floats in [-1, 1] → scaled to paddle velocities.
-    Reward: sparse ±1 on goals.
+    Each instance controls ONE paddle. State is the full wavepacket
+    representation + game state. Action is a single float in [-1, 1].
     """
 
     def __init__(self, state_dim: int, hidden_dim: int = 256,
@@ -272,8 +271,8 @@ class SimpleRLController:
         scale2 = np.sqrt(2.0 / hidden_dim)
         self.W1 = np.random.randn(hidden_dim, state_dim) * scale1
         self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(2, hidden_dim) * scale2
-        self.b2 = np.zeros(2)
+        self.W2 = np.random.randn(1, hidden_dim) * scale2
+        self.b2 = np.zeros(1)
         self.lr = lr
         self.gamma = gamma
         self.std = std
@@ -296,23 +295,23 @@ class SimpleRLController:
                                left_paddle['y'], right_paddle['y']]))
         return np.concatenate(parts)
 
-    def act(self, state: np.ndarray) -> np.ndarray:
+    def act(self, state: np.ndarray) -> float:
         """Forward pass + sample from Gaussian policy. Returns action in [-1,1]."""
         # Forward
         z1 = self.W1 @ state + self.b1
         h1 = np.maximum(z1, 0)                          # ReLU
-        z2 = self.W2 @ h1 + self.b2
+        z2 = float((self.W2 @ h1)[0] + self.b2[0])
         mean = np.tanh(z2)                               # bounded mean
 
         # Sample
-        action = np.clip(mean + self.std * np.random.randn(2), -1, 1)
+        action = float(np.clip(mean + self.std * np.random.randn(), -1, 1))
 
         # ∇ log π  (Gaussian + tanh chain rule)
         d_logpi = (action - mean) / (self.std ** 2)
         d_z2 = d_logpi * (1 - mean ** 2)                 # through tanh
-        grad_W2 = d_z2[:, None] * h1[None, :]
-        grad_b2 = d_z2
-        d_h1 = self.W2.T @ d_z2
+        grad_W2 = d_z2 * h1[None, :]
+        grad_b2 = np.array([d_z2])
+        d_h1 = self.W2[0] * d_z2
         d_z1 = d_h1 * (z1 > 0)                           # through ReLU
         grad_W1 = d_z1[:, None] * state[None, :]
         grad_b1 = d_z1
@@ -406,12 +405,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         c_cos=reward_c_cos, c_sin=np.zeros((K, 2)),
         lr=reward_lr, lr_tracking=0.0)
 
-    # -- RL paddle controller (when spectral_paddle is True) -----------------
-    rl_controller = None
+    # -- RL paddle controllers (one per paddle, opposite rewards) ------------
+    rl_left = None
+    rl_right = None
     if spectral_paddle:
         # State: 5 wavepackets × (K×2 cos + K×2 sin) + 6 game-state floats
         state_dim = 5 * (K * 2 * 2) + 6
-        rl_controller = SimpleRLController(state_dim, hidden_dim=8)
+        rl_left = SimpleRLController(state_dim, hidden_dim=8)
+        rl_right = SimpleRLController(state_dim, hidden_dim=8)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -576,14 +577,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         # -- move paddles -------------------------------------------------
         half_h = PADDLE_HEIGHT / 2
         if auto_paddle:
-            if spectral_paddle and rl_controller is not None:
-                # RL policy: wavepacket state → paddle velocities
+            if spectral_paddle and rl_left is not None:
+                # RL policy: wavepacket state → paddle velocity (one per paddle)
                 rl_state = SimpleRLController.build_state(
                     [wp_ball, wp_paddle_l, wp_paddle_r, wp_env, wp_reward],
                     ball, left_paddle, right_paddle)
-                action = rl_controller.act(rl_state)  # [-1, 1]
-                left_paddle['y'] += action[0] * PADDLE_SPEED * dt
-                right_paddle['y'] += action[1] * PADDLE_SPEED * dt
+                act_l = rl_left.act(rl_state)
+                act_r = rl_right.act(rl_state)
+                left_paddle['y'] += act_l * PADDLE_SPEED * dt
+                right_paddle['y'] += act_r * PADDLE_SPEED * dt
             else:
                 # Simple tracking AI
                 track_speed = PADDLE_SPEED * dt * 0.8
@@ -667,9 +669,10 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
-            # RL update on sparse reward
-            if rl_controller is not None:
-                rl_controller.update(reward)
+            # RL update — opposite rewards for each side
+            if rl_left is not None:
+                rl_left.update(reward)       # +1 when left scores
+                rl_right.update(-reward)     # +1 when right blocks
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
