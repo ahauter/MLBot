@@ -46,6 +46,7 @@ SCORE_COLOR = 'white'
 ENV_FIELD_COLOR = '#c084fc'
 INTERACT_COLOR = '#a78bfa'
 RESIDUAL_COLOR = '#facc15'
+REWARD_COLOR = '#fb923c'       # orange for learned reward field
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -222,7 +223,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 env_lr: float, spectral_paddle: bool = False,
                 alpha_paddle: float = 0.5,
                 paddle_damping: float = 0.85,
-                beta_paddle: float = 0.3):
+                beta_paddle: float = 0.3,
+                gamma_paddle: float = 0.2,
+                reward_lr: float = 0.3):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
@@ -243,6 +246,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, pos0=(0.0, 0.0), mass=1e6,
         c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
         lr=env_lr)
+
+    # Learned reward field: maps positions to reward values via LMS.
+    # Both amplitude axes store scalar reward (axis 0 = reward-at-x,
+    # axis 1 = reward-at-y).  Learns from sparse goal events.
+    wp_reward = WavepacketObject2D(
+        K, frequencies, pos0=(0.0, 0.0), mass=1.0,
+        c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
+        lr=reward_lr)
 
     # -- Newtonian state ------------------------------------------------------
     paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
@@ -299,6 +310,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                            label='R paddle')
     lx_env, = ax_x.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
                          label='Env (learned)')
+    lx_reward, = ax_x.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
+                            ls='--', label='Reward (learned)')
     lx_dot, = ax_x.plot([], [], 'o', color=BALL_COLOR, markersize=8,
                          zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_x.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
@@ -320,6 +333,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7)
     ly_env, = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
                          label='Env (learned)')
+    ly_reward, = ax_y.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
+                            ls='--', label='Reward (learned)')
     ly_dot, = ax_y.plot([], [], 'o', color=BALL_COLOR, markersize=8,
                          zorder=5, markeredgecolor='white', markeredgewidth=1)
     ax_y.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
@@ -380,8 +395,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
     # -- animation step -------------------------------------------------------
     def init():
-        for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env,
-                    ly_ball, ly_pad_l, ly_pad_r, ly_env]:
+        for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env, lx_reward,
+                    ly_ball, ly_pad_l, ly_pad_r, ly_env, ly_reward]:
             ln.set_data([], [])
         lx_dot.set_data([], [])
         ly_dot.set_data([], [])
@@ -402,18 +417,24 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         half_h = PADDLE_HEIGHT / 2
         if auto_paddle:
             if spectral_paddle:
-                # Two-term spectral rule:
-                #   tracking    = cross(ball, paddle)  — signed displacement
+                # Three-term spectral rule:
+                #   tracking     = cross(paddle, ball) — signed displacement
                 #   anticipation = -cross(ball, env)   — pre-correct for wall bounce
-                #   force = alpha * tracking + beta * anticipation
+                #   reward_grad  = dR/dy at paddle pos — move toward higher reward
                 tracking_l = wp_paddle_l.cross_product_2d(wp_ball)[1]
                 wall_signal = wp_ball.cross_product_2d(wp_env)[1]
-                force_l = alpha_paddle * tracking_l - beta_paddle * wall_signal
+                reward_grad_l = wp_reward.gradient(left_paddle['y'], axis=1)
+                force_l = (alpha_paddle * tracking_l
+                           - beta_paddle * wall_signal
+                           + gamma_paddle * reward_grad_l)
                 paddle_vel['l'] = paddle_damping * paddle_vel['l'] + force_l * dt
                 left_paddle['y'] += paddle_vel['l'] * dt
 
                 tracking_r = wp_paddle_r.cross_product_2d(wp_ball)[1]
-                force_r = alpha_paddle * tracking_r - beta_paddle * wall_signal
+                reward_grad_r = wp_reward.gradient(right_paddle['y'], axis=1)
+                force_r = (alpha_paddle * tracking_r
+                           - beta_paddle * wall_signal
+                           + gamma_paddle * reward_grad_r)
                 paddle_vel['r'] = paddle_damping * paddle_vel['r'] + force_r * dt
                 right_paddle['y'] += paddle_vel['r'] * dt
             else:
@@ -495,16 +516,25 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
         # Scoring
         scored = False
+        reward = 0.0
         if ball['x'] < COURT_LEFT:
             right_paddle['score'] += 1
+            reward = -1.0   # left paddle conceded
             scored = True
-            reset_ball(ball, toward='left', speed=ball_speed)
         elif ball['x'] > COURT_RIGHT:
             left_paddle['score'] += 1
+            reward = +1.0   # left paddle scored
             scored = True
-            reset_ball(ball, toward='right', speed=ball_speed)
 
         if scored:
+            # Train reward field at the goal position before resetting ball
+            goal_pos = np.array([ball['x'], ball['y']])
+            wp_reward.update_lms(goal_pos,
+                                 np.array([reward, reward]),
+                                 anomaly_scale=1.0)
+
+            reset_ball(ball, toward='left' if reward < 0 else 'right',
+                       speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
             paddle_vel['l'] = 0.0
             paddle_vel['r'] = 0.0
@@ -546,6 +576,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0))
         lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0))
         lx_env.set_data(x_dom, wp_env.evaluate(x_dom, axis=0))
+        lx_reward.set_data(x_dom, wp_reward.evaluate(x_dom, axis=0))
         lx_dot.set_data([ball['x']], [0])
 
         # -- draw Y-domain (x=field value, y=domain) ---------------------
@@ -553,6 +584,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1), y_dom)
         ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1), y_dom)
         ly_env.set_data(wp_env.evaluate(y_dom, axis=1), y_dom)
+        ly_reward.set_data(wp_reward.evaluate(y_dom, axis=1), y_dom)
         ly_dot.set_data([0], [ball['y']])
 
         # -- draw court ---------------------------------------------------
@@ -620,6 +652,12 @@ def main():
     parser.add_argument('--beta-paddle', type=float, default=0.3,
                         help='Wall-anticipation coupling strength '
                              '(default: 0.3)')
+    parser.add_argument('--gamma-paddle', type=float, default=0.2,
+                        help='Reward-gradient coupling strength '
+                             '(default: 0.2)')
+    parser.add_argument('--reward-lr', type=float, default=0.3,
+                        help='Reward field LMS learning rate '
+                             '(default: 0.3)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -655,6 +693,8 @@ def main():
         alpha_paddle=args.alpha_paddle,
         paddle_damping=args.paddle_damping,
         beta_paddle=args.beta_paddle,
+        gamma_paddle=args.gamma_paddle,
+        reward_lr=args.reward_lr,
     )
 
     if args.save:
