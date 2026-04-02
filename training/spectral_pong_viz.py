@@ -819,12 +819,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_paddle_l.normalize()
         wp_paddle_r.normalize()
 
-        # 5. Feed deviation into env field — "something here pushed
-        #    the ball off its PMF constraint"
+        # 5. Attribute deviation via NIP soft attention — env only gets
+        #    its fraction; paddle fraction is discarded (observed objects)
         deviation_mag = np.linalg.norm(ball_deviation)
         if not scored and deviation_mag > 1e-8:
+            total_nip = nip_ball_env + nip_ball_padL + nip_ball_padR + 1e-8
+            env_fraction = nip_ball_env / total_nip
             wp_env.update_lms(ball_pos, ball_deviation,
-                              anomaly_scale=deviation_mag)
+                              anomaly_scale=deviation_mag * env_fraction)
             wp_env.normalize()
 
         # 6. Update stored positions
