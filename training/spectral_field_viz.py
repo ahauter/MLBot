@@ -43,10 +43,10 @@ BALL_COLOR = '#38bdf8'
 WALL_COLOR = '#f87171'
 INTERACT_COLOR = '#a78bfa'
 NEWTON_COLOR = '#4ade80'
-RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall
+RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall (legacy)
 RESIDUAL_COLOR = '#facc15'   # yellow for LMS residual
-PAD_COLOR = '#2dd4bf'        # teal for friction pad
-PAD_FIELD_COLOR = '#5eead4'  # light teal for pad field curve
+ENV_FIELD_COLOR = '#c084fc'  # purple for learned environment field
+PAD_COLOR = '#2dd4bf'        # teal for friction pad region marker
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -188,22 +188,17 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, x0=0.0, mass=1.0,
         sigma=ball_sigma, amplitude=ball_amplitude)
 
-    # Wall field: starts empty, learns from bounce contact positions via LMS
-    b_wall = WavepacketObject(
+    # Environment field: starts empty, learns from acceleration anomalies.
+    # No prior knowledge of walls or pads — discovers them from velocity changes.
+    b_env = WavepacketObject(
         K, frequencies, x0=0.0, mass=wall_mass,
-        c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
-
-    # Pad field: starts empty, learns from ball passing through friction region
-    b_pad = WavepacketObject(
-        K, frequencies, x0=pad_center, mass=wall_mass,
         c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
 
     b_hist_x = deque(maxlen=window)
 
     # Shared
     history_t = deque(maxlen=window)
-    state = {'t': 0, 'residual': 0.0, 'residual_wall_x': 0.0,
-             'residual_age': 999, 'max_residual': 1.0}
+    state = {'t': 0, 'residual': 0.0, 'residual_x': 0.0, 'max_residual': 1.0}
 
     # ── figure: 2 field panels + position comparison ──────────────────
     fig, (ax_a, ax_b, ax_track) = plt.subplots(
@@ -259,19 +254,17 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     lb_ball_field, = ax_b.plot([], [], color=BALL_COLOR, lw=2, alpha=0.9,
                                 label='Ball wavepacket (shifted)')
-    lb_wall_field, = ax_b.plot([], [], color=RECON_WALL_COLOR, lw=1.5,
-                                alpha=0.8, label='Learned wall field')
-    lb_pad_field, = ax_b.plot([], [], color=PAD_FIELD_COLOR, lw=1.5,
-                               alpha=0.7, ls='--', label='Learned pad field')
+    lb_env_field, = ax_b.plot([], [], color=ENV_FIELD_COLOR, lw=1.5,
+                               alpha=0.8, label='Learned env field')
     lb_dot, = ax_b.plot([], [], 'o', color=NEWTON_COLOR, markersize=12,
                          zorder=5, markeredgecolor='white', markeredgewidth=1.5)
     lb_arrow = [None]
     lb_residual_arrow = [None]
 
     ax_b.text(0.02, 0.97,
-              'Ball: wavepacket shifted to Newtonian position'
+              'Ball: wavepacket shifted to Newtonian pos'
               '\n'
-              'Wall: LMS from bounces | Pad: LMS from friction region',
+              r'Env: LMS from accel anomaly $a_{actual} - a_{predicted}$',
               transform=ax_b.transAxes, color='#ccc', fontsize=9,
               verticalalignment='top',
               bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -312,7 +305,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     def init():
         for line in [la_ball_field, la_wall_field,
-                     lb_ball_field, lb_wall_field, lb_pad_field,
+                     lb_ball_field, lb_env_field,
                      lt_spectral, lt_newton]:
             line.set_data([], [])
         la_dot.set_data([], [])
@@ -338,64 +331,50 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         # ════════════════════════════════════════════════════════════
         # PANEL B: Position → Spectral
         # ════════════════════════════════════════════════════════════
-        # Newtonian step
-        bounced = False
+        # Newtonian step — record velocity before and after
+        v_before = newton['v']
+
         newton['x'] += newton['v'] * dt
 
         # Friction pad: decelerate proportional to velocity
         if pad_left <= newton['x'] <= pad_right:
             newton['v'] -= pad_friction * newton['v'] * dt
 
+        # Wall bounces
         if newton['x'] >= wall_right:
             newton['x'] = 2 * wall_right - newton['x']
             newton['v'] = -newton['v']
-            bounced = True
         elif newton['x'] <= wall_left:
             newton['x'] = 2 * wall_left - newton['x']
             newton['v'] = -newton['v']
-            bounced = True
 
+        v_after = newton['v']
         nx = newton['x']
 
-        # Increment phase: shift wavepacket by velocity * dt each frame.
-        # On bounce frames, decompose into two shifts (to wall + reflection)
-        # so every frequency accumulates the correct total phase theta.
-        if bounced:
-            # Pre-bounce position before reflection
-            if newton['v'] > 0:
-                # Bounced off left wall, now moving right
-                wall_pos = wall_left
-            else:
-                # Bounced off right wall, now moving left
-                wall_pos = wall_right
-            delta_to_wall = wall_pos - b_ball.x
-            delta_from_wall = nx - wall_pos
-            b_ball.shift(delta_to_wall)
-            b_ball.shift(delta_from_wall)
-        else:
-            delta_b = nx - b_ball.x
-            b_ball.shift(delta_b)
+        # Shift ball wavepacket to match Newtonian position
+        delta_b = nx - b_ball.x
+        b_ball.shift(delta_b)
         b_ball.x = nx
 
-        # LMS: learn wall field from bounce contact positions
-        if bounced:
-            wall_pos = wall_right if newton['v'] < 0 else wall_left
-            # Capture pre-update residual (before LMS corrects it)
-            basis = b_wall._basis(wall_pos)
-            pred = float(b_wall._c @ basis)
-            state['residual'] = wall_pos - pred
-            state['residual_wall_x'] = wall_pos
-            state['residual_age'] = 0
-            for _ in range(10):
-                b_wall.update(wall_pos)
-
-        # LMS: learn pad field from ball passing through friction region
-        if pad_left <= nx <= pad_right:
-            b_pad.update(nx)
-
-        # Inner product force from reconstructed spectral fields
-        overlap_b = b_ball.inner_product(b_wall)
+        # ── Anomaly-based learning ──────────────────────────────
+        # Observed acceleration vs predicted (from learned env field)
+        a_actual = (v_after - v_before) / dt
+        overlap_b = b_ball.inner_product(b_env)
         force_b = -alpha * overlap_b
+        a_predicted = force_b / b_ball.mass
+        a_residual = a_actual - a_predicted
+
+        # LMS: update env field at ball position, scaled by anomaly
+        # No knowledge of walls or pads — only the velocity anomaly
+        anomaly_mag = abs(a_residual)
+        if anomaly_mag > 0.1:
+            n_lms = int(np.clip(anomaly_mag * 0.5, 1, 10))
+            for _ in range(n_lms):
+                b_env.update(nx)
+
+        # Store residual for visualization
+        state['residual'] = a_residual
+        state['residual_x'] = nx
 
         b_hist_x.append(nx)
         history_t.append(t)
@@ -423,11 +402,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
         # ── draw panel B ─────────────────────────────────────────
         b_ball_curve = b_ball.evaluate(x_domain)
-        b_wall_curve = b_wall.evaluate(x_domain)
-        b_pad_curve = b_pad.evaluate(x_domain)
+        b_env_curve = b_env.evaluate(x_domain)
         lb_ball_field.set_data(x_domain, b_ball_curve)
-        lb_wall_field.set_data(x_domain, b_wall_curve)
-        lb_pad_field.set_data(x_domain, b_pad_curve)
+        lb_env_field.set_data(x_domain, b_env_curve)
         lb_dot.set_data([nx], [0])
         lb_vel_text.set_text(f'v={newton["v"]:.2f}')
 
@@ -443,27 +420,22 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         else:
             lb_arrow[0] = None
 
-        # LMS residual arrow (vertical, at wall contact point)
+        # Acceleration anomaly arrow (vertical, at ball position)
         if lb_residual_arrow[0] is not None:
             lb_residual_arrow[0].remove()
             lb_residual_arrow[0] = None
-        age = state['residual_age']
-        if age < 15:
-            r = state['residual']
-            wx = state['residual_wall_x']
-            fade = max(0.0, 1.0 - age / 15.0)
-            # Auto-scale: track max with exponential decay so small residuals
-            # remain visible after the initial large ones fade from memory
-            state['max_residual'] = max(abs(r), state['max_residual'] * 0.98)
-            mr = max(state['max_residual'], 0.01)
-            rdy = np.clip(r / mr * 3.0, -4.0, 4.0)
-            if abs(rdy) > 0.05:
-                lb_residual_arrow[0] = ax_b.annotate(
-                    '', xy=(wx, rdy), xytext=(wx, 0),
-                    arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
-                                    lw=2.5, alpha=fade, mutation_scale=15),
-                    zorder=7)
-            state['residual_age'] = age + 1
+        r = state['residual']
+        rx = state['residual_x']
+        # Auto-scale with exponential decay
+        state['max_residual'] = max(abs(r), state['max_residual'] * 0.98)
+        mr = max(state['max_residual'], 0.01)
+        rdy = np.clip(r / mr * 3.0, -4.0, 4.0)
+        if abs(rdy) > 0.05:
+            lb_residual_arrow[0] = ax_b.annotate(
+                '', xy=(rx, rdy), xytext=(rx, 0),
+                arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
+                                lw=2.5, mutation_scale=15),
+                zorder=7)
 
         # ── draw panel 3: position comparison ────────────────────
         ts = np.array(history_t)
