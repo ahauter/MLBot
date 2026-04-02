@@ -554,10 +554,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             np.array([paddle_rx, right_paddle['y']]))
 
         # -- LMS wall learning from acceleration anomaly ------------------
+        # Subtract contributions from ALL known sources (env + paddles)
+        # so the env field only learns from truly unexplained anomalies.
         a_actual = np.array([(vx_after - vx_before) / dt,
                              (vy_after - vy_before) / dt])
-        force_pred = -alpha * wp_ball.inner_product_2d(wp_env)
-        a_predicted = force_pred / wp_ball.mass
+        force_env = -alpha * wp_ball.inner_product_2d(wp_env)
+        force_pad_l = -alpha * wp_ball.inner_product_2d(wp_paddle_l)
+        force_pad_r = -alpha * wp_ball.inner_product_2d(wp_paddle_r)
+        a_predicted = (force_env + force_pad_l + force_pad_r) / wp_ball.mass
         a_residual = a_actual - a_predicted
 
         anomaly_mag = np.linalg.norm(a_residual) * 0.01
