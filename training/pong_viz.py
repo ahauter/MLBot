@@ -5,7 +5,7 @@ Simple 2D pong game with Newtonian ball physics.
 Baseline for future spectral-field pong variant.
 
 Controls:
-    Left paddle:  W / S
+    Left paddle:  A / D
     Right paddle:  Up / Down
 
 Usage:
@@ -46,7 +46,7 @@ PADDLE_HEIGHT = 1.0
 PADDLE_SPEED = 4.0
 
 BALL_RADIUS = 0.15
-BALL_SPEED = 3.0
+BALL_SPEED = 2.0
 SPIN_FACTOR = 2.0           # how much paddle-hit offset affects vy
 
 
@@ -157,9 +157,9 @@ def create_game(dt: float, interval: int, max_frames: int | None,
             return ()
 
         # ── move paddles ─────────────────────────────────
-        if 'w' in keys_held:
+        if 'a' in keys_held:
             left_paddle['y'] += PADDLE_SPEED * dt
-        if 's' in keys_held:
+        if 'd' in keys_held:
             left_paddle['y'] -= PADDLE_SPEED * dt
         if 'up' in keys_held:
             right_paddle['y'] += PADDLE_SPEED * dt
