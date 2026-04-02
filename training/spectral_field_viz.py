@@ -45,7 +45,7 @@ INTERACT_COLOR = '#a78bfa'
 NEWTON_COLOR = '#4ade80'
 RECON_WALL_COLOR = '#fb923c'  # orange for reconstructed wall
 RESIDUAL_COLOR = '#facc15'   # yellow for LMS residual
-PAD_COLOR = '#2dd4bf'        # teal for boost pad
+PAD_COLOR = '#2dd4bf'        # teal for friction pad
 PAD_FIELD_COLOR = '#5eead4'  # light teal for pad field curve
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
@@ -154,7 +154,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                      ball_sigma: float, ball_amplitude: float,
                      ball_lr: float, wall_mass: float,
                      pad_center: float, pad_width: float,
-                     pad_boost: float,
+                     pad_friction: float,
                      interval: int, max_frames: int | None):
     x_domain = np.linspace(-6, 6, 500)
     window = 300
@@ -193,7 +193,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, x0=0.0, mass=wall_mass,
         c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
 
-    # Pad field: starts empty, learns from ball passing through boost region
+    # Pad field: starts empty, learns from ball passing through friction region
     b_pad = WavepacketObject(
         K, frequencies, x0=pad_center, mass=wall_mass,
         c_cos=np.zeros(K), c_sin=np.zeros(K), lr=ball_lr)
@@ -271,7 +271,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_b.text(0.02, 0.97,
               'Ball: wavepacket shifted to Newtonian position'
               '\n'
-              'Wall: LMS from bounces | Pad: LMS from boost region',
+              'Wall: LMS from bounces | Pad: LMS from friction region',
               transform=ax_b.transAxes, color='#ccc', fontsize=9,
               verticalalignment='top',
               bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a2e',
@@ -342,9 +342,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         bounced = False
         newton['x'] += newton['v'] * dt
 
-        # Boost pad: accelerate ball in direction of travel
+        # Friction pad: decelerate proportional to velocity
         if pad_left <= newton['x'] <= pad_right:
-            newton['v'] += np.sign(newton['v']) * pad_boost * dt
+            newton['v'] -= pad_friction * newton['v'] * dt
 
         if newton['x'] >= wall_right:
             newton['x'] = 2 * wall_right - newton['x']
@@ -389,7 +389,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
             for _ in range(10):
                 b_wall.update(wall_pos)
 
-        # LMS: learn pad field from ball passing through boost region
+        # LMS: learn pad field from ball passing through friction region
         if pad_left <= nx <= pad_right:
             b_pad.update(nx)
 
@@ -496,11 +496,11 @@ def main():
     parser.add_argument('--frames', type=int, default=None,
                         help='Frame limit (default: infinite, required for --save)')
     parser.add_argument('--pad-center', type=float, default=1.5,
-                        help='Boost pad center position (default: 1.5)')
+                        help='Friction pad center position (default: 1.5)')
     parser.add_argument('--pad-width', type=float, default=1.0,
-                        help='Boost pad width (default: 1.0)')
-    parser.add_argument('--pad-boost', type=float, default=0.3,
-                        help='Boost pad acceleration strength (default: 0.3)')
+                        help='Friction pad width (default: 1.0)')
+    parser.add_argument('--pad-friction', type=float, default=0.3,
+                        help='Friction pad coefficient mu (default: 0.3)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -532,7 +532,7 @@ def main():
         wall_mass=1e6,
         pad_center=args.pad_center,
         pad_width=args.pad_width,
-        pad_boost=args.pad_boost,
+        pad_friction=args.pad_friction,
         interval=50,
         max_frames=args.frames,
     )
