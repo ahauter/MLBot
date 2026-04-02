@@ -148,7 +148,7 @@ class WavepacketObject2D:
         a, b = WORLD_BOUNDS[axis]
         grid = np.linspace(a, b, 200)
         vals = self.evaluate(grid, axis)
-        return float(np.trapz(vals ** 2, grid))
+        return float(np.trapezoid(vals ** 2, grid))
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
@@ -265,8 +265,11 @@ class SimpleRLController:
     representation + game state. Action is a single float in [-1, 1].
     """
 
+    TRACE_CLIP = 1.0
+    WEIGHT_DECAY = 0.9999
+
     def __init__(self, state_dim: int, hidden_dim: int = 256,
-                 lr: float = 3e-5, gamma: float = 0.99, std: float = 0.5):
+                 lr: float = 3e-5, gamma: float = 0.95, std: float = 0.5):
         scale1 = np.sqrt(2.0 / state_dim)
         scale2 = np.sqrt(2.0 / hidden_dim)
         self.W1 = np.random.randn(hidden_dim, state_dim) * scale1
@@ -316,11 +319,23 @@ class SimpleRLController:
         grad_W1 = d_z1[:, None] * state[None, :]
         grad_b1 = d_z1
 
-        # Accumulate eligibility traces
+        # Accumulate eligibility traces (clipped to prevent runaway)
         self.trace_W1 = self.gamma * self.trace_W1 + grad_W1
         self.trace_b1 = self.gamma * self.trace_b1 + grad_b1
         self.trace_W2 = self.gamma * self.trace_W2 + grad_W2
         self.trace_b2 = self.gamma * self.trace_b2 + grad_b2
+        np.clip(self.trace_W1, -self.TRACE_CLIP, self.TRACE_CLIP,
+                out=self.trace_W1)
+        np.clip(self.trace_b1, -self.TRACE_CLIP, self.TRACE_CLIP,
+                out=self.trace_b1)
+        np.clip(self.trace_W2, -self.TRACE_CLIP, self.TRACE_CLIP,
+                out=self.trace_W2)
+        np.clip(self.trace_b2, -self.TRACE_CLIP, self.TRACE_CLIP,
+                out=self.trace_b2)
+
+        # Weight decay — prevent tanh saturation
+        self.W1 *= self.WEIGHT_DECAY
+        self.W2 *= self.WEIGHT_DECAY
 
         return action
 
