@@ -370,8 +370,10 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     ax_y.axhline(COURT_BOTTOM, color=RESIDUAL_COLOR, ls='--', lw=1, alpha=0.5)
 
     ly_ball, = ax_y.plot([], [], color=BALL_COLOR, lw=2, label='Ball')
-    ly_pad_l, = ax_y.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7)
-    ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7)
+    ly_pad_l, = ax_y.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7,
+                           label='L paddle')
+    ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7,
+                           label='R paddle')
     ly_env, = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
                          label='Env (learned)')
     ly_reward, = ax_y.plot([], [], color=REWARD_COLOR, lw=1.5, alpha=0.8,
