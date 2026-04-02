@@ -126,6 +126,16 @@ class WavepacketObject2D:
         """Predict field value at domain position x for one axis."""
         return float(self._c_flat(axis) @ self._basis(x))
 
+    def gradient(self, x: float, axis: int) -> float:
+        """Analytical derivative dF_d/dx at domain position x.
+
+        dF/dx = sum_j [-c_cos[j,d] * k_j * sin(k_j * x)
+                        + c_sin[j,d] * k_j * cos(k_j * x)]
+        """
+        return float(np.sum(
+            -self.c_cos[:, axis] * self.k * np.sin(self.k * x)
+            + self.c_sin[:, axis] * self.k * np.cos(self.k * x)))
+
     def inner_product_2d(self, other: 'WavepacketObject2D') -> np.ndarray:
         """Component-wise inner product per spatial dimension. Returns (2,)."""
         return np.array([
@@ -194,7 +204,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 dt: float, ball_speed: float, interval: int,
                 max_frames: int | None, auto_paddle: bool,
                 ball_sigma: float, ball_amplitude: float,
-                env_lr: float):
+                env_lr: float, spectral_paddle: bool = False,
+                alpha_paddle: float = 0.5,
+                paddle_damping: float = 0.85):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
@@ -226,6 +238,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     left_paddle = {'y': 0.0, 'score': 0}
     right_paddle = {'y': 0.0, 'score': 0}
     key_times: dict[str, float] = {}
+    paddle_vel = {'l': 0.0, 'r': 0.0}
     state = {'freeze': 0, 't': 0,
              'anomaly': np.zeros(2), 'max_anomaly': 1.0}
 
@@ -372,16 +385,27 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         # -- move paddles -------------------------------------------------
         half_h = PADDLE_HEIGHT / 2
         if auto_paddle:
-            # Simple tracking AI
-            track_speed = PADDLE_SPEED * dt * 0.8
-            if ball['y'] > left_paddle['y'] + 0.1:
-                left_paddle['y'] += track_speed
-            elif ball['y'] < left_paddle['y'] - 0.1:
-                left_paddle['y'] -= track_speed
-            if ball['y'] > right_paddle['y'] + 0.1:
-                right_paddle['y'] += track_speed
-            elif ball['y'] < right_paddle['y'] - 0.1:
-                right_paddle['y'] -= track_speed
+            if spectral_paddle:
+                # Gradient ascent on ball's spectral field —
+                # paddle follows the gradient uphill toward the ball's peak
+                grad_l = wp_ball.gradient(left_paddle['y'], axis=1)
+                paddle_vel['l'] = paddle_damping * paddle_vel['l'] + alpha_paddle * grad_l * dt
+                left_paddle['y'] += paddle_vel['l'] * dt
+
+                grad_r = wp_ball.gradient(right_paddle['y'], axis=1)
+                paddle_vel['r'] = paddle_damping * paddle_vel['r'] + alpha_paddle * grad_r * dt
+                right_paddle['y'] += paddle_vel['r'] * dt
+            else:
+                # Simple tracking AI
+                track_speed = PADDLE_SPEED * dt * 0.8
+                if ball['y'] > left_paddle['y'] + 0.1:
+                    left_paddle['y'] += track_speed
+                elif ball['y'] < left_paddle['y'] - 0.1:
+                    left_paddle['y'] -= track_speed
+                if ball['y'] > right_paddle['y'] + 0.1:
+                    right_paddle['y'] += track_speed
+                elif ball['y'] < right_paddle['y'] - 0.1:
+                    right_paddle['y'] -= track_speed
         else:
             now = time.time()
             held = 0.15
@@ -398,6 +422,13 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
         right_paddle['y'] = np.clip(right_paddle['y'],
                                      COURT_BOTTOM + half_h, COURT_TOP - half_h)
+
+        # Zero paddle velocity when clamped to court edge
+        if spectral_paddle and auto_paddle:
+            if left_paddle['y'] <= COURT_BOTTOM + half_h or left_paddle['y'] >= COURT_TOP - half_h:
+                paddle_vel['l'] = 0.0
+            if right_paddle['y'] <= COURT_BOTTOM + half_h or right_paddle['y'] >= COURT_TOP - half_h:
+                paddle_vel['r'] = 0.0
 
         # -- Newtonian ball step ------------------------------------------
         vx_before, vy_before = ball['vx'], ball['vy']
@@ -454,6 +485,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
         if scored:
             state['freeze'] = int(0.5 / dt)
+            paddle_vel['l'] = 0.0
+            paddle_vel['r'] = 0.0
             # Re-init ball wavepacket on score
             wp_ball.__init__(K, frequencies, pos0=(ball['x'], ball['y']),
                              mass=1.0, sigma=ball_sigma,
@@ -554,6 +587,15 @@ def main():
                         help='Target FPS (default: 30)')
     parser.add_argument('--auto-paddle', action='store_true',
                         help='AI-controlled paddles (required for --save)')
+    parser.add_argument('--spectral-paddle', action='store_true',
+                        help='Use spectral inner-product force for paddle AI '
+                             '(with --auto-paddle)')
+    parser.add_argument('--alpha-paddle', type=float, default=0.5,
+                        help='Paddle-ball spectral coupling strength '
+                             '(default: 0.5)')
+    parser.add_argument('--paddle-damping', type=float, default=0.85,
+                        help='Paddle velocity damping per frame '
+                             '(default: 0.85)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
@@ -585,6 +627,9 @@ def main():
         ball_sigma=0.8,
         ball_amplitude=1.5,
         env_lr=args.lr,
+        spectral_paddle=args.spectral_paddle,
+        alpha_paddle=args.alpha_paddle,
+        paddle_damping=args.paddle_damping,
     )
 
     if args.save:
