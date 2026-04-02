@@ -21,6 +21,11 @@ the interaction energy between two particles with contact potential V=g*delta(r)
 is E = g * integral |psi_1|^2 |psi_2|^2 dx.  Our linear version (coefficient
 dot product) computes this via Parseval's theorem in O(K) instead of O(N).
 
+A Newtonian elastic-bounce simulation runs alongside for comparison.  Rolling
+FFTs of both trajectories reveal how the spectral field's soft-wall interaction
+suppresses high-frequency harmonics compared to a hard wall's sharp velocity
+reversal.
+
 The initial parameters are tuned so a human sees Newtonian-like ball-bouncing,
 but in the actual ML experiment these become learnable parameters so RL
 algorithms can discover 3D physical-space representations.
@@ -57,6 +62,7 @@ BG_COLOR = '#12121f'
 BALL_COLOR = '#38bdf8'
 WALL_COLOR = '#f87171'
 INTERACT_COLOR = '#a78bfa'
+NEWTON_COLOR = '#4ade80'
 GRID_COLOR = '#444'
 GRID_ALPHA = 0.15
 LABEL_COLOR = '#aaa'
@@ -211,26 +217,33 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         K, frequencies, x0=0.0, mass=1.0, v0=ball_v0,
         sigma=ball_sigma, amplitude=ball_amplitude)
 
-    state = {'t': 0}
+    # Newtonian ball — same initial conditions, hard elastic walls
+    newton = {'x': 0.0, 'v': ball_v0}
+
+    state = {'t': 0, 'fft_ymax': 1.0}
     history_x = deque(maxlen=window)
-    history_force = deque(maxlen=window)
+    history_newton_x = deque(maxlen=window)
     history_t = deque(maxlen=window)
 
     # ── figure setup ─────────────────────────────────────────────────────
-    fig, (ax_field, ax_interact, ax_track) = plt.subplots(
-        3, 1, figsize=(12, 9), gridspec_kw={'height_ratios': [2, 1, 1]})
+    fig, (ax_field, ax_interact, ax_track,
+          ax_fft_spectral, ax_fft_newton) = plt.subplots(
+        5, 1, figsize=(12, 14),
+        gridspec_kw={'height_ratios': [2, 1, 1.2, 1, 1]})
     fig.patch.set_facecolor(BG_COLOR)
-    fig.suptitle('1D Spectral Field — Inner Product Dynamics',
-                 color=TITLE_COLOR, fontsize=13, fontweight='bold', y=0.97)
+    fig.suptitle('1D Spectral Field — Inner Product Dynamics vs Newtonian',
+                 color=TITLE_COLOR, fontsize=13, fontweight='bold', y=0.98)
 
-    for ax in (ax_field, ax_interact, ax_track):
+    all_axes = [ax_field, ax_interact, ax_track,
+                ax_fft_spectral, ax_fft_newton]
+    for ax in all_axes:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
             spine.set_color('#333')
         ax.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
 
-    # ── top panel: fields + force arrow ──────────────────────────────────
+    # ── panel 1: fields + force arrow ────────────────────────────────────
     ax_field.set_xlim(-6, 6)
     ax_field.set_ylim(-6, 6)
     ax_field.set_xlabel('x (spatial domain)', color=LABEL_COLOR, fontsize=9)
@@ -251,7 +264,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                markeredgewidth=1.5)
 
     # Force arrow (updated each frame)
-    force_arrow = [None]  # mutable container for the annotation artist
+    force_arrow = [None]
 
     eq_text = (r'$\mathrm{shift}(\delta): c_j \to R(k_j \delta)\, c_j$'
                '\n'
@@ -264,7 +277,7 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
     ax_field.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
 
-    # ── middle panel: interaction density ────────────────────────────────
+    # ── panel 2: interaction density ─────────────────────────────────────
     ax_interact.set_xlim(-6, 6)
     ax_interact.set_ylim(-25, 25)
     ax_interact.set_xlabel('x (spatial domain)', color=LABEL_COLOR, fontsize=9)
@@ -279,7 +292,6 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
 
     line_interact, = ax_interact.plot([], [], color=INTERACT_COLOR, lw=1.5,
                                        alpha=0.9)
-    # Filled regions re-drawn each frame; store for cleanup
     interact_fills = []
 
     force_text = ax_interact.text(0.02, 0.92, '', transform=ax_interact.transAxes,
@@ -289,30 +301,52 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
                                              facecolor='#1a1a2e',
                                              edgecolor='#333', alpha=0.9))
 
-    # ── bottom panel: position + force time series ───────────────────────
+    # ── panel 3: position time series (both balls) ───────────────────────
     ax_track.set_ylim(wall_left - 1, wall_right + 1)
     ax_track.set_xlabel('Timestep', color=LABEL_COLOR, fontsize=9)
-    ax_track.set_ylabel('Position / Force', color=LABEL_COLOR, fontsize=9)
-    ax_track.set_title('Position & Force Over Time', color=TITLE_COLOR,
+    ax_track.set_ylabel('Position', color=LABEL_COLOR, fontsize=9)
+    ax_track.set_title('Position Comparison', color=TITLE_COLOR,
                        fontsize=11, fontweight='bold', pad=8)
     ax_track.axhline(wall_left, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(wall_right, color=WALL_COLOR, ls='--', lw=1, alpha=0.5)
     ax_track.axhline(0, color='#555', ls='-', lw=0.5, alpha=0.3)
 
-    line_actual, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
-                                  label='Ball position')
-    line_force_hist, = ax_track.plot([], [], color=INTERACT_COLOR, lw=1.2,
-                                     ls='--', alpha=0.7,
-                                     label='Force (inner product)')
+    line_spectral_pos, = ax_track.plot([], [], color=BALL_COLOR, lw=1.5,
+                                        label='Spectral ball')
+    line_newton_pos, = ax_track.plot([], [], color=NEWTON_COLOR, lw=1.5,
+                                      alpha=0.8, label='Newtonian ball')
 
     ax_track.legend(loc='upper right', fontsize=8, facecolor='#1a1a2e',
                     edgecolor='#333', labelcolor='#ccc')
+
+    # ── panel 4: FFT — spectral ball ────────────────────────────────────
+    nyquist = 1.0 / (2.0 * dt)
+    ax_fft_spectral.set_xlim(0, nyquist)
+    ax_fft_spectral.set_ylim(0, 50)
+    ax_fft_spectral.set_xlabel('Frequency (Hz)', color=LABEL_COLOR, fontsize=9)
+    ax_fft_spectral.set_ylabel('|FFT|', color=LABEL_COLOR, fontsize=9)
+    ax_fft_spectral.set_title('Frequency Content — Spectral Ball',
+                               color=BALL_COLOR, fontsize=10,
+                               fontweight='bold', pad=6)
+
+    line_fft_spectral, = ax_fft_spectral.plot([], [], color=BALL_COLOR, lw=1.5)
+
+    # ── panel 5: FFT — Newtonian ball ───────────────────────────────────
+    ax_fft_newton.set_xlim(0, nyquist)
+    ax_fft_newton.set_ylim(0, 50)
+    ax_fft_newton.set_xlabel('Frequency (Hz)', color=LABEL_COLOR, fontsize=9)
+    ax_fft_newton.set_ylabel('|FFT|', color=LABEL_COLOR, fontsize=9)
+    ax_fft_newton.set_title('Frequency Content — Newtonian Ball',
+                             color=NEWTON_COLOR, fontsize=10,
+                             fontweight='bold', pad=6)
+
+    line_fft_newton, = ax_fft_newton.plot([], [], color=NEWTON_COLOR, lw=1.5)
 
     frame_text = ax_field.text(0.98, 0.02, '', transform=ax_field.transAxes,
                                 color='#555', fontsize=8,
                                 horizontalalignment='right')
 
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     # ── animation callbacks ──────────────────────────────────────────────
 
@@ -322,31 +356,42 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         ball_dot.set_data([], [])
         line_interact.set_data([], [])
         force_text.set_text('')
-        line_actual.set_data([], [])
-        line_force_hist.set_data([], [])
+        line_spectral_pos.set_data([], [])
+        line_newton_pos.set_data([], [])
+        line_fft_spectral.set_data([], [])
+        line_fft_newton.set_data([], [])
         frame_text.set_text('')
         return (line_ball_field, line_wall_field, ball_dot,
-                line_interact, line_actual, line_force_hist, frame_text)
+                line_interact, line_spectral_pos, line_newton_pos,
+                line_fft_spectral, line_fft_newton, frame_text)
 
     def step(_frame):
         t = state['t']
 
-        # ── compute force via inner product ──────────────────────
+        # ── spectral ball: inner product force ───────────────────
         overlap = ball.inner_product(wall)
         force_on_ball = -alpha * overlap
 
-        # ── step all objects ─────────────────────────────────────
         ball.step(force_on_ball, dt)
-        wall.step(-force_on_ball, dt)  # Newton's 3rd (opposite on wall)
+        wall.step(-force_on_ball, dt)
+
+        # ── Newtonian ball: elastic bounce ───────────────────────
+        newton['x'] += newton['v'] * dt
+        if newton['x'] >= wall_right:
+            newton['x'] = 2 * wall_right - newton['x']
+            newton['v'] = -newton['v']
+        elif newton['x'] <= wall_left:
+            newton['x'] = 2 * wall_left - newton['x']
+            newton['v'] = -newton['v']
 
         # ── record history ───────────────────────────────────────
         history_x.append(ball.x)
-        history_force.append(force_on_ball)
+        history_newton_x.append(newton['x'])
         history_t.append(t)
 
         state['t'] = t + 1
 
-        # ── draw top panel: fields + force arrow ─────────────────
+        # ── panel 1: fields + force arrow ────────────────────────
         ball_curve = ball.evaluate(x_domain)
         wall_curve = wall.evaluate(x_domain)
 
@@ -355,13 +400,9 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         ball_dot.set_data([ball.x], [0])
         frame_text.set_text(f't={t}')
 
-        # Force arrow at ball position
         if force_arrow[0] is not None:
             force_arrow[0].remove()
-        arrow_scale = 3.0  # scale force for visual arrow length
-        arrow_dx = force_on_ball * arrow_scale
-        # Clamp arrow length for readability
-        arrow_dx = np.clip(arrow_dx, -2.5, 2.5)
+        arrow_dx = np.clip(force_on_ball * 3.0, -2.5, 2.5)
         if abs(arrow_dx) > 0.05:
             force_arrow[0] = ax_field.annotate(
                 '', xy=(ball.x + arrow_dx, 0),
@@ -372,11 +413,10 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
         else:
             force_arrow[0] = None
 
-        # ── draw middle panel: interaction density ───────────────
+        # ── panel 2: interaction density ─────────────────────────
         interaction = ball_curve * wall_curve
         line_interact.set_data(x_domain, interaction)
 
-        # Update filled regions (remove old, draw new)
         for fill in interact_fills:
             fill.remove()
         interact_fills.clear()
@@ -391,16 +431,41 @@ def create_animation(K: int, frequencies: np.ndarray, alpha: float,
             rf'$\langle F_{{ball}}, F_{{wall}} \rangle = {overlap:+.3f}$'
             f'    force = {force_on_ball:+.3f}')
 
-        # ── draw bottom panel: time series ───────────────────────
+        # ── panel 3: position time series ────────────────────────
         ts = np.array(history_t)
-        line_actual.set_data(ts, np.array(history_x))
-        line_force_hist.set_data(ts, np.array(history_force))
+        line_spectral_pos.set_data(ts, np.array(history_x))
+        line_newton_pos.set_data(ts, np.array(history_newton_x))
 
         if len(ts) > 1:
             ax_track.set_xlim(ts[0], ts[-1] + 1)
 
+        # ── panels 4-5: rolling FFT ─────────────────────────────
+        n = len(history_x)
+        if n >= 64:
+            win = np.hanning(n)
+
+            spectral_arr = np.array(history_x)
+            spectral_arr = spectral_arr - spectral_arr.mean()
+            newton_arr = np.array(history_newton_x)
+            newton_arr = newton_arr - newton_arr.mean()
+
+            fft_s = np.abs(np.fft.rfft(spectral_arr * win))
+            fft_n = np.abs(np.fft.rfft(newton_arr * win))
+            freqs = np.fft.rfftfreq(n, d=dt)
+
+            line_fft_spectral.set_data(freqs, fft_s)
+            line_fft_newton.set_data(freqs, fft_n)
+
+            # Same y-scale for both, with smooth decay to prevent jitter
+            ymax = max(fft_s.max(), fft_n.max(), 1.0) * 1.1
+            ymax = max(ymax, state['fft_ymax'] * 0.95)
+            state['fft_ymax'] = ymax
+            ax_fft_spectral.set_ylim(0, ymax)
+            ax_fft_newton.set_ylim(0, ymax)
+
         return (line_ball_field, line_wall_field, ball_dot,
-                line_interact, line_actual, line_force_hist, frame_text)
+                line_interact, line_spectral_pos, line_newton_pos,
+                line_fft_spectral, line_fft_newton, frame_text)
 
     frames = range(max_frames) if max_frames is not None else itertools.count()
     # blit=False because fill_between creates new artists each frame
