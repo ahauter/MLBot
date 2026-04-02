@@ -148,8 +148,9 @@ class WavepacketObject2D:
         """∫ F_d(x)² dx over world bounds (numerical trapezoidal)."""
         a, b = WORLD_BOUNDS[axis]
         grid = np.linspace(a, b, 200)
-        vals = self.evaluate(grid, axis)
-        return float(np.trapz(vals ** 2, grid))
+        v2 = self.evaluate(grid, axis) ** 2
+        dx = (b - a) / 199
+        return float((v2[0] + v2[-1]) * 0.5 + v2[1:-1].sum()) * dx
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
@@ -297,10 +298,14 @@ class SimpleRLController:
                     left_paddle: dict, right_paddle: dict) -> np.ndarray:
         parts = []
         for wp in wavepackets:
-            parts.extend([wp.c_cos.ravel(), wp.c_sin.ravel()])
-        parts.append(np.array([ball['x'], ball['y'],
-                               ball['vx'], ball['vy'],
-                               left_paddle['y'], right_paddle['y']]))
+            coeffs = np.concatenate([wp.c_cos.ravel(), wp.c_sin.ravel()])
+            norm = np.linalg.norm(coeffs) + 1e-8
+            parts.append(coeffs / norm)
+        # Game state normalized to ~[-1, 1] by world bounds
+        parts.append(np.array([ball['x'] / 5.0, ball['y'] / 3.0,
+                               ball['vx'] / 3.0, ball['vy'] / 3.0,
+                               left_paddle['y'] / 3.0,
+                               right_paddle['y'] / 3.0]))
         return np.concatenate(parts)
 
     def act(self, state: np.ndarray) -> float:
@@ -612,7 +617,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         init_data = np.zeros((5, K_coeff * 4))
         debug_heatmap = ax_input.imshow(
             init_data, aspect='auto', cmap='coolwarm',
-            vmin=-COEFF_CLIP, vmax=COEFF_CLIP, interpolation='nearest')
+            vmin=-1, vmax=1, interpolation='nearest')
         ax_input.set_yticks(range(5))
         ax_input.set_yticklabels(['Ball', 'PadL', 'PadR', 'Env', 'Rew'],
                                  fontsize=7, color=LABEL_COLOR)
