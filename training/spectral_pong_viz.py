@@ -276,17 +276,24 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         sigma=0.5, amplitude=1.0,
         lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
+    # Env and reward start with orthogonal spectral basis vectors so the
+    # normalized inner product can bootstrap learning:
+    #   env  — basis [1,0,0,...] on x-axis, [0,1,0,...] on y-axis
+    #   reward — basis [0,0,1,...] on both axes
+    env_c_cos = np.zeros((K, 2))
+    env_c_cos[0, 0] = 1.0  # frequency 0 → x
+    env_c_cos[1, 1] = 1.0  # frequency 1 → y
     wp_env = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1e6,
-        c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
+        c_cos=env_c_cos, c_sin=np.zeros((K, 2)),
         lr=env_lr, lr_tracking=0.0)
 
-    # Learned reward field: maps positions to reward values via LMS.
-    # Both amplitude axes store scalar reward (axis 0 = reward-at-x,
-    # axis 1 = reward-at-y).  Learns from sparse goal events.
+    reward_c_cos = np.zeros((K, 2))
+    reward_c_cos[2, 0] = 1.0  # frequency 2 → both axes
+    reward_c_cos[2, 1] = 1.0
     wp_reward = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0), mass=1.0,
-        c_cos=np.zeros((K, 2)), c_sin=np.zeros((K, 2)),
+        c_cos=reward_c_cos, c_sin=np.zeros((K, 2)),
         lr=reward_lr, lr_tracking=0.0)
 
     # -- Newtonian state ------------------------------------------------------
