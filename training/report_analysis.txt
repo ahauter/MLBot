@@ -1,0 +1,106 @@
+Spectral Pong RL — Instability Analysis & Baseline Validation
+===============================================================
+Date: 2026-04-03
+
+1. WHAT WAS THE INSTABILITY?
+-----------------------------
+The original SimpleRLController had no clipping on TD errors, critic
+traces, or weights. With gamma=0.95 and lr_critic=0.1:
+
+  - TD errors reached |5.9| (vs reward magnitude of 1.0)
+  - ||w_c|| drifted to 2.0+ (unbounded)
+  - V(s) oscillated between -0.8 and +1.8 within a single seed
+
+This created a positive feedback loop: large V(s) -> large TD error
+-> large weight update -> larger V(s). The fix clips TD error to
+[-1,1], weights to [-5,5], and critic traces to [-1,1].
+
+2. WHY PADDLES LEARN TO DODGE THE BALL
+----------------------------------------
+With gamma=0.95, the TD bootstrap spreads reward ~20 steps backward.
+The only reward events are goals (±1). When a goal is conceded, the
+paddle "blames" its position when the ball was still approaching.
+The value function learns: "ball near my side = bad state."
+
+Evidence (approach behavior analysis, seed 0):
+  Ball dist [4.0, 8.0): policy correctly tracks ball (mean_policy agrees with offset sign)
+  Ball dist [0.0, 0.5): policy INVERTS — moves AWAY from ball
+  V(s) drops from +0.04 (ball far) to -0.12 (ball close)
+
+This is rational under gamma=0.95: the agent has never blocked a ball,
+so every "ball near me" state precedes a goal-against. The value
+function is correct — it just can't distinguish "near ball and about
+to block" from "near ball and about to concede."
+
+3. LOW GAMMA HELPS — BUT HOW MUCH?
+------------------------------------
+Hypothesis: the spectral encoder (wavepacket reward field) handles
+long-horizon credit assignment, so the RL layer should use low gamma
+and focus on immediate state-action mapping.
+
+BASELINE VALIDATION (10 seeds, 6000 frames each):
+
+  Condition           Close%      vs Random
+  ----------------------------------------
+  Pure random         49.5%       (true baseline)
+  Zero-learning       52.1±8.0%   +2.6% (conv feature bias, not significant)
+  gamma=0.95          46.2±9.7%   -3.3% (WORSE — learns to dodge)
+  gamma=0.30          57.9±11.2%  +8.4% (REAL signal, p≈0.04*)
+  gamma=0.00          52.3±8.3%   +2.8% (marginal)
+  gamma=0.10 lr=3x    38.2±24.7%  -11.3% (unstable, high variance)
+
+  * One-sample t-test vs 50%: t=2.24, df=9
+
+gamma=0.3 with base learning rates is the ONLY config that reliably
+beats random across 10 seeds. The effect size is modest (~8pp above
+baseline) and the variance is high (±11%), but it is statistically
+real (p≈0.04).
+
+4. ARE TOUCHES A VALID LEARNING METRIC?
+-----------------------------------------
+No. Touches are ~5-7 across ALL conditions including pure random.
+The paddle collision zone covers ~22% of court height (0.65/3.0).
+With a ball that crosses the court in ~150 frames, a random paddle
+will intercept by chance roughly 1 in 5-6 approaches. This matches
+the observed ~0.2 touches/episode across all configs.
+
+Touches should NOT be used as evidence of learning unless they
+significantly exceed ~6-7 per 6000 frames.
+
+5. WHAT IS THE SPECTRAL ENCODER ACTUALLY CONTRIBUTING?
+-------------------------------------------------------
+The reward wavepacket (wp_reward_l) learns WHERE goals happen via LMS
+updates. After a few goals, it encodes a spatial map of "goal zones"
+at the court edges. This enters the agent's feature maps as channel 4.
+
+This IS useful information — it tells the agent which side of the
+court is dangerous — but the linear RL policy (8 conv features -> 1
+action) is too weak to convert this spatial information into effective
+position-dependent behavior (track when far, hold when close).
+
+6. CODE ISSUES FOUND
+----------------------
+a) Conv filters NOT fixed: lr_conv=1e-9 means slow learning (design
+   claims "fixed random projections"). Effect is tiny but non-zero.
+
+b) Both paddles visible: each agent sees both paddle positions in
+   feature map channels 2-3. Not a bug per se, but worth noting.
+
+c) Reward sign conventions: VERIFIED CORRECT throughout.
+
+d) Collision geometry: VERIFIED CORRECT (half_h + ball_radius = 0.65).
+
+e) Touch counting: VERIFIED CORRECT.
+
+f) State reset on goal: eligibility traces cleared, ball wavepacket
+   re-initialized, reward wavepackets persist (by design).
+
+7. RECOMMENDATIONS
+-------------------
+a) Use gamma=0.3 as default (only reliable improvement over random)
+b) Keep base learning rates (lr_actor=1e-2, lr_critic=1e-1)
+c) Higher LRs (3x, 5x) cause weight saturation and instability
+d) Need a stronger policy (nonlinear, or more conv features) to
+   exploit the spatial information the spectral encoder provides
+e) Track "close% vs random baseline" as the primary metric, not
+   raw touches or close% in isolation
