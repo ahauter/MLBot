@@ -239,6 +239,8 @@ def run_pretrain(n_frames: int = 6000,
                 wp_reward_r.update_lms(
                     goal_pos_rew, np.array([0.0, 0.0, -reward]),
                     anomaly_scale=1.0)
+                wp_reward_l.soft_normalize(max_energy=2.0)
+                wp_reward_r.soft_normalize(max_energy=2.0)
                 wp_ball.normalize()
                 if lr_k > 0:
                     wp_ball.learn_from_residual(pred_rew, goal_pos_rew,
