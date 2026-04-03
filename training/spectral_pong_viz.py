@@ -72,7 +72,6 @@ PADDLE_SPEED = 4.0
 BALL_RADIUS = 0.15
 BALL_SPEED = 2.0
 SPIN_FACTOR = 2.0
-HIT_REWARD = 0.1
 
 
 # -- WavepacketObject2D ------------------------------------------------------
@@ -911,8 +910,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
 
         # -- Newtonian ball step ------------------------------------------
-        touch_reward_l = 0.0
-        touch_reward_r = 0.0
         vx_before, vy_before = ball['vx'], ball['vy']
 
         ball['x'] += ball['vx'] * dt
@@ -940,7 +937,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             ball['vy'] *= ball_speed / spd
             state['rally_touches'] += 1
             state['total_touches'] += 1
-            touch_reward_l = HIT_REWARD
 
         # Right paddle collision
         if (ball['vx'] > 0
@@ -956,7 +952,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             ball['vy'] *= ball_speed / spd
             state['rally_touches'] += 1
             state['total_touches'] += 1
-            touch_reward_r = HIT_REWARD
 
         vx_after, vy_after = ball['vx'], ball['vy']
 
@@ -1125,8 +1120,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             ns_r = SimpleRLController.build_state(
                 wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
                 wp_reward=wp_reward_r)
-            rl_left.step(ns_l, touch_reward_l)
-            rl_right.step(ns_r, touch_reward_r)
+            rl_left.step(ns_l, 0.0)
+            rl_right.step(ns_r, 0.0)
 
         # Deviation magnitude for display
         a_residual = ball_deviation
