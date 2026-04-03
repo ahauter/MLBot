@@ -753,6 +753,16 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                color='#555', fontsize=8,
                                horizontalalignment='right')
 
+    # -- reward field heatmap overlay -------------------------------------------
+    HM_NX = 50
+    r_dom_hm = np.linspace(-1.0, 1.0, HM_NX)
+    reward_heatmap = ax_court.imshow(
+        np.zeros((1, HM_NX)),
+        extent=[COURT_LEFT, COURT_RIGHT, COURT_BOTTOM, COURT_TOP],
+        origin='lower', aspect='auto', cmap='RdYlGn',
+        alpha=0.25, vmin=-2.0, vmax=2.0, zorder=0,
+        interpolation='bilinear')
+
     # -- debug strip artists (only when spectral_paddle) ----------------------
     debug_heatmap = None
     debug_bars_l = []
@@ -1146,6 +1156,10 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 xytext=(ball['x'], ball['y']),
                 arrowprops=dict(arrowstyle='->', color=RESIDUAL_COLOR,
                                 lw=2.5, mutation_scale=15), zorder=6)
+
+        # -- update reward heatmap -----------------------------------------
+        rew_vals = wp_reward_l.evaluate(r_dom_hm, axis=2)
+        reward_heatmap.set_array(rew_vals.reshape(1, -1))
 
         # -- update debug strip -------------------------------------------
         if spectral_paddle and debug_heatmap is not None:
