@@ -61,6 +61,7 @@ COURT_BOTTOM = -3.0
 WORLD_BOUNDS = [
     (COURT_LEFT, COURT_RIGHT),   # axis 0 (x)
     (COURT_BOTTOM, COURT_TOP),   # axis 1 (y)
+    (-1.0, 1.0),                 # axis 2 (reward)
 ]
 
 PADDLE_X_OFFSET = 0.5
@@ -76,22 +77,26 @@ SPIN_FACTOR = 2.0
 # -- WavepacketObject2D ------------------------------------------------------
 
 class WavepacketObject2D:
-    """Spectral wavepacket with 2D amplitude vectors.
+    """Spectral wavepacket with N-dimensional amplitude vectors.
 
-    Each frequency k_j has coefficients c_cos[j] and c_sin[j] in R^2.
+    Each frequency k_j has coefficients c_cos[j] and c_sin[j] in R^ndim.
     The field is evaluated on a 1D domain per axis:
         F_d(x) = sum_j  c_cos[j, d] * cos(k_j * x) + c_sin[j, d] * sin(k_j * x)
-    where d in {0, 1} selects the x or y component.
+    where d in {0, ..., ndim-1} selects the component.
+
+    Default ndim=2 (x, y) for backward compatibility.  Use ndim=3 to add
+    a reward dimension: dims 0,1 = physics, dim 2 = reward.
     """
 
     def __init__(self, K: int, frequencies: np.ndarray,
-                 pos0: tuple[float, float] = (0.0, 0.0),
+                 pos0: tuple = (0.0, 0.0),
                  mass: float = 1.0,
-                 vel0: tuple[float, float] = (0.0, 0.0),
+                 vel0: tuple = (0.0, 0.0),
                  c_cos: np.ndarray | None = None,
                  c_sin: np.ndarray | None = None,
                  sigma: float = 0.8, amplitude: float = 1.5,
-                 lr: float = 0.0, lr_tracking: float = 0.0):
+                 lr: float = 0.0, lr_tracking: float = 0.0,
+                 ndim: int | None = None):
         self.K = K
         self.k = np.asarray(frequencies, dtype=np.float64)
         self.mass = mass
@@ -100,15 +105,29 @@ class WavepacketObject2D:
         self.lr = lr
         self.lr_tracking = lr_tracking
 
+        # Infer ndim from pos0 if not explicitly given
+        if ndim is not None:
+            self.ndim = ndim
+        else:
+            self.ndim = len(self.pos)
+
+        # Pad pos/vel to ndim if shorter (e.g. pos0=(0,0) with ndim=3)
+        if len(self.pos) < self.ndim:
+            self.pos = np.concatenate([self.pos,
+                                       np.zeros(self.ndim - len(self.pos))])
+        if len(self.vel) < self.ndim:
+            self.vel = np.concatenate([self.vel,
+                                       np.zeros(self.ndim - len(self.vel))])
+
         if c_cos is not None and c_sin is not None:
-            self.c_cos = np.array(c_cos, dtype=np.float64)  # (K, 2)
-            self.c_sin = np.array(c_sin, dtype=np.float64)  # (K, 2)
+            self.c_cos = np.array(c_cos, dtype=np.float64)  # (K, ndim)
+            self.c_sin = np.array(c_sin, dtype=np.float64)  # (K, ndim)
         else:
             # Gaussian envelope, phase set from position per axis
             envelope = amplitude * np.exp(-self.k**2 * sigma**2 / 2)  # (K,)
-            self.c_cos = np.zeros((K, 2), dtype=np.float64)
-            self.c_sin = np.zeros((K, 2), dtype=np.float64)
-            for d in range(2):
+            self.c_cos = np.zeros((K, self.ndim), dtype=np.float64)
+            self.c_sin = np.zeros((K, self.ndim), dtype=np.float64)
+            for d in range(self.ndim):
                 self.c_cos[:, d] = envelope * np.cos(self.k * self.pos[d])
                 self.c_sin[:, d] = envelope * np.sin(self.k * self.pos[d])
 
@@ -154,7 +173,7 @@ class WavepacketObject2D:
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
-        for d in range(2):
+        for d in range(self.ndim):
             S = self.integrate_squared(d)
             if S > 1e-20:
                 self.c_cos[:, d] /= np.sqrt(S)
@@ -170,16 +189,19 @@ class WavepacketObject2D:
             -self.c_cos[:, axis] * self.k * np.sin(self.k * x)
             + self.c_sin[:, axis] * self.k * np.cos(self.k * x)))
 
-    def inner_product_2d(self, other: 'WavepacketObject2D') -> np.ndarray:
-        """Component-wise inner product per spatial dimension. Returns (2,)."""
+    def inner_product(self, other: 'WavepacketObject2D') -> np.ndarray:
+        """Component-wise inner product per dimension. Returns (ndim,)."""
         return np.array([
             float(np.sum(self.c_cos[:, d] * other.c_cos[:, d] +
                          self.c_sin[:, d] * other.c_sin[:, d]))
-            for d in range(2)
+            for d in range(self.ndim)
         ])
 
-    def cross_product_2d(self, other: 'WavepacketObject2D') -> np.ndarray:
-        """Imaginary part of complex inner product per axis. Returns (2,).
+    # backward compat alias
+    inner_product_2d = inner_product
+
+    def cross_product(self, other: 'WavepacketObject2D') -> np.ndarray:
+        """Imaginary part of complex inner product per axis. Returns (ndim,).
 
         cross[d] = sum_j (self.c_cos[j,d] * other.c_sin[j,d]
                         - self.c_sin[j,d] * other.c_cos[j,d])
@@ -190,17 +212,20 @@ class WavepacketObject2D:
         return np.array([
             float(np.sum(self.c_cos[:, d] * other.c_sin[:, d] -
                          self.c_sin[:, d] * other.c_cos[:, d]))
-            for d in range(2)
+            for d in range(self.ndim)
         ])
+
+    # backward compat alias
+    cross_product_2d = cross_product
 
     def normalized_inner_product(self, other: 'WavepacketObject2D') -> float:
         """Spectral alignment score in ~[0, 1]. Attention weight for LMS."""
-        ip = self.inner_product_2d(other)  # (2,)
-        norm_s = np.sqrt(np.sum(self.c_cos**2 + self.c_sin**2, axis=0))  # (2,)
+        ip = self.inner_product(other)  # (ndim,)
+        norm_s = np.sqrt(np.sum(self.c_cos**2 + self.c_sin**2, axis=0))  # (ndim,)
         norm_o = np.sqrt(
-            np.sum(other.c_cos**2 + other.c_sin**2, axis=0))  # (2,)
-        nip = ip / (norm_s * norm_o + 1e-8)  # (2,)
-        return float(np.linalg.norm(nip) / np.sqrt(2))
+            np.sum(other.c_cos**2 + other.c_sin**2, axis=0))  # (ndim,)
+        nip = ip / (norm_s * norm_o + 1e-8)  # (ndim,)
+        return float(np.linalg.norm(nip) / np.sqrt(self.ndim))
 
     def shift(self, delta: float, axis: int) -> None:
         """Fourier-domain phase rotation for one axis."""
@@ -212,31 +237,31 @@ class WavepacketObject2D:
             self.c_cos[j, axis] = oc * ca - os * sa
             self.c_sin[j, axis] = oc * sa + os * ca
 
-    def predict_force(self, env_wp: 'WavepacketObject2D',
-                      nip_env: float,
+    def predict_force(self, field_wp: 'WavepacketObject2D',
+                      nip: float,
                       force_scale: float = 0.5) -> np.ndarray:
-        """Predict force on this object from the env field gradient.
+        """Predict force on this object from a field's gradient.
 
-        The env field has high density near walls.  Its gradient at our
-        position points toward walls, so the *negative* gradient is a
-        repulsive force.  Scaled by NIP (spectral proximity) so the
-        force is only active when the ball is near the env structure.
+        The field has high density near structures (walls, reward zones).
+        Its gradient at our position points toward structures, so the
+        *negative* gradient is the repulsive/predictive force.
+        Scaled by NIP (spectral proximity).
 
-        Returns predicted acceleration (2,).
+        Returns predicted acceleration (ndim,).
         """
-        force = np.zeros(2)
-        for d in range(2):
-            grad_env = env_wp.gradient(self.pos[d], axis=d)
-            force[d] = -force_scale * nip_env * grad_env
+        force = np.zeros(self.ndim)
+        for d in range(self.ndim):
+            grad = field_wp.gradient(self.pos[d], axis=d)
+            force[d] = -force_scale * nip * grad
         return force
 
     def predict_position(self, vel: np.ndarray, dt: float,
-                         env_force: np.ndarray) -> np.ndarray:
-        """Predict next position using velocity + env force.
+                         total_force: np.ndarray) -> np.ndarray:
+        """Predict next position using velocity + total force.
 
-        Returns predicted_pos (2,).  Does NOT modify coefficients.
+        Returns predicted_pos (ndim,).  Does NOT modify coefficients.
         """
-        corrected_vel = vel + env_force * dt
+        corrected_vel = vel + total_force * dt
         return self.pos + corrected_vel * dt
 
     def learn_from_residual(self, predicted_pos: np.ndarray,
@@ -247,10 +272,10 @@ class WavepacketObject2D:
         Analytically computes dF_d/dk_j and adjusts self.k via gradient
         descent on ||observed - predicted||².
 
-        Returns prediction_residual (2,).
+        Returns prediction_residual (ndim,).
         """
-        residual = observed_pos - predicted_pos  # (2,)
-        for d in range(2):
+        residual = observed_pos - predicted_pos  # (ndim,)
+        for d in range(self.ndim):
             x = self.pos[d]
             # dF/dk_j = -c_cos[j,d] * x * sin(k_j*x) + c_sin[j,d] * x * cos(k_j*x)
             dF_dk = (-self.c_cos[:, d] * x * np.sin(self.k * x)
@@ -260,8 +285,8 @@ class WavepacketObject2D:
         return residual
 
     def set_position(self, new_pos: np.ndarray) -> None:
-        """Shift both axes so the wavepacket tracks new_pos."""
-        for d in range(2):
+        """Shift all axes so the wavepacket tracks new_pos."""
+        for d in range(self.ndim):
             delta = new_pos[d] - self.pos[d]
             if abs(delta) > 1e-12:
                 self.shift(delta, axis=d)
@@ -269,17 +294,17 @@ class WavepacketObject2D:
         np.clip(self.c_cos, -COEFF_CLIP, COEFF_CLIP, out=self.c_cos)
         np.clip(self.c_sin, -COEFF_CLIP, COEFF_CLIP, out=self.c_sin)
 
-    def update_lms(self, domain_pos: np.ndarray, target_2d: np.ndarray,
+    def update_lms(self, domain_pos: np.ndarray, target: np.ndarray,
                    anomaly_scale: float = 1.0) -> np.ndarray:
-        """LMS update with 2D target. Returns residual (2,)."""
+        """LMS update with ndim target. Returns residual (ndim,)."""
         if self.lr <= 0:
-            return np.zeros(2)
-        residual = np.zeros(2)
-        for d in range(2):
+            return np.zeros(self.ndim)
+        residual = np.zeros(self.ndim)
+        for d in range(self.ndim):
             basis = self._basis(domain_pos[d])       # (2K,)
             c = self._c_flat(d)                       # (2K,)
             pred = float(c @ basis)
-            res = target_2d[d] - pred
+            res = target[d] - pred
             residual[d] = res
             c_new = c + (self.lr * anomaly_scale) * basis * res
             np.clip(c_new, -COEFF_CLIP, COEFF_CLIP, out=c_new)
@@ -287,17 +312,17 @@ class WavepacketObject2D:
         return residual
 
     def update_with_attention(self, domain_pos: np.ndarray,
-                              target_2d: np.ndarray,
+                              target: np.ndarray,
                               interaction_scales: list[float]) -> np.ndarray:
         """LMS with effective_lr = lr_tracking + lr * sum(interaction_scales)."""
         effective_lr = self.lr_tracking + self.lr * sum(interaction_scales)
         if effective_lr <= 0:
-            return np.zeros(2)
-        residual = np.zeros(2)
-        for d in range(2):
+            return np.zeros(self.ndim)
+        residual = np.zeros(self.ndim)
+        for d in range(self.ndim):
             basis = self._basis(domain_pos[d])
             c = self._c_flat(d)
-            res = target_2d[d] - float(c @ basis)
+            res = target[d] - float(c @ basis)
             residual[d] = res
             c_new = c + effective_lr * basis * res
             np.clip(c_new, -COEFF_CLIP, COEFF_CLIP, out=c_new)
@@ -320,13 +345,13 @@ class SimpleRLController:
 
     TRACE_CLIP = 1.0
 
-    STATE_DIM = 10
+    STATE_DIM = 14
     STATE_LABELS = [
-        'nip_env', 'nip_padL', 'nip_padR',
-        'nip_x_env_x', 'nip_x_env_y',
-        'nip_x_padL_x', 'nip_x_padL_y',
-        'nip_x_padR_x', 'nip_x_padR_y',
-        'reward_pred',
+        'nip_env', 'nip_padL', 'nip_padR', 'nip_reward',
+        'nip_x_env_x', 'nip_x_env_y', 'nip_x_env_r',
+        'nip_x_padL_x', 'nip_x_padL_y', 'nip_x_padL_r',
+        'nip_x_padR_x', 'nip_x_padR_y', 'nip_x_padR_r',
+        'reward_cross',
     ]
 
     def __init__(self, state_dim: int, lr_actor: float = 1e-2,
@@ -384,31 +409,42 @@ class SimpleRLController:
 
     @staticmethod
     def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
-                    wp_env, reward_pred: float = 0.0) -> np.ndarray:
-        """10-dim spectral interaction features.
+                    wp_env, wp_reward=None,
+                    reward_pred: float = 0.0) -> np.ndarray:
+        """14-dim spectral interaction features.
 
         Cross products use entity.cross(ball) for correct sign convention
         (positive = ball is above/right of entity) and are weighted by
         NIP so directional signal is stronger when objects are nearby.
+
+        Reward field cross product dim 2 gives signed reward prediction.
         """
         nip_env = wp_ball.normalized_inner_product(wp_env)
         nip_padL = wp_ball.normalized_inner_product(wp_paddle_l)
         nip_padR = wp_ball.normalized_inner_product(wp_paddle_r)
+        if wp_reward is not None:
+            nip_rew = wp_ball.normalized_inner_product(wp_reward)
+            rew_cross = nip_rew * wp_reward.cross_product(wp_ball)
+            # Only the reward dim (index 2) matters for reward signal
+            reward_signal = float(rew_cross[2]) if len(rew_cross) > 2 else 0.0
+        else:
+            nip_rew = 0.0
+            reward_signal = reward_pred
         return np.array([
-            nip_env, nip_padL, nip_padR,
-            *(nip_env * wp_env.cross_product_2d(wp_ball)),
-            *(nip_padL * wp_paddle_l.cross_product_2d(wp_ball)),
-            *(nip_padR * wp_paddle_r.cross_product_2d(wp_ball)),
-            reward_pred,
+            nip_env, nip_padL, nip_padR, nip_rew,
+            *(nip_env * wp_env.cross_product(wp_ball)),
+            *(nip_padL * wp_paddle_l.cross_product(wp_ball)),
+            *(nip_padR * wp_paddle_r.cross_product(wp_ball)),
+            reward_signal,
         ])
 
-    # NIPs are in [0,1], NIP×cross products peak at ~0.08, reward_pred in ~[-1,1]
+    # NIPs are in [0,1], NIP×cross products peak at ~0.08
     _FEAT_SCALE = np.array([
-        1.0, 1.0, 1.0,           # NIPs already [0,1]
-        12.0, 12.0,              # nip×cross_env  (1/0.08 ≈ 12)
-        12.0, 12.0,              # nip×cross_padL
-        12.0, 12.0,              # nip×cross_padR
-        1.0,                     # reward_pred already [-1,1]
+        1.0, 1.0, 1.0, 1.0,     # NIPs already [0,1]
+        12.0, 12.0, 12.0,        # nip×cross_env  (3 dims now)
+        12.0, 12.0, 12.0,        # nip×cross_padL
+        12.0, 12.0, 12.0,        # nip×cross_padR
+        1.0,                      # reward_cross already ~[-1,1]
     ])
 
     def _normalize(self, state: np.ndarray) -> np.ndarray:
@@ -513,37 +549,46 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 force_scale: float = 0.0,
                 lr_k: float = 0.0):
 
-    # -- spectral setup -------------------------------------------------------
+    # -- spectral setup (3D: x, y, reward) ------------------------------------
+    NDIM = 3
+
     wp_ball = WavepacketObject2D(
-        K, frequencies, pos0=(0.0, 0.0), mass=1.0,
-        sigma=ball_sigma,
+        K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1.0,
+        sigma=ball_sigma, ndim=NDIM,
         lr=ball_lr, lr_tracking=lr_tracking)
 
     wp_paddle_l = WavepacketObject2D(
         K, frequencies,
-        pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0.0), mass=1e6,
-        sigma=0.5, amplitude=1.0,
+        pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0.0, 0.0), mass=1e6,
+        sigma=0.5, amplitude=1.0, ndim=NDIM,
         lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
     wp_paddle_r = WavepacketObject2D(
         K, frequencies,
-        pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0.0), mass=1e6,
-        sigma=0.5, amplitude=1.0,
+        pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0.0, 0.0), mass=1e6,
+        sigma=0.5, amplitude=1.0, ndim=NDIM,
         lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
-    # Env and reward start with orthogonal spectral basis vectors so the
-    # normalized inner product can bootstrap learning:
-    #   env  — basis [1,0,0,...] on x-axis, [0,1,0,...] on y-axis
-    #   reward — basis [0,0,1,...] on both axes
-    env_c_cos = np.zeros((K, 2))
+    # Env field: basis [1,0,0] and [0,1,0] — acts on x,y only, not reward
+    env_c_cos = np.zeros((K, NDIM))
     env_c_cos[0, 0] = 1.0  # frequency 0 → x
     env_c_cos[1, 1] = 1.0  # frequency 1 → y
     wp_env = WavepacketObject2D(
-        K, frequencies, pos0=(0.0, 0.0), mass=1e6,
-        c_cos=env_c_cos, c_sin=np.zeros((K, 2)),
+        K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1e6, ndim=NDIM,
+        c_cos=env_c_cos, c_sin=np.zeros((K, NDIM)),
         lr=env_lr, lr_tracking=0.0)
 
-    # (Reward field removed — was overwhelming spectral signals)
+    # Per-agent reward fields: basis [0,0,1] — acts on reward dim only
+    rew_c_cos = np.zeros((K, NDIM))
+    rew_c_cos[0, 2] = 1.0  # frequency 0 → reward dimension
+    wp_reward_l = WavepacketObject2D(
+        K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1e6, ndim=NDIM,
+        c_cos=rew_c_cos.copy(), c_sin=np.zeros((K, NDIM)),
+        lr=0.15, lr_tracking=0.0)
+    wp_reward_r = WavepacketObject2D(
+        K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1e6, ndim=NDIM,
+        c_cos=rew_c_cos.copy(), c_sin=np.zeros((K, NDIM)),
+        lr=0.15, lr_tracking=0.0)
 
     # -- RL paddle controllers (one per paddle, opposite rewards) ------------
     rl_left = None
@@ -565,7 +610,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     key_times: dict[str, float] = {}
     paddle_vel = {'l': 0.0, 'r': 0.0}
     state = {'freeze': 0, 't': 0,
-             'anomaly': np.zeros(2), 'max_anomaly': 1.0}
+             'anomaly': np.zeros(NDIM), 'max_anomaly': 1.0}
 
     window = 200
     anomaly_hist = deque(maxlen=window)
@@ -815,12 +860,12 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if auto_paddle:
             if spectral_paddle and rl_left is not None:
                 # RL policy: wavepacket state → paddle velocity (one per paddle)
-                rp_l = rl_left.reward_predict(ball['x'])
-                rp_r = rl_right.reward_predict(ball['x'])
                 rl_state_l = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_l)
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
+                    wp_reward=wp_reward_l)
                 rl_state_r = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_r)
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
+                    wp_reward=wp_reward_r)
                 act_l = rl_left.act(rl_state_l)
                 act_r = rl_right.act(rl_state_r)
                 left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -908,11 +953,25 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
+            # Reward fields learn: LMS at ball's goal position with [0,0,±1]
+            goal_ball_pos = np.array([ball['x'], ball['y'], 0.0])
+            wp_reward_l.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, reward]),
+                                   anomaly_scale=1.0)
+            wp_reward_r.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, -reward]),
+                                   anomaly_scale=1.0)
+            # Show paddles with signed reward dim for NIP learning
+            paddle_l_goal = np.array([paddle_lx, left_paddle['y'], reward])
+            paddle_r_goal = np.array([paddle_rx, right_paddle['y'], -reward])
+            wp_paddle_l.update_with_attention(
+                paddle_l_goal, np.ones(NDIM), [1.0])
+            wp_paddle_r.update_with_attention(
+                paddle_r_goal, np.ones(NDIM), [1.0])
+
             if rl_left is not None:
-                # Update reward wavepackets: learn where goals happen
                 rl_left.reward_update(ball['x'], reward)
                 rl_right.reward_update(ball['x'], -reward)
-                # Terminal TD step: reward reaches critic before reset
                 term_state = np.zeros(SimpleRLController.STATE_DIM)
                 rl_left.step(term_state, reward)
                 rl_right.step(term_state, -reward)
@@ -923,34 +982,41 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             state['freeze'] = int(0.5 / dt)
             paddle_vel['l'] = 0.0
             paddle_vel['r'] = 0.0
-            # Re-init ball wavepacket on score
-            wp_ball.__init__(K, frequencies, pos0=(ball['x'], ball['y']),
-                             mass=1.0, sigma=ball_sigma,
+            # Re-init ball wavepacket on score (3D)
+            wp_ball.__init__(K, frequencies,
+                             pos0=(ball['x'], ball['y'], 0.0),
+                             mass=1.0, sigma=ball_sigma, ndim=NDIM,
                              lr=ball_lr, lr_tracking=lr_tracking)
 
         # -- update wavepackets: predict → correct → learn ----------------
-        ball_pos = np.array([ball['x'], ball['y']])
-        paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
-        paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
+        ball_pos = np.array([ball['x'], ball['y'], 0.0])
+        paddle_l_pos = np.array([paddle_lx, left_paddle['y'], 0.0])
+        paddle_r_pos = np.array([paddle_rx, right_paddle['y'], 0.0])
 
-        # 1. PREDICT: env-field force + velocity-based forward step
+        # 1. PREDICT: env + reward field forces, step forward
         if not scored:
             nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
             nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
             nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
+            nip_ball_rew = abs(wp_ball.normalized_inner_product(wp_reward_l))
 
+            # Env force: dims 0,1 (walls). Reward force: dim 2 only.
             env_force = wp_ball.predict_force(wp_env, nip_ball_env,
                                               force_scale=force_scale)
-            ball_vel = np.array([ball['vx'], ball['vy']])
-            predicted_pos = wp_ball.predict_position(ball_vel, dt, env_force)
+            rew_force = wp_ball.predict_force(wp_reward_l, nip_ball_rew,
+                                              force_scale=force_scale)
+            total_force = env_force + rew_force
+            ball_vel = np.array([ball['vx'], ball['vy'], 0.0])
+            predicted_pos = wp_ball.predict_position(ball_vel, dt, total_force)
         else:
             nip_ball_env = nip_ball_padL = nip_ball_padR = 0.0
+            nip_ball_rew = 0.0
             predicted_pos = ball_pos.copy()
 
-        # Shift ball wavepacket by velocity (propagation)
-        for d in range(2):
-            wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
-        # Paddle shifts
+        # Shift ball wavepacket by velocity (dims 0,1 only; dim 2 = 0)
+        wp_ball.shift(ball['vx'] * dt, axis=0)
+        wp_ball.shift(ball['vy'] * dt, axis=1)
+        # Paddle shifts (y-axis only)
         delta_l = left_paddle['y'] - wp_paddle_l.pos[1]
         delta_r = right_paddle['y'] - wp_paddle_r.pos[1]
         if abs(delta_l) > 1e-12:
@@ -958,9 +1024,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if abs(delta_r) > 1e-12:
             wp_paddle_r.shift(delta_r, axis=1)
 
-        # 2. CORRECT: attention-weighted LMS toward observed position
+        # 2. CORRECT: LMS toward observed position [x, y, 0]
         if not scored:
-            unity = np.array([1.0, 1.0])
+            unity = np.ones(NDIM)
             wp_ball.update_with_attention(
                 ball_pos, unity,
                 [nip_ball_env, nip_ball_padL, nip_ball_padR])
@@ -969,12 +1035,12 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             wp_paddle_r.update_with_attention(
                 paddle_r_pos, unity, [nip_ball_padR])
 
-        # 3. Prediction residual
+        # 3. Prediction residual (3D: physics + reward)
         prediction_residual = ball_pos - predicted_pos
 
         # 4. Measure integral deviation BEFORE normalizing
         ball_deviation = np.array([wp_ball.integrate_squared(d) - 1.0
-                                   for d in range(2)])
+                                   for d in range(NDIM)])
 
         # 5. Normalize observed objects back to PMF
         wp_ball.normalize()
@@ -982,7 +1048,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_paddle_r.normalize()
 
         # 6. Attribute deviation via NIP soft attention — env learns
-        deviation_mag = np.linalg.norm(ball_deviation)
+        deviation_mag = np.linalg.norm(ball_deviation[:2])  # physics dims only
         if not scored and deviation_mag > 1e-8:
             total_nip = nip_ball_env + nip_ball_padL + nip_ball_padR + 1e-8
             env_fraction = nip_ball_env / total_nip
@@ -999,19 +1065,18 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_paddle_l.pos[:] = paddle_l_pos
         wp_paddle_r.pos[:] = paddle_r_pos
 
-        # 7. TD update AFTER wavepacket updates so next_state reflects
-        #    the new ball/paddle positions
+        # TD update AFTER wavepacket updates
         if rl_left is not None and not scored:
-            rp_l = rl_left.reward_predict(ball['x'])
-            rp_r = rl_right.reward_predict(ball['x'])
             ns_l = SimpleRLController.build_state(
-                wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_l)
+                wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
+                wp_reward=wp_reward_l)
             ns_r = SimpleRLController.build_state(
-                wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_r)
+                wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
+                wp_reward=wp_reward_r)
             rl_left.step(ns_l, reward)
             rl_right.step(ns_r, -reward)
 
-        # Deviation magnitude for display (replaces old anomaly)
+        # Deviation magnitude for display
         a_residual = ball_deviation
 
         state['anomaly'] = a_residual

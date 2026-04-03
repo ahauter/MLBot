@@ -28,25 +28,43 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
     """Run pong with RL paddles, return list of goal-frame indices."""
     np.random.seed(seed)
     K = 8
+    NDIM = 3
     freqs = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
     dt = 1 / 60
     ball_speed = BALL_SPEED
 
-    # Wavepackets
-    wp_ball = WavepacketObject2D(K, freqs, pos0=(0, 0), sigma=0.8,
-                                  lr=0.15, lr_tracking=0.01)
-    wp_pl = WavepacketObject2D(K, freqs, pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0),
+    # Wavepackets (3D: x, y, reward)
+    wp_ball = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), sigma=0.8,
+                                  ndim=NDIM, lr=0.15, lr_tracking=0.01)
+    wp_pl = WavepacketObject2D(K, freqs,
+                                pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0, 0),
                                 mass=1e6, sigma=0.5, amplitude=1.0,
-                                lr=0.1, lr_tracking=0.02)
-    wp_pr = WavepacketObject2D(K, freqs, pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0),
+                                ndim=NDIM, lr=0.1, lr_tracking=0.02)
+    wp_pr = WavepacketObject2D(K, freqs,
+                                pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0, 0),
                                 mass=1e6, sigma=0.5, amplitude=1.0,
-                                lr=0.1, lr_tracking=0.02)
-    env_c = np.zeros((K, 2))
+                                ndim=NDIM, lr=0.1, lr_tracking=0.02)
+    # Env field: basis [1,0,0] and [0,1,0] — physics only
+    env_c = np.zeros((K, NDIM))
     env_c[0, 0] = 1.0
     env_c[1, 1] = 1.0
-    wp_env = WavepacketObject2D(K, freqs, pos0=(0, 0), mass=1e6,
-                                 c_cos=env_c, c_sin=np.zeros((K, 2)),
+    wp_env = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                 ndim=NDIM,
+                                 c_cos=env_c, c_sin=np.zeros((K, NDIM)),
                                  lr=0.15, lr_tracking=0.0)
+    # Per-agent reward fields: basis [0,0,1] — reward dim only
+    rew_c = np.zeros((K, NDIM))
+    rew_c[0, 2] = 1.0
+    wp_reward_l = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                      ndim=NDIM,
+                                      c_cos=rew_c.copy(),
+                                      c_sin=np.zeros((K, NDIM)),
+                                      lr=0.15, lr_tracking=0.0)
+    wp_reward_r = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                      ndim=NDIM,
+                                      c_cos=rew_c.copy(),
+                                      c_sin=np.zeros((K, NDIM)),
+                                      lr=0.15, lr_tracking=0.0)
 
     # RL controllers (actor-critic with TD(λ))
     rl_left = SimpleRLController(SimpleRLController.STATE_DIM,
@@ -74,12 +92,10 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             continue
 
         # -- RL paddle movement --
-        rp_l = rl_left.reward_predict(ball['x'])
-        rp_r = rl_right.reward_predict(ball['x'])
         rl_state_l = SimpleRLController.build_state(
-            wp_ball, wp_pl, wp_pr, wp_env, rp_l)
+            wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_l)
         rl_state_r = SimpleRLController.build_state(
-            wp_ball, wp_pl, wp_pr, wp_env, rp_r)
+            wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_r)
         act_l = rl_left.act(rl_state_l)
         act_r = rl_right.act(rl_state_r)
         left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -138,10 +154,24 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
 
         if scored:
             goal_frames.append(t)
-            # Update reward wavepackets
+            # Reward fields learn: LMS at ball's goal position with [0,0,±1]
+            goal_ball_pos = np.array([ball['x'], ball['y'], 0.0])
+            wp_reward_l.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, reward]),
+                                   anomaly_scale=1.0)
+            wp_reward_r.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, -reward]),
+                                   anomaly_scale=1.0)
+            # Show paddles with signed reward dim
+            wp_pl.update_with_attention(
+                np.array([paddle_lx, left_paddle['y'], reward]),
+                np.ones(NDIM), [1.0])
+            wp_pr.update_with_attention(
+                np.array([paddle_rx, right_paddle['y'], -reward]),
+                np.ones(NDIM), [1.0])
+
             rl_left.reward_update(ball['x'], reward)
             rl_right.reward_update(ball['x'], -reward)
-            # Terminal TD step: V(terminal)=0, so δ = reward - V(s)
             term_state = np.zeros(SimpleRLController.STATE_DIM)
             rl_left.step(term_state, reward)
             rl_right.step(term_state, -reward)
@@ -150,32 +180,36 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             freeze = int(0.5 / dt)
-            wp_ball.__init__(K, freqs, pos0=(ball['x'], ball['y']),
-                             mass=1.0, sigma=0.8,
+            wp_ball.__init__(K, freqs, pos0=(ball['x'], ball['y'], 0.0),
+                             mass=1.0, sigma=0.8, ndim=NDIM,
                              lr=0.15, lr_tracking=0.01)
 
         # -- Wavepacket updates: predict → correct → learn --
-        ball_pos = np.array([ball['x'], ball['y']])
-        paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
-        paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
+        ball_pos = np.array([ball['x'], ball['y'], 0.0])
+        paddle_l_pos = np.array([paddle_lx, left_paddle['y'], 0.0])
+        paddle_r_pos = np.array([paddle_rx, right_paddle['y'], 0.0])
 
-        # 1. PREDICT: env-field force + velocity forward step
+        # 1. PREDICT: env + reward field forces
         if not scored:
             nip_env = abs(wp_ball.normalized_inner_product(wp_env))
             nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
             nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
+            nip_rew = abs(wp_ball.normalized_inner_product(wp_reward_l))
 
             env_force = wp_ball.predict_force(wp_env, nip_env,
                                               force_scale=force_scale)
-            ball_vel = np.array([ball['vx'], ball['vy']])
-            predicted_pos = wp_ball.predict_position(ball_vel, dt, env_force)
+            rew_force = wp_ball.predict_force(wp_reward_l, nip_rew,
+                                              force_scale=force_scale)
+            total_force = env_force + rew_force
+            ball_vel = np.array([ball['vx'], ball['vy'], 0.0])
+            predicted_pos = wp_ball.predict_position(ball_vel, dt, total_force)
         else:
-            nip_env = nip_padL = nip_padR = 0.0
+            nip_env = nip_padL = nip_padR = nip_rew = 0.0
             predicted_pos = ball_pos.copy()
 
-        # Shift ball by velocity (propagation)
-        for d in range(2):
-            wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
+        # Shift ball by velocity (dims 0,1 only)
+        wp_ball.shift(ball['vx'] * dt, axis=0)
+        wp_ball.shift(ball['vy'] * dt, axis=1)
         delta_l = left_paddle['y'] - wp_pl.pos[1]
         delta_r = right_paddle['y'] - wp_pr.pos[1]
         if abs(delta_l) > 1e-12:
@@ -183,26 +217,23 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
         if abs(delta_r) > 1e-12:
             wp_pr.shift(delta_r, axis=1)
 
-        # 2. CORRECT: LMS toward observed position
+        # 2. CORRECT: LMS toward observed [x, y, 0]
         if not scored:
-            unity = np.array([1.0, 1.0])
+            unity = np.ones(NDIM)
             wp_ball.update_with_attention(ball_pos, unity,
                                           [nip_env, nip_padL, nip_padR])
             wp_pl.update_with_attention(paddle_l_pos, unity, [nip_padL])
             wp_pr.update_with_attention(paddle_r_pos, unity, [nip_padR])
 
-        # 3. Prediction residual
-        prediction_residual = ball_pos - predicted_pos
-
-        # 4. Deviation + normalize
+        # 3. Deviation + normalize
         ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
-                             for d in range(2)])
+                             for d in range(NDIM)])
         wp_ball.normalize()
         wp_pl.normalize()
         wp_pr.normalize()
 
-        # 5. Env learns from deviation
-        dev_mag = np.linalg.norm(ball_dev)
+        # 4. Env learns from deviation (physics dims only)
+        dev_mag = np.linalg.norm(ball_dev[:2])
         if not scored and dev_mag > 1e-8:
             total_nip = nip_env + nip_padL + nip_padR + 1e-8
             env_frac = nip_env / total_nip
@@ -210,23 +241,21 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                               anomaly_scale=dev_mag * env_frac)
             wp_env.normalize()
 
-        # 6. LEARN: update frequencies from prediction error
+        # 5. LEARN: update frequencies from prediction error
         if not scored and lr_k > 0:
             wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=lr_k)
 
-        # 7. Store positions
+        # 6. Store positions
         wp_ball.pos[:] = ball_pos
         wp_pl.pos[:] = paddle_l_pos
         wp_pr.pos[:] = paddle_r_pos
 
         # TD update AFTER wavepacket updates
         if not scored:
-            rp_l = rl_left.reward_predict(ball['x'])
-            rp_r = rl_right.reward_predict(ball['x'])
             ns_l = SimpleRLController.build_state(
-                wp_ball, wp_pl, wp_pr, wp_env, rp_l)
+                wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_l)
             ns_r = SimpleRLController.build_state(
-                wp_ball, wp_pl, wp_pr, wp_env, rp_r)
+                wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_r)
             rl_left.step(ns_l, reward)
             rl_right.step(ns_r, -reward)
 

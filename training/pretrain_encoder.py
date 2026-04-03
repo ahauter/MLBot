@@ -69,66 +69,6 @@ AGENTS = {
 }
 
 # ---------------------------------------------------------------------------
-# Reward field: 2D wavepacket that learns where goals happen
-# ---------------------------------------------------------------------------
-
-class RewardField:
-    """2D reward wavepacket using same frequencies as ball.
-
-    Learns reward values at spatial positions via LMS.  Shares frequencies
-    with the ball wavepacket so frequency adaptation helps both physics
-    and reward prediction.
-    """
-
-    def __init__(self, K: int, frequencies: np.ndarray, lr: float = 0.1):
-        self.K = K
-        self.k = np.asarray(frequencies, dtype=np.float64)
-        # Reward coefficients: (K, 2) for [cos, sin] × 2 axes
-        # Actually 1D along x is sufficient for pong (goals at x edges)
-        # but we keep 2D for generality
-        self.c_cos = np.zeros(K, dtype=np.float64)
-        self.c_sin = np.zeros(K, dtype=np.float64)
-        self.lr = lr
-
-    def predict(self, x: float) -> float:
-        """Predict reward at x position."""
-        basis_cos = np.cos(self.k * x)
-        basis_sin = np.sin(self.k * x)
-        return float(self.c_cos @ basis_cos + self.c_sin @ basis_sin)
-
-    def predict_at(self, pos: np.ndarray) -> float:
-        """Predict reward at 2D position (uses x-component only for pong)."""
-        return self.predict(pos[0])
-
-    def update(self, x: float, reward: float) -> float:
-        """LMS update toward observed reward. Returns residual."""
-        pred = self.predict(x)
-        error = reward - pred
-        basis_cos = np.cos(self.k * x)
-        basis_sin = np.sin(self.k * x)
-        self.c_cos += self.lr * error * basis_cos
-        self.c_sin += self.lr * error * basis_sin
-        return error
-
-    def learn_from_residual(self, predicted_x: float, observed_x: float,
-                            observed_reward: float, lr_k: float) -> float:
-        """Update shared frequencies from reward prediction error.
-
-        Predicts reward at the predicted position, compares to actual reward
-        at observed position.  Backprops to frequencies.
-        """
-        pred_reward = self.predict(predicted_x)
-        residual = observed_reward - pred_reward
-        # dR/dk_j = -c_cos_j * x * sin(k_j * x) + c_sin_j * x * cos(k_j * x)
-        x = predicted_x
-        dR_dk = (-self.c_cos * x * np.sin(self.k * x)
-                 + self.c_sin * x * np.cos(self.k * x))
-        self.k += lr_k * residual * dR_dk
-        self.k = np.clip(self.k, 0.1, 5.0)
-        return residual
-
-
-# ---------------------------------------------------------------------------
 # Main pretraining loop
 # ---------------------------------------------------------------------------
 
@@ -140,41 +80,59 @@ def run_pretrain(n_frames: int = 6000,
                  window: int = 200) -> dict:
     """Run pong with specified paddle agent, track residuals.
 
+    All wavepackets are 3D (x, y, reward).  The reward field has basis
+    [0,0,1] and only acts on dim 2.  The env field has basis [1,0,0]
+    and [0,1,0] — physics only.  On goals, paddles are shown as
+    [x, y, ±1] and the reward field gets LMS at the ball's goal position.
+
     Returns dict with:
-        physics_residuals: list of per-frame ||predicted_pos - observed_pos||
-        reward_residuals:  list of per-frame |predicted_reward - observed_reward|
+        physics_residuals: per-frame ||predicted_pos - observed_pos|| (dims 0,1)
+        reward_residuals:  per-frame |predicted_reward_dim - actual| (dim 2)
         goal_frames:       frame indices where goals occurred
         freq_history:      snapshots of ball.k at intervals
         env_energy:        snapshots of env field energy at intervals
     """
     np.random.seed(seed)
     K = 8
+    NDIM = 3
     freqs = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
     dt = 1 / 60
     ball_speed = BALL_SPEED
 
     agent_fn = AGENTS[agent_type]
 
-    # Wavepackets
-    wp_ball = WavepacketObject2D(K, freqs, pos0=(0, 0), sigma=0.8,
-                                 lr=0.15, lr_tracking=0.01)
+    # Wavepackets (3D: x, y, reward)
+    wp_ball = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), sigma=0.8,
+                                 ndim=NDIM, lr=0.15, lr_tracking=0.01)
     wp_pl = WavepacketObject2D(K, freqs,
-                               pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0),
+                               pos0=(COURT_LEFT + PADDLE_X_OFFSET, 0, 0),
                                mass=1e6, sigma=0.5, amplitude=1.0,
-                               lr=0.1, lr_tracking=0.02)
+                               ndim=NDIM, lr=0.1, lr_tracking=0.02)
     wp_pr = WavepacketObject2D(K, freqs,
-                               pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0),
+                               pos0=(COURT_RIGHT - PADDLE_X_OFFSET, 0, 0),
                                mass=1e6, sigma=0.5, amplitude=1.0,
-                               lr=0.1, lr_tracking=0.02)
-    env_c = np.zeros((K, 2))
+                               ndim=NDIM, lr=0.1, lr_tracking=0.02)
+    # Env field: basis [1,0,0] and [0,1,0]
+    env_c = np.zeros((K, NDIM))
     env_c[0, 0] = 1.0
     env_c[1, 1] = 1.0
-    wp_env = WavepacketObject2D(K, freqs, pos0=(0, 0), mass=1e6,
-                                c_cos=env_c, c_sin=np.zeros((K, 2)),
+    wp_env = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                ndim=NDIM,
+                                c_cos=env_c, c_sin=np.zeros((K, NDIM)),
                                 lr=0.15, lr_tracking=0.0)
-
-    # Reward field (shares same frequency array initially)
-    reward_field = RewardField(K, freqs.copy(), lr=0.1)
+    # Per-agent reward fields: basis [0,0,1]
+    rew_c = np.zeros((K, NDIM))
+    rew_c[0, 2] = 1.0
+    wp_reward_l = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                      ndim=NDIM,
+                                      c_cos=rew_c.copy(),
+                                      c_sin=np.zeros((K, NDIM)),
+                                      lr=0.15, lr_tracking=0.0)
+    wp_reward_r = WavepacketObject2D(K, freqs, pos0=(0, 0, 0), mass=1e6,
+                                      ndim=NDIM,
+                                      c_cos=rew_c.copy(),
+                                      c_sin=np.zeros((K, NDIM)),
+                                      lr=0.15, lr_tracking=0.0)
 
     # Game state
     ball = {'x': 0.0, 'y': 0.0, 'vx': 0.0, 'vy': 0.0}
@@ -259,41 +217,55 @@ def run_pretrain(n_frames: int = 6000,
 
         if scored:
             goal_frames.append(t)
-            # Reward field learns from actual goal
-            reward_field.update(ball['x'], reward)
+            # Reward fields learn at ball's goal position: [0, 0, ±1]
+            goal_ball_pos = np.array([ball['x'], ball['y'], 0.0])
+            wp_reward_l.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, reward]),
+                                   anomaly_scale=1.0)
+            wp_reward_r.update_lms(goal_ball_pos,
+                                   np.array([0.0, 0.0, -reward]),
+                                   anomaly_scale=1.0)
+            # Show paddles with signed reward dim
+            wp_pl.update_with_attention(
+                np.array([paddle_lx, left_paddle['y'], reward]),
+                np.ones(NDIM), [1.0])
+            wp_pr.update_with_attention(
+                np.array([paddle_rx, right_paddle['y'], -reward]),
+                np.ones(NDIM), [1.0])
+
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             freeze = int(0.5 / dt)
-            wp_ball.__init__(K, freqs, pos0=(ball['x'], ball['y']),
-                             mass=1.0, sigma=0.8,
+            wp_ball.__init__(K, freqs, pos0=(ball['x'], ball['y'], 0.0),
+                             mass=1.0, sigma=0.8, ndim=NDIM,
                              lr=0.15, lr_tracking=0.01)
 
         # -- Wavepacket updates: predict → correct → learn --
-        ball_pos = np.array([ball['x'], ball['y']])
-        paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
-        paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
+        ball_pos = np.array([ball['x'], ball['y'], 0.0])
+        paddle_l_pos = np.array([paddle_lx, left_paddle['y'], 0.0])
+        paddle_r_pos = np.array([paddle_rx, right_paddle['y'], 0.0])
 
-        # 1. PREDICT
+        # 1. PREDICT: env + reward field forces
         if not scored:
             nip_env = abs(wp_ball.normalized_inner_product(wp_env))
             nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
             nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
+            nip_rew = abs(wp_ball.normalized_inner_product(wp_reward_l))
 
             env_force = wp_ball.predict_force(wp_env, nip_env,
                                               force_scale=force_scale)
-            ball_vel = np.array([ball['vx'], ball['vy']])
-            predicted_pos = wp_ball.predict_position(ball_vel, dt, env_force)
-
-            # Reward prediction at predicted position
-            predicted_reward = reward_field.predict_at(predicted_pos)
+            rew_force = wp_ball.predict_force(wp_reward_l, nip_rew,
+                                              force_scale=force_scale)
+            total_force = env_force + rew_force
+            ball_vel = np.array([ball['vx'], ball['vy'], 0.0])
+            predicted_pos = wp_ball.predict_position(ball_vel, dt, total_force)
         else:
-            nip_env = nip_padL = nip_padR = 0.0
+            nip_env = nip_padL = nip_padR = nip_rew = 0.0
             predicted_pos = ball_pos.copy()
-            predicted_reward = 0.0
 
-        # Shift ball by velocity
-        for d in range(2):
-            wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
+        # Shift ball by velocity (dims 0,1)
+        wp_ball.shift(ball['vx'] * dt, axis=0)
+        wp_ball.shift(ball['vy'] * dt, axis=1)
         delta_l = left_paddle['y'] - wp_pl.pos[1]
         delta_r = right_paddle['y'] - wp_pr.pos[1]
         if abs(delta_l) > 1e-12:
@@ -301,29 +273,30 @@ def run_pretrain(n_frames: int = 6000,
         if abs(delta_r) > 1e-12:
             wp_pr.shift(delta_r, axis=1)
 
-        # 2. CORRECT: LMS toward observed position
+        # 2. CORRECT: LMS toward observed [x, y, 0]
         if not scored:
-            unity = np.array([1.0, 1.0])
+            unity = np.ones(NDIM)
             wp_ball.update_with_attention(ball_pos, unity,
                                           [nip_env, nip_padL, nip_padR])
             wp_pl.update_with_attention(paddle_l_pos, unity, [nip_padL])
             wp_pr.update_with_attention(paddle_r_pos, unity, [nip_padR])
 
-        # 3. Residuals
-        phys_res = np.linalg.norm(ball_pos - predicted_pos)
-        rew_res = abs(reward - predicted_reward)
+        # 3. Residuals (physics = dims 0,1; reward = dim 2)
+        full_residual = ball_pos - predicted_pos
+        phys_res = np.linalg.norm(full_residual[:2])
+        rew_res = abs(full_residual[2])
         physics_residuals.append(float(phys_res))
         reward_residuals.append(float(rew_res))
 
         # 4. Deviation + normalize
         ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
-                             for d in range(2)])
+                             for d in range(NDIM)])
         wp_ball.normalize()
         wp_pl.normalize()
         wp_pr.normalize()
 
-        # 5. Env learns from deviation
-        dev_mag = np.linalg.norm(ball_dev)
+        # 5. Env learns from deviation (physics dims only)
+        dev_mag = np.linalg.norm(ball_dev[:2])
         if not scored and dev_mag > 1e-8:
             total_nip = nip_env + nip_padL + nip_padR + 1e-8
             env_frac = nip_env / total_nip
@@ -331,12 +304,9 @@ def run_pretrain(n_frames: int = 6000,
                               anomaly_scale=dev_mag * env_frac)
             wp_env.normalize()
 
-        # 6. LEARN: update frequencies from prediction error
+        # 6. LEARN: update frequencies from 3D prediction error
         if not scored and lr_k > 0:
             wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=lr_k)
-            # Reward field also updates its frequencies
-            reward_field.learn_from_residual(
-                predicted_pos[0], ball_pos[0], reward, lr_k)
 
         # Store positions
         wp_ball.pos[:] = ball_pos
@@ -347,7 +317,8 @@ def run_pretrain(n_frames: int = 6000,
         if t % 500 == 0:
             freq_history.append((t, wp_ball.k.copy()))
             env_e = sum(wp_env.integrate_squared(d) for d in range(2))
-            env_energy_history.append((t, env_e))
+            rew_e = wp_reward_l.integrate_squared(2)
+            env_energy_history.append((t, env_e, rew_e))
 
     return {
         'physics_residuals': physics_residuals,
@@ -419,10 +390,17 @@ def print_report(result: dict, window: int = 500) -> None:
         k_str = ' '.join(f'{v:.3f}' for v in k)
         print(f"    t={t:5d}: [{k_str}]")
 
-    print(f"\n  Env field energy:")
-    for t, e in result['env_energy']:
-        bar = '#' * min(int(e * 5), 40)
-        print(f"    t={t:5d}: {e:.4f}  {bar}")
+    print(f"\n  Env / Reward field energy:")
+    for entry in result['env_energy']:
+        if len(entry) == 3:
+            t, env_e, rew_e = entry
+            bar_e = '#' * min(int(env_e * 5), 30)
+            bar_r = '#' * min(int(rew_e * 5), 30)
+            print(f"    t={t:5d}: env={env_e:.4f} {bar_e}  rew={rew_e:.4f} {bar_r}")
+        else:
+            t, env_e = entry
+            bar = '#' * min(int(env_e * 5), 40)
+            print(f"    t={t:5d}: {env_e:.4f}  {bar}")
 
 
 # ---------------------------------------------------------------------------
