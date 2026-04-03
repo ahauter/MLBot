@@ -261,55 +261,120 @@ class WavepacketObject2D:
 # -- Simple RL paddle controller -----------------------------------------------
 
 class SimpleRLController:
-    """Linear policy: action = tanh(w · state + b).
+    """Linear actor-critic: TD(0) with eligibility traces.
 
-    Trained with REINFORCE + eligibility traces.  Only 10 parameters
-    (9 weights + 1 bias) — the spectral encoder does the heavy lifting.
+    Actor:  action = tanh(w_a · state + b_a) + noise
+    Critic: V(s)   = w_c · state + b_c
+    TD error: δ = reward + γ·V(s') − V(s)
+    Updates every frame via δ, not just on goals.
+    ~22 parameters per paddle (10+1 actor, 10+1 critic).
+    Includes a 1D reward wavepacket that learns where goals happen.
     """
 
     TRACE_CLIP = 1.0
-    WEIGHT_DECAY = 0.9999
 
-    STATE_DIM = 9
+    STATE_DIM = 10
     STATE_LABELS = [
         'nip_env', 'nip_padL', 'nip_padR',
-        'x_env_x', 'x_env_y',
-        'x_padL_x', 'x_padL_y',
-        'x_padR_x', 'x_padR_y',
+        'nip_x_env_x', 'nip_x_env_y',
+        'nip_x_padL_x', 'nip_x_padL_y',
+        'nip_x_padR_x', 'nip_x_padR_y',
+        'reward_pred',
     ]
 
-    def __init__(self, state_dim: int, lr: float = 3e-3,
-                 gamma: float = 0.95, std: float = 0.5, **_kwargs):
-        self.w = np.random.randn(state_dim) * 0.1
-        self.b = 0.0
-        self.lr = lr
+    def __init__(self, state_dim: int, lr_actor: float = 1e-2,
+                 lr_critic: float = 1e-1, gamma: float = 0.95,
+                 lam: float = 0.9, std: float = 0.3,
+                 K: int = 8, frequencies: np.ndarray | None = None,
+                 **_kwargs):
+        # Actor (policy)
+        self.w_a = np.random.randn(state_dim) * 0.1
+        self.b_a = 0.0
+        # Critic (value)
+        self.w_c = np.zeros(state_dim)
+        self.b_c = 0.0
+        self.lr_actor = lr_actor
+        self.lr_critic = lr_critic
         self.gamma = gamma
+        self.lam = lam  # trace decay for TD(λ)
         self.std = std
-        self._reset_traces()
+        # Actor eligibility trace (∇logπ accumulated)
+        self.trace_a_w = np.zeros(state_dim)
+        self.trace_a_b = 0.0
+        # Critic eligibility trace (state features accumulated)
+        self.trace_c_w = np.zeros(state_dim)
+        self.trace_c_b = 0.0
+        # Previous state for TD
+        self.prev_state = None
+        # 1D reward wavepacket: learns where goals happen along x-axis
+        if frequencies is None:
+            frequencies = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
+        self.rw_k = np.asarray(frequencies, dtype=np.float64)
+        self.rw_c_cos = np.zeros(K, dtype=np.float64)
+        self.rw_c_sin = np.zeros(K, dtype=np.float64)
+        self.rw_lr = 0.1
         # Diagnostics
         self.last_mean = 0.0
         self.last_action = 0.0
+        self.last_td_error = 0.0
+        self.last_value = 0.0
 
-    def _reset_traces(self) -> None:
-        self.trace_w = np.zeros_like(self.w)
-        self.trace_b = 0.0
+    def reward_predict(self, x: float) -> float:
+        """Evaluate 1D reward wavepacket at x position."""
+        basis = np.concatenate([np.cos(self.rw_k * x),
+                                np.sin(self.rw_k * x)])
+        coeffs = np.concatenate([self.rw_c_cos, self.rw_c_sin])
+        return float(coeffs @ basis)
+
+    def reward_update(self, x: float, reward: float) -> None:
+        """LMS update: push reward wavepacket toward observed reward at x."""
+        basis_cos = np.cos(self.rw_k * x)
+        basis_sin = np.sin(self.rw_k * x)
+        pred = float(self.rw_c_cos @ basis_cos + self.rw_c_sin @ basis_sin)
+        error = reward - pred
+        self.rw_c_cos += self.rw_lr * error * basis_cos
+        self.rw_c_sin += self.rw_lr * error * basis_sin
 
     @staticmethod
     def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
-                    wp_env) -> np.ndarray:
-        """9-dim spectral interaction features."""
+                    wp_env, reward_pred: float = 0.0) -> np.ndarray:
+        """10-dim spectral interaction features.
+
+        Cross products use entity.cross(ball) for correct sign convention
+        (positive = ball is above/right of entity) and are weighted by
+        NIP so directional signal is stronger when objects are nearby.
+        """
+        nip_env = wp_ball.normalized_inner_product(wp_env)
+        nip_padL = wp_ball.normalized_inner_product(wp_paddle_l)
+        nip_padR = wp_ball.normalized_inner_product(wp_paddle_r)
         return np.array([
-            wp_ball.normalized_inner_product(wp_env),
-            wp_ball.normalized_inner_product(wp_paddle_l),
-            wp_ball.normalized_inner_product(wp_paddle_r),
-            *wp_ball.cross_product_2d(wp_env),
-            *wp_ball.cross_product_2d(wp_paddle_l),
-            *wp_ball.cross_product_2d(wp_paddle_r),
+            nip_env, nip_padL, nip_padR,
+            *(nip_env * wp_env.cross_product_2d(wp_ball)),
+            *(nip_padL * wp_paddle_l.cross_product_2d(wp_ball)),
+            *(nip_padR * wp_paddle_r.cross_product_2d(wp_ball)),
+            reward_pred,
         ])
 
-    def act(self, state: np.ndarray) -> float:
-        """Linear policy: tanh(w·s + b) + noise."""
-        z = float(self.w @ state + self.b)
+    # NIPs are in [0,1], NIP×cross products peak at ~0.08, reward_pred in ~[-1,1]
+    _FEAT_SCALE = np.array([
+        1.0, 1.0, 1.0,           # NIPs already [0,1]
+        12.0, 12.0,              # nip×cross_env  (1/0.08 ≈ 12)
+        12.0, 12.0,              # nip×cross_padL
+        12.0, 12.0,              # nip×cross_padR
+        1.0,                     # reward_pred already [-1,1]
+    ])
+
+    def _normalize(self, state: np.ndarray) -> np.ndarray:
+        """Scale features to O(1) range."""
+        return state * self._FEAT_SCALE
+
+    def _value(self, state: np.ndarray) -> float:
+        return float(self.w_c @ state + self.b_c)
+
+    def act(self, raw_state: np.ndarray) -> float:
+        """Actor forward pass + accumulate trace. Call step() after."""
+        state = self._normalize(raw_state)
+        z = float(self.w_a @ state + self.b_a)
         mean = np.tanh(z)
         action = float(np.clip(mean + self.std * np.random.randn(), -1, 1))
 
@@ -319,29 +384,54 @@ class SimpleRLController:
         grad_w = d_z * state
         grad_b = d_z
 
-        # Eligibility traces (clipped)
-        self.trace_w = np.clip(
-            self.gamma * self.trace_w + grad_w,
+        # Accumulate actor eligibility trace (γλ decay)
+        self.trace_a_w = np.clip(
+            self.gamma * self.lam * self.trace_a_w + grad_w,
             -self.TRACE_CLIP, self.TRACE_CLIP)
-        self.trace_b = np.clip(
-            self.gamma * self.trace_b + grad_b,
+        self.trace_a_b = np.clip(
+            self.gamma * self.lam * self.trace_a_b + grad_b,
             -self.TRACE_CLIP, self.TRACE_CLIP)
-
-        # Weight decay
-        self.w *= self.WEIGHT_DECAY
 
         # Diagnostics
         self.last_mean = mean
         self.last_action = action
+        self.last_value = self._value(state)
         return action
 
-    def update(self, reward: float) -> None:
-        """REINFORCE update on sparse reward."""
-        if abs(reward) < 1e-10:
+    def step(self, raw_state: np.ndarray, reward: float) -> None:
+        """TD(0) update — call every frame with current state and reward."""
+        state = self._normalize(raw_state)
+        if self.prev_state is None:
+            self.prev_state = state.copy()
             return
-        self.w += self.lr * reward * self.trace_w
-        self.b += self.lr * reward * self.trace_b
-        self._reset_traces()
+
+        # TD(λ): δ = r + γ·V(s') − V(s)
+        v_prev = self._value(self.prev_state)
+        v_curr = self._value(state)
+        td_error = reward + self.gamma * v_curr - v_prev
+        self.last_td_error = td_error
+
+        # Accumulate critic trace: e_c = γλ·e_c + ∇V(s) = γλ·e_c + s
+        self.trace_c_w = self.gamma * self.lam * self.trace_c_w + self.prev_state
+        self.trace_c_b = self.gamma * self.lam * self.trace_c_b + 1.0
+
+        # Critic update via trace: w_c += lr_c · δ · e_c
+        self.w_c += self.lr_critic * td_error * self.trace_c_w
+        self.b_c += self.lr_critic * td_error * self.trace_c_b
+
+        # Actor update via trace: w_a += lr_a · δ · e_a
+        self.w_a += self.lr_actor * td_error * self.trace_a_w
+        self.b_a += self.lr_actor * td_error * self.trace_a_b
+
+        self.prev_state = state.copy()
+
+    def on_reset(self) -> None:
+        """Call on episode boundary (goal scored) to clear traces."""
+        self.prev_state = None
+        self.trace_a_w[:] = 0
+        self.trace_a_b = 0.0
+        self.trace_c_w[:] = 0
+        self.trace_c_b = 0.0
 
 
 # -- helpers ------------------------------------------------------------------
@@ -676,10 +766,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if auto_paddle:
             if spectral_paddle and rl_left is not None:
                 # RL policy: wavepacket state → paddle velocity (one per paddle)
-                rl_state = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env)
-                act_l = rl_left.act(rl_state)
-                act_r = rl_right.act(rl_state)
+                rp_l = rl_left.reward_predict(ball['x'])
+                rp_r = rl_right.reward_predict(ball['x'])
+                rl_state_l = SimpleRLController.build_state(
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_l)
+                rl_state_r = SimpleRLController.build_state(
+                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_r)
+                act_l = rl_left.act(rl_state_l)
+                act_r = rl_right.act(rl_state_r)
                 left_paddle['y'] += act_l * PADDLE_SPEED * dt
                 right_paddle['y'] += act_r * PADDLE_SPEED * dt
             else:
@@ -765,10 +859,16 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
-            # RL update — opposite rewards for each side
             if rl_left is not None:
-                rl_left.update(reward)       # +1 when left scores
-                rl_right.update(-reward)     # +1 when right blocks
+                # Update reward wavepackets: learn where goals happen
+                rl_left.reward_update(ball['x'], reward)
+                rl_right.reward_update(ball['x'], -reward)
+                # Terminal TD step: reward reaches critic before reset
+                term_state = np.zeros(SimpleRLController.STATE_DIM)
+                rl_left.step(term_state, reward)
+                rl_right.step(term_state, -reward)
+                rl_left.on_reset()
+                rl_right.on_reset()
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
@@ -833,6 +933,18 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_ball.pos[:] = ball_pos
         wp_paddle_l.pos[:] = paddle_l_pos
         wp_paddle_r.pos[:] = paddle_r_pos
+
+        # 7. TD update AFTER wavepacket updates so next_state reflects
+        #    the new ball/paddle positions
+        if rl_left is not None and not scored:
+            rp_l = rl_left.reward_predict(ball['x'])
+            rp_r = rl_right.reward_predict(ball['x'])
+            ns_l = SimpleRLController.build_state(
+                wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_l)
+            ns_r = SimpleRLController.build_state(
+                wp_ball, wp_paddle_l, wp_paddle_r, wp_env, rp_r)
+            rl_left.step(ns_l, reward)
+            rl_right.step(ns_r, -reward)
 
         # Deviation magnitude for display (replaces old anomaly)
         a_residual = ball_deviation

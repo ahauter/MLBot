@@ -20,9 +20,10 @@ from spectral_pong_viz import (
 )
 
 
-def run_headless(n_frames: int = 6000, lr: float = 3e-3,
-                 gamma: float = 0.95, std: float = 0.5,
-                 seed: int = 0, verbose: bool = True) -> list[int]:
+def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
+                 lr_critic: float = 1e-1, gamma: float = 0.95,
+                 lam: float = 0.9, std: float = 0.3, seed: int = 0,
+                 verbose: bool = True) -> list[int]:
     """Run pong with RL paddles, return list of goal-frame indices."""
     np.random.seed(seed)
     K = 8
@@ -46,11 +47,13 @@ def run_headless(n_frames: int = 6000, lr: float = 3e-3,
                                  c_cos=env_c, c_sin=np.zeros((K, 2)),
                                  lr=0.15, lr_tracking=0.0)
 
-    # RL controllers
+    # RL controllers (actor-critic with TD(λ))
     rl_left = SimpleRLController(SimpleRLController.STATE_DIM,
-                                  lr=lr, gamma=gamma, std=std)
+                                  lr_actor=lr_actor, lr_critic=lr_critic,
+                                  gamma=gamma, lam=lam, std=std)
     rl_right = SimpleRLController(SimpleRLController.STATE_DIM,
-                                   lr=lr, gamma=gamma, std=std)
+                                   lr_actor=lr_actor, lr_critic=lr_critic,
+                                   gamma=gamma, lam=lam, std=std)
 
     # Game state
     ball = {'x': 0.0, 'y': 0.0, 'vx': 0.0, 'vy': 0.0}
@@ -70,10 +73,14 @@ def run_headless(n_frames: int = 6000, lr: float = 3e-3,
             continue
 
         # -- RL paddle movement --
-        rl_state = SimpleRLController.build_state(
-            wp_ball, wp_pl, wp_pr, wp_env)
-        act_l = rl_left.act(rl_state)
-        act_r = rl_right.act(rl_state)
+        rp_l = rl_left.reward_predict(ball['x'])
+        rp_r = rl_right.reward_predict(ball['x'])
+        rl_state_l = SimpleRLController.build_state(
+            wp_ball, wp_pl, wp_pr, wp_env, rp_l)
+        rl_state_r = SimpleRLController.build_state(
+            wp_ball, wp_pl, wp_pr, wp_env, rp_r)
+        act_l = rl_left.act(rl_state_l)
+        act_r = rl_right.act(rl_state_r)
         left_paddle['y'] += act_l * PADDLE_SPEED * dt
         right_paddle['y'] += act_r * PADDLE_SPEED * dt
         left_paddle['y'] = np.clip(left_paddle['y'],
@@ -130,8 +137,15 @@ def run_headless(n_frames: int = 6000, lr: float = 3e-3,
 
         if scored:
             goal_frames.append(t)
-            rl_left.update(reward)
-            rl_right.update(-reward)
+            # Update reward wavepackets
+            rl_left.reward_update(ball['x'], reward)
+            rl_right.reward_update(ball['x'], -reward)
+            # Terminal TD step: V(terminal)=0, so δ = reward - V(s)
+            term_state = np.zeros(SimpleRLController.STATE_DIM)
+            rl_left.step(term_state, reward)
+            rl_right.step(term_state, -reward)
+            rl_left.on_reset()
+            rl_right.on_reset()
             reset_ball(ball, toward='left' if reward < 0 else 'right',
                        speed=ball_speed)
             freeze = int(0.5 / dt)
@@ -181,6 +195,17 @@ def run_headless(n_frames: int = 6000, lr: float = 3e-3,
         wp_ball.pos[:] = ball_pos
         wp_pl.pos[:] = paddle_l_pos
         wp_pr.pos[:] = paddle_r_pos
+
+        # TD update AFTER wavepacket updates
+        if not scored:
+            rp_l = rl_left.reward_predict(ball['x'])
+            rp_r = rl_right.reward_predict(ball['x'])
+            ns_l = SimpleRLController.build_state(
+                wp_ball, wp_pl, wp_pr, wp_env, rp_l)
+            ns_r = SimpleRLController.build_state(
+                wp_ball, wp_pl, wp_pr, wp_env, rp_r)
+            rl_left.step(ns_l, reward)
+            rl_right.step(ns_r, -reward)
 
     return goal_frames
 
@@ -239,20 +264,19 @@ def main():
 
     if args.lr is not None:
         # Single run
-        configs = [{'lr': args.lr,
-                     'std': args.std or 0.5,
+        configs = [{'lr_actor': args.lr,
+                     'lr_critic': args.lr * 10,
+                     'std': args.std or 0.3,
                      'gamma': args.gamma or 0.95}]
     else:
-        # Sweep
+        # Sweep: TD(λ) actor-critic with fixed λ=0.9
         configs = [
-            {'lr': 1e-3, 'std': 0.5, 'gamma': 0.95},
-            {'lr': 3e-3, 'std': 0.5, 'gamma': 0.95},
-            {'lr': 1e-2, 'std': 0.5, 'gamma': 0.95},
-            {'lr': 3e-2, 'std': 0.5, 'gamma': 0.95},
-            {'lr': 3e-3, 'std': 0.3, 'gamma': 0.95},
-            {'lr': 3e-3, 'std': 0.7, 'gamma': 0.95},
-            {'lr': 3e-3, 'std': 0.5, 'gamma': 0.90},
-            {'lr': 3e-3, 'std': 0.5, 'gamma': 0.99},
+            {'lr_actor': 3e-3, 'lr_critic': 3e-2, 'std': 0.3, 'gamma': 0.95},
+            {'lr_actor': 1e-2, 'lr_critic': 1e-1, 'std': 0.3, 'gamma': 0.95},
+            {'lr_actor': 3e-2, 'lr_critic': 3e-1, 'std': 0.3, 'gamma': 0.95},
+            {'lr_actor': 1e-2, 'lr_critic': 1e-1, 'std': 0.1, 'gamma': 0.95},
+            {'lr_actor': 1e-2, 'lr_critic': 1e-1, 'std': 0.5, 'gamma': 0.95},
+            {'lr_actor': 1e-2, 'lr_critic': 1e-1, 'std': 0.3, 'gamma': 0.99},
         ]
 
     print(f'Running {len(configs)} configs × {args.seeds} seeds × '
@@ -265,16 +289,16 @@ def main():
         for seed in range(args.seeds):
             goals = run_headless(n_frames=args.frames, seed=seed, **cfg,
                                  verbose=False)
-            label = (f'lr={cfg["lr"]:.0e} std={cfg["std"]:.1f} '
-                     f'γ={cfg["gamma"]:.2f} seed={seed}')
+            label = (f'lr_a={cfg["lr_actor"]:.0e} lr_c={cfg["lr_critic"]:.0e} '
+                     f'std={cfg["std"]:.1f} γ={cfg["gamma"]:.2f} seed={seed}')
             result = analyse(goals, args.frames, label=label)
             if result:
                 improvements.append(result['improvement'])
 
         if improvements:
             mean_imp = np.mean(improvements)
-            tag = (f'lr={cfg["lr"]:.0e} std={cfg["std"]:.1f} '
-                   f'γ={cfg["gamma"]:.2f}')
+            tag = (f'lr_a={cfg["lr_actor"]:.0e} lr_c={cfg["lr_critic"]:.0e} '
+                   f'std={cfg["std"]:.1f} γ={cfg["gamma"]:.2f}')
             print(f'\n  >> {tag}: mean improvement = {mean_imp:.2f}x '
                   f'({len(improvements)} seeds)')
             if best is None or mean_imp > best[1]:
