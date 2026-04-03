@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import numpy as np
 from spectral_pong_viz import (
-    WavepacketObject2D, SimpleRLController,
+    WavepacketObject2D, SimpleRLController, MLPController, build_raw_state,
     COURT_LEFT, COURT_RIGHT, COURT_TOP, COURT_BOTTOM,
     PADDLE_X_OFFSET, PADDLE_WIDTH, PADDLE_HEIGHT, PADDLE_SPEED,
     BALL_RADIUS, BALL_SPEED, SPIN_FACTOR,
@@ -26,7 +26,9 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                  lam: float = 0.9, std: float = 0.3, seed: int = 0,
                  verbose: bool = True,
                  force_scale: float = 0.0, lr_k: float = 0.0,
-                 reward_replay_n: int = 5) -> list[int]:
+                 reward_replay_n: int = 5,
+                 batch_size: int = 1,
+                 use_raw: bool = False) -> list[int]:
     """Run pong with RL paddles, return list of goal-frame indices."""
     np.random.seed(seed)
     K = 8
@@ -69,12 +71,14 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                                       lr=0.15, lr_tracking=0.0)
 
     # RL controllers (actor-critic with TD(λ))
-    rl_left = SimpleRLController(SimpleRLController.STATE_DIM,
-                                  lr_actor=lr_actor, lr_critic=lr_critic,
-                                  gamma=gamma, lam=lam, std=std)
-    rl_right = SimpleRLController(SimpleRLController.STATE_DIM,
-                                   lr_actor=lr_actor, lr_critic=lr_critic,
-                                   gamma=gamma, lam=lam, std=std)
+    rl_kwargs = dict(lr_actor=lr_actor, lr_critic=lr_critic,
+                     gamma=gamma, lam=lam, std=std, batch_size=batch_size)
+    if use_raw:
+        rl_left = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
+        rl_right = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
+    else:
+        rl_left = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
+        rl_right = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
 
     # Feature map grids for conv state extraction
     x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
@@ -99,12 +103,16 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             continue
 
         # -- RL paddle movement --
-        fmaps_l = compute_feature_maps(
-            wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l, x_fm, y_fm, r_fm)
-        fmaps_r = compute_feature_maps(
-            wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r, x_fm, y_fm, r_fm)
-        rl_state_l = SimpleRLController.build_state(fmaps_l, rl_left.conv)
-        rl_state_r = SimpleRLController.build_state(fmaps_r, rl_right.conv)
+        if use_raw:
+            rl_state_l = build_raw_state(ball, left_paddle, right_paddle)
+            rl_state_r = build_raw_state(ball, right_paddle, left_paddle)
+        else:
+            fmaps_l = compute_feature_maps(
+                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l, x_fm, y_fm, r_fm)
+            fmaps_r = compute_feature_maps(
+                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r, x_fm, y_fm, r_fm)
+            rl_state_l = SimpleRLController.build_state(fmaps_l, rl_left.conv)
+            rl_state_r = SimpleRLController.build_state(fmaps_r, rl_right.conv)
         act_l = rl_left.act(rl_state_l)
         act_r = rl_right.act(rl_state_r)
         left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -281,14 +289,18 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
 
         # TD update AFTER wavepacket updates
         if not scored:
-            ns_fmaps_l = compute_feature_maps(
-                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l,
-                x_fm, y_fm, r_fm)
-            ns_fmaps_r = compute_feature_maps(
-                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r,
-                x_fm, y_fm, r_fm)
-            ns_l = SimpleRLController.build_state(ns_fmaps_l, rl_left.conv)
-            ns_r = SimpleRLController.build_state(ns_fmaps_r, rl_right.conv)
+            if use_raw:
+                ns_l = build_raw_state(ball, left_paddle, right_paddle)
+                ns_r = build_raw_state(ball, right_paddle, left_paddle)
+            else:
+                ns_fmaps_l = compute_feature_maps(
+                    wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l,
+                    x_fm, y_fm, r_fm)
+                ns_fmaps_r = compute_feature_maps(
+                    wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r,
+                    x_fm, y_fm, r_fm)
+                ns_l = SimpleRLController.build_state(ns_fmaps_l, rl_left.conv)
+                ns_r = SimpleRLController.build_state(ns_fmaps_r, rl_right.conv)
             rl_left.step(ns_l, reward)
             rl_right.step(ns_r, -reward)
 
@@ -345,6 +357,10 @@ def main():
                         help='Single exploration std (default: sweep)')
     parser.add_argument('--gamma', type=float, default=None,
                         help='Single gamma (default: sweep)')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size for gradient updates (default: 1 = per-frame)')
+    parser.add_argument('--raw', action='store_true',
+                        help='Use raw MLP controller (no spectral encoder)')
     args = parser.parse_args()
 
     if args.lr is not None:
@@ -373,7 +389,8 @@ def main():
         improvements = []
         for seed in range(args.seeds):
             goals = run_headless(n_frames=args.frames, seed=seed, **cfg,
-                                 verbose=False)
+                                 verbose=False, batch_size=args.batch_size,
+                                 use_raw=args.raw)
             label = (f'lr_a={cfg["lr_actor"]:.0e} lr_c={cfg["lr_critic"]:.0e} '
                      f'std={cfg["std"]:.1f} γ={cfg["gamma"]:.2f} seed={seed}')
             result = analyse(goals, args.frames, label=label)
