@@ -179,6 +179,22 @@ class WavepacketObject2D:
                 self.c_cos[:, d] /= np.sqrt(S)
                 self.c_sin[:, d] /= np.sqrt(S)
 
+    def soft_normalize(self, max_energy: float = 2.0) -> None:
+        """Soft ceiling: rescale to max_energy when any axis exceeds it."""
+        for d in range(self.ndim):
+            E = self.integrate_squared(d)
+            if E > max_energy:
+                s = np.sqrt(max_energy / E)
+                self.c_cos[:, d] *= s
+                self.c_sin[:, d] *= s
+
+    def outer_product_map(self, x_grid: np.ndarray, y_grid: np.ndarray,
+                          ax0: int = 0, ax1: int = 1) -> np.ndarray:
+        """2D outer product of two axis evaluations. Returns (Ny, Nx)."""
+        fx = self.evaluate(x_grid, axis=ax0)
+        fy = self.evaluate(y_grid, axis=ax1)
+        return np.outer(fy, fx)
+
     def gradient(self, x: float, axis: int) -> float:
         """Analytical derivative dF_d/dx at domain position x.
 
@@ -330,6 +346,82 @@ class WavepacketObject2D:
         return residual
 
 
+# -- Feature map constants -----------------------------------------------------
+FM_NX, FM_NY = 24, 16  # outer-product grid resolution (court aspect ~5:3)
+FM_CHANNELS = 6        # ball, env, padL, padR, reward, ball×reward
+FM_LABELS = ['ball', 'env', 'padL', 'padR', 'rew', 'b×r']
+
+
+def compute_feature_maps(wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+                         wp_reward_l, x_fm, y_fm, r_fm):
+    """Compute 6-channel outer-product feature maps. Returns (6, Ny, Nx)."""
+    maps = np.empty((FM_CHANNELS, FM_NY, FM_NX))
+    maps[0] = wp_ball.outer_product_map(x_fm, y_fm, ax0=0, ax1=1)
+    maps[1] = wp_env.outer_product_map(x_fm, y_fm, ax0=0, ax1=1)
+    maps[2] = wp_paddle_l.outer_product_map(x_fm, y_fm, ax0=0, ax1=1)
+    maps[3] = wp_paddle_r.outer_product_map(x_fm, y_fm, ax0=0, ax1=1)
+    maps[4] = wp_reward_l.outer_product_map(x_fm, y_fm, ax0=0, ax1=1)
+    maps[5] = wp_ball.outer_product_map(x_fm, r_fm, ax0=0, ax1=2)
+    return maps
+
+
+class ConvFeatureExtractor:
+    """2D convolution on outer-product feature maps. Numpy-only.
+
+    Forward: valid conv2d → ReLU → global avg pool → (n_filters,) vector.
+    Filters are fixed random projections (not learned via TD).
+    """
+
+    def __init__(self, n_channels: int = FM_CHANNELS, n_filters: int = 8,
+                 kernel_size: int = 3, seed: int = 0):
+        rng = np.random.RandomState(seed)
+        self.n_filters = n_filters
+        self.ks = kernel_size
+        # He initialization
+        fan_in = n_channels * kernel_size * kernel_size
+        self.W = rng.randn(n_filters, n_channels,
+                           kernel_size, kernel_size) * np.sqrt(2.0 / fan_in)
+        self.b = np.zeros(n_filters)
+
+    def forward(self, maps: np.ndarray) -> np.ndarray:
+        """maps: (C, H, W) → feature vector (n_filters,)."""
+        C, H, W = maps.shape
+        oH = H - self.ks + 1
+        oW = W - self.ks + 1
+        out = np.zeros((self.n_filters, oH, oW))
+        for f in range(self.n_filters):
+            for c in range(C):
+                for i in range(oH):
+                    for j in range(oW):
+                        out[f, i, j] += np.sum(
+                            maps[c, i:i+self.ks, j:j+self.ks] * self.W[f, c])
+            out[f] += self.b[f]
+        # ReLU
+        out = np.maximum(out, 0.0)
+        # Global average pool → (n_filters,)
+        return out.mean(axis=(1, 2))
+
+    def forward_fast(self, maps: np.ndarray) -> np.ndarray:
+        """Vectorized valid conv2d → ReLU → global avg pool."""
+        C, H, W = maps.shape
+        ks = self.ks
+        oH, oW = H - ks + 1, W - ks + 1
+        # im2col: extract all patches → (oH*oW, C*ks*ks)
+        patches = np.empty((oH * oW, C * ks * ks))
+        idx = 0
+        for i in range(oH):
+            for j in range(oW):
+                patches[idx] = maps[:, i:i+ks, j:j+ks].ravel()
+                idx += 1
+        # filters as (n_filters, C*ks*ks)
+        W_flat = self.W.reshape(self.n_filters, -1)
+        # conv output: (oH*oW, n_filters)
+        conv_out = patches @ W_flat.T + self.b  # (oH*oW, n_filters)
+        # ReLU + global avg pool
+        conv_out = np.maximum(conv_out, 0.0)
+        return conv_out.mean(axis=0)  # (n_filters,)
+
+
 # -- Simple RL paddle controller -----------------------------------------------
 
 class SimpleRLController:
@@ -393,6 +485,9 @@ class SimpleRLController:
         self.feat_mean = np.zeros(state_dim)
         self.feat_var = np.ones(state_dim)
         self._feat_ema_alpha = 0.01
+        # Conv feature extractor for 2D outer-product maps
+        self.conv = ConvFeatureExtractor(
+            n_channels=FM_CHANNELS, n_filters=8, kernel_size=3)
         # Diagnostics
         self.last_mean = 0.0
         self.last_action = 0.0
@@ -434,6 +529,12 @@ class SimpleRLController:
                 cp = objects[i].cross_product(objects[j])   # (3,)
                 feats.append(np.outer(ip, cp).flatten())    # (9,)
         return np.concatenate(feats)  # (90,)
+
+    @staticmethod
+    def build_state_2d(feature_maps: np.ndarray,
+                       conv: 'ConvFeatureExtractor') -> np.ndarray:
+        """Conv features from outer-product maps. Returns (n_filters,)."""
+        return conv.forward_fast(feature_maps)
 
     def _normalize(self, state: np.ndarray) -> np.ndarray:
         """EMA per-feature standardization: zero mean, unit variance."""
@@ -611,25 +712,32 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     history_t = deque(maxlen=window)
 
     # -- figure layout --------------------------------------------------------
-    # Layout:  Y-domain (left) | X-domain (top-right)
-    #                          | Court    (bottom-right)
+    # Layout:  [ball] [env] [padL] [padR] [rew] [b×r]   FEATURE MAPS
+    #          [            Court (game)              ]
     #          [Debug strip — only when spectral_paddle]
+    #
+    # Feature map grids for outer-product evaluation
+    x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
+    y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
+    r_fm = np.linspace(-1.0, 1.0, FM_NY)  # reward domain, same height
+
     if spectral_paddle:
         fig = plt.figure(figsize=(15, 11))
         fig.patch.set_facecolor(BG_COLOR)
-        fig.suptitle('Spectral Pong — 2D Amplitude Wavepackets',
+        fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
                      color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
-        gs = fig.add_gridspec(3, 2, width_ratios=[1, 3],
-                              height_ratios=[1, 2, 0.6],
-                              hspace=0.3, wspace=0.2,
-                              left=0.06, right=0.97, top=0.93, bottom=0.04)
-        ax_y = fig.add_subplot(gs[0:2, 0])
-        ax_x = fig.add_subplot(gs[0, 1])
-        ax_court = fig.add_subplot(gs[1, 1])
+        gs = fig.add_gridspec(3, 1, height_ratios=[1, 3, 0.6],
+                              hspace=0.25,
+                              left=0.04, right=0.97, top=0.93, bottom=0.04)
+        # Top row: 6 feature map thumbnails
+        gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
+                                        wspace=0.15)
+        ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
+        ax_court = fig.add_subplot(gs[1, 0])
 
         # Debug strip: [input heatmap | L hidden | L out | R hidden | R out]
         gs_dbg = GridSpecFromSubplotSpec(
-            1, 5, subplot_spec=gs[2, :],
+            1, 5, subplot_spec=gs[2, 0],
             width_ratios=[4, 2, 1, 2, 1], wspace=0.4)
         ax_input = fig.add_subplot(gs_dbg[0, 0])
         ax_hid_l = fig.add_subplot(gs_dbg[0, 1])
@@ -640,64 +748,38 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     else:
         fig = plt.figure(figsize=(15, 9))
         fig.patch.set_facecolor(BG_COLOR)
-        fig.suptitle('Spectral Pong — 2D Amplitude Wavepackets',
+        fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
                      color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
-        gs = fig.add_gridspec(2, 2, width_ratios=[1, 3], height_ratios=[1, 2],
-                              hspace=0.25, wspace=0.2,
-                              left=0.06, right=0.97, top=0.93, bottom=0.05)
-        ax_y = fig.add_subplot(gs[:, 0])
-        ax_x = fig.add_subplot(gs[0, 1])
-        ax_court = fig.add_subplot(gs[1, 1])
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 3],
+                              hspace=0.2,
+                              left=0.04, right=0.97, top=0.93, bottom=0.05)
+        gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
+                                        wspace=0.15)
+        ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
+        ax_court = fig.add_subplot(gs[1, 0])
         debug_axes = []
 
-    for ax in [ax_y, ax_x, ax_court] + debug_axes:
+    for ax in ax_fmaps + [ax_court] + debug_axes:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
             spine.set_color('#333')
 
-    # -- X-domain panel -------------------------------------------------------
-    x_dom = np.linspace(COURT_LEFT - 1, COURT_RIGHT + 1, 400)
-    ax_x.set_xlim(x_dom[0], x_dom[-1])
-    ax_x.set_ylim(-0.05, 1.0)
-    ax_x.set_title('X-domain spectral fields', color=TITLE_COLOR, fontsize=10)
-    ax_x.set_ylabel('F_x(x)', color=LABEL_COLOR, fontsize=8)
-    ax_x.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
-
-    lx_ball, = ax_x.plot([], [], color=BALL_COLOR, lw=2, label='Ball')
-    lx_pad_l, = ax_x.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7,
-                          label='L paddle')
-    lx_pad_r, = ax_x.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7,
-                          label='R paddle')
-    lx_env, = ax_x.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
-                        label='Env (learned)')
-    lx_dot, = ax_x.plot([], [], 'o', color=BALL_COLOR, markersize=8,
-                        zorder=5, markeredgecolor='white', markeredgewidth=1)
-    ax_x.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
-                edgecolor='#333', labelcolor='#ccc')
-
-    # -- Y-domain panel -------------------------------------------------------
-    y_dom = np.linspace(COURT_BOTTOM - 1, COURT_TOP + 1, 400)
-    ax_y.set_ylim(y_dom[0], y_dom[-1])
-    ax_y.set_xlim(-0.05, 1.5)
-    ax_y.set_title('Y-domain', color=TITLE_COLOR, fontsize=10)
-    ax_y.set_xlabel('F_y(y)', color=LABEL_COLOR, fontsize=8)
-    ax_y.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
-    # Walls as dashed lines on the Y-domain
-    ax_y.axhline(COURT_TOP, color=RESIDUAL_COLOR, ls='--', lw=1, alpha=0.5)
-    ax_y.axhline(COURT_BOTTOM, color=RESIDUAL_COLOR, ls='--', lw=1, alpha=0.5)
-
-    ly_ball, = ax_y.plot([], [], color=BALL_COLOR, lw=2, label='Ball')
-    ly_pad_l, = ax_y.plot([], [], color=PADDLE_COLOR_L, lw=1.5, alpha=0.7,
-                          label='L paddle')
-    ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R, lw=1.5, alpha=0.7,
-                          label='R paddle')
-    ly_env, = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8,
-                        label='Env (learned)')
-    ly_dot, = ax_y.plot([], [], 'o', color=BALL_COLOR, markersize=8,
-                        zorder=5, markeredgecolor='white', markeredgewidth=1)
-    ax_y.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
-                edgecolor='#333', labelcolor='#ccc')
+    # -- Feature map thumbnails (outer product 2D maps) -----------------------
+    fm_artists = []
+    fm_cmaps = ['inferno', 'viridis', PADDLE_COLOR_L, PADDLE_COLOR_R,
+                'RdYlGn', 'coolwarm']
+    # Use named colormaps for all; paddle colors handled below
+    for i, ax_fm in enumerate(ax_fmaps):
+        ax_fm.set_xticks([])
+        ax_fm.set_yticks([])
+        ax_fm.set_title(FM_LABELS[i], color=TITLE_COLOR, fontsize=9)
+        cmap = 'inferno' if i <= 1 else ('RdYlGn' if i == 4 else
+                'coolwarm' if i == 5 else 'viridis')
+        im = ax_fm.imshow(np.zeros((FM_NY, FM_NX)),
+                          origin='lower', aspect='auto', cmap=cmap,
+                          vmin=-0.5, vmax=0.5, interpolation='bilinear')
+        fm_artists.append(im)
 
     # -- Court panel ----------------------------------------------------------
     ax_court.set_xlim(COURT_LEFT - 0.5, COURT_RIGHT + 0.5)
@@ -847,11 +929,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     # -- animation step -------------------------------------------------------
 
     def init():
-        for ln in [lx_ball, lx_pad_l, lx_pad_r, lx_env,
-                   ly_ball, ly_pad_l, ly_pad_r, ly_env]:
-            ln.set_data([], [])
-        lx_dot.set_data([], [])
-        ly_dot.set_data([], [])
         ball_dot.set_data([], [])
         frame_text.set_text('')
         stats_text.set_text('')
@@ -994,6 +1071,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 wp_reward_r.update_lms(
                     goal_pos_rew, np.array([0.0, 0.0, -reward]),
                     anomaly_scale=1.0)
+                wp_reward_l.soft_normalize(max_energy=2.0)
+                wp_reward_r.soft_normalize(max_energy=2.0)
                 wp_ball.normalize()
                 # 3. LEARN: residual in dim 2 trains frequencies
                 if lr_k > 0:
@@ -1134,19 +1213,12 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         history_t.append(t)
         state['t'] = t + 1
 
-        # -- draw X-domain (plot F² = PMF) --------------------------------
-        lx_ball.set_data(x_dom, wp_ball.evaluate(x_dom, axis=0) ** 2)
-        lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0) ** 2)
-        lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0) ** 2)
-        lx_env.set_data(x_dom, wp_env.evaluate(x_dom, axis=0) ** 2)
-        lx_dot.set_data([ball['x']], [0])
-
-        # -- draw Y-domain (plot F² = PMF, x=field², y=domain) ----------
-        ly_ball.set_data(wp_ball.evaluate(y_dom, axis=1) ** 2, y_dom)
-        ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1) ** 2, y_dom)
-        ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1) ** 2, y_dom)
-        ly_env.set_data(wp_env.evaluate(y_dom, axis=1) ** 2, y_dom)
-        ly_dot.set_data([0], [ball['y']])
+        # -- draw 2D feature maps (outer products) -------------------------
+        fmaps = compute_feature_maps(
+            wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+            wp_reward_l, x_fm, y_fm, r_fm)
+        for i in range(FM_CHANNELS):
+            fm_artists[i].set_array(fmaps[i])
 
         # -- draw court ---------------------------------------------------
         ball_dot.set_data([ball['x']], [ball['y']])
