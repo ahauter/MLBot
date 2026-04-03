@@ -547,7 +547,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 paddle_lr: float = 0.1,
                 lr_tracking: float = 0.01,
                 force_scale: float = 0.0,
-                lr_k: float = 0.0):
+                lr_k: float = 0.0,
+                reward_replay_n: int = 5):
 
     # -- spectral setup (3D: x, y, reward) ------------------------------------
     NDIM = 3
@@ -953,14 +954,35 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
-            # Reward fields learn: LMS at ball's goal position with [0,0,±1]
-            goal_ball_pos = np.array([ball['x'], ball['y'], 0.0])
-            wp_reward_l.update_lms(goal_ball_pos,
-                                   np.array([0.0, 0.0, reward]),
-                                   anomaly_scale=1.0)
-            wp_reward_r.update_lms(goal_ball_pos,
-                                   np.array([0.0, 0.0, -reward]),
-                                   anomaly_scale=1.0)
+            # Replay reward frame N times through predict→correct→learn
+            goal_pos_rew = np.array([ball['x'], ball['y'], reward])
+            goal_vel = np.array([0.0, 0.0, 0.0])  # ball stopped at goal
+            for _ in range(reward_replay_n):
+                # 1. PREDICT with reward field forces
+                nip_rew_l = abs(wp_ball.normalized_inner_product(wp_reward_l))
+                nip_env_g = abs(wp_ball.normalized_inner_product(wp_env))
+                rew_force = wp_ball.predict_force(
+                    wp_reward_l, nip_rew_l, force_scale=force_scale)
+                env_force = wp_ball.predict_force(
+                    wp_env, nip_env_g, force_scale=force_scale)
+                pred_rew = wp_ball.predict_position(
+                    goal_vel, dt, env_force + rew_force)
+                # 2. CORRECT: LMS toward goal pos with reward in dim 2
+                wp_ball.update_with_attention(
+                    goal_pos_rew, np.ones(NDIM),
+                    [nip_env_g, nip_rew_l])
+                wp_reward_l.update_lms(
+                    goal_pos_rew, np.array([0.0, 0.0, reward]),
+                    anomaly_scale=1.0)
+                wp_reward_r.update_lms(
+                    goal_pos_rew, np.array([0.0, 0.0, -reward]),
+                    anomaly_scale=1.0)
+                wp_ball.normalize()
+                # 3. LEARN: residual in dim 2 trains frequencies
+                if lr_k > 0:
+                    wp_ball.learn_from_residual(pred_rew, goal_pos_rew,
+                                                lr_k=lr_k)
+                wp_ball.pos[:] = goal_pos_rew
             # Show paddles with signed reward dim for NIP learning
             paddle_l_goal = np.array([paddle_lx, left_paddle['y'], reward])
             paddle_r_goal = np.array([paddle_rx, right_paddle['y'], -reward])

@@ -77,7 +77,8 @@ def run_pretrain(n_frames: int = 6000,
                  force_scale: float = 0.5,
                  lr_k: float = 0.001,
                  seed: int = 0,
-                 window: int = 200) -> dict:
+                 window: int = 200,
+                 reward_replay_n: int = 5) -> dict:
     """Run pong with specified paddle agent, track residuals.
 
     All wavepackets are 3D (x, y, reward).  The reward field has basis
@@ -217,14 +218,32 @@ def run_pretrain(n_frames: int = 6000,
 
         if scored:
             goal_frames.append(t)
-            # Reward fields learn at ball's goal position: [0, 0, ±1]
-            goal_ball_pos = np.array([ball['x'], ball['y'], 0.0])
-            wp_reward_l.update_lms(goal_ball_pos,
-                                   np.array([0.0, 0.0, reward]),
-                                   anomaly_scale=1.0)
-            wp_reward_r.update_lms(goal_ball_pos,
-                                   np.array([0.0, 0.0, -reward]),
-                                   anomaly_scale=1.0)
+            # Replay reward frame N times through predict→correct→learn
+            goal_pos_rew = np.array([ball['x'], ball['y'], reward])
+            goal_vel = np.array([0.0, 0.0, 0.0])
+            for _ in range(reward_replay_n):
+                nip_rew_l = abs(wp_ball.normalized_inner_product(wp_reward_l))
+                nip_env_g = abs(wp_ball.normalized_inner_product(wp_env))
+                rew_force = wp_ball.predict_force(
+                    wp_reward_l, nip_rew_l, force_scale=force_scale)
+                env_force = wp_ball.predict_force(
+                    wp_env, nip_env_g, force_scale=force_scale)
+                pred_rew = wp_ball.predict_position(
+                    goal_vel, dt, env_force + rew_force)
+                wp_ball.update_with_attention(
+                    goal_pos_rew, np.ones(NDIM),
+                    [nip_env_g, nip_rew_l])
+                wp_reward_l.update_lms(
+                    goal_pos_rew, np.array([0.0, 0.0, reward]),
+                    anomaly_scale=1.0)
+                wp_reward_r.update_lms(
+                    goal_pos_rew, np.array([0.0, 0.0, -reward]),
+                    anomaly_scale=1.0)
+                wp_ball.normalize()
+                if lr_k > 0:
+                    wp_ball.learn_from_residual(pred_rew, goal_pos_rew,
+                                                lr_k=lr_k)
+                wp_ball.pos[:] = goal_pos_rew
             # Show paddles with signed reward dim
             wp_pl.update_with_attention(
                 np.array([paddle_lx, left_paddle['y'], reward]),
