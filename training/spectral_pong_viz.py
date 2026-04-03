@@ -402,7 +402,11 @@ class ConvFeatureExtractor:
         return out.mean(axis=(1, 2))
 
     def forward_fast(self, maps: np.ndarray) -> np.ndarray:
-        """Vectorized valid conv2d → ReLU → global avg pool."""
+        """Vectorized valid conv2d → ReLU → global avg pool.
+
+        Stores _last_patches, _last_gate, _last_n_pos as side effects
+        for gradient computation during conv filter updates.
+        """
         C, H, W = maps.shape
         ks = self.ks
         oH, oW = H - ks + 1, W - ks + 1
@@ -415,11 +419,15 @@ class ConvFeatureExtractor:
                 idx += 1
         # filters as (n_filters, C*ks*ks)
         W_flat = self.W.reshape(self.n_filters, -1)
-        # conv output: (oH*oW, n_filters)
-        conv_out = patches @ W_flat.T + self.b  # (oH*oW, n_filters)
+        # pre-ReLU: (oH*oW, n_filters)
+        pre_relu = patches @ W_flat.T + self.b
+        gate = (pre_relu > 0).astype(np.float64)   # ReLU mask
+        # Store for gradient computation
+        self._last_patches = patches    # (oH*oW, C*ks*ks)
+        self._last_gate    = gate       # (oH*oW, n_filters)
+        self._last_n_pos   = oH * oW
         # ReLU + global avg pool
-        conv_out = np.maximum(conv_out, 0.0)
-        return conv_out.mean(axis=0)  # (n_filters,)
+        return (pre_relu * gate).mean(axis=0)  # (n_filters,)
 
 
 # -- Simple RL paddle controller -----------------------------------------------
@@ -437,21 +445,12 @@ class SimpleRLController:
 
     TRACE_CLIP = 1.0
 
-    # 5 objects → C(5,2)=10 pairs × 9 (3×3 outer product) = 90
-    _SCENE_NAMES = ['ball', 'padL', 'padR', 'env', 'rew']
-    STATE_DIM = 90
-    STATE_LABELS = [
-        f'{n0}/{n1}[{di},{dc}]'
-        for n0, n1 in [
-            ('ball','padL'),('ball','padR'),('ball','env'),('ball','rew'),
-            ('padL','padR'),('padL','env'),('padL','rew'),
-            ('padR','env'),('padR','rew'),('env','rew'),
-        ]
-        for di in range(3) for dc in range(3)
-    ]
+    # Conv over 6-channel outer-product maps → 8-dim state
+    STATE_DIM = 8
+    STATE_LABELS = [f'conv_{i}' for i in range(8)]
 
-    def __init__(self, state_dim: int, lr_actor: float = 1e-3,
-                 lr_critic: float = 1e-2, gamma: float = 0.95,
+    def __init__(self, state_dim: int, lr_actor: float = 1e-7,
+                 lr_critic: float = 1e-6, gamma: float = 0.95,
                  lam: float = 0.9, std: float = 0.3,
                  K: int = 8, frequencies: np.ndarray | None = None,
                  **_kwargs):
@@ -480,7 +479,7 @@ class SimpleRLController:
         self.rw_k = np.asarray(frequencies, dtype=np.float64)
         self.rw_c_cos = np.zeros(K, dtype=np.float64)
         self.rw_c_sin = np.zeros(K, dtype=np.float64)
-        self.rw_lr = 0.01
+        self.rw_lr = 0.0001
         # EMA feature normalization
         self.feat_mean = np.zeros(state_dim)
         self.feat_var = np.ones(state_dim)
@@ -488,6 +487,14 @@ class SimpleRLController:
         # Conv feature extractor for 2D outer-product maps
         self.conv = ConvFeatureExtractor(
             n_channels=FM_CHANNELS, n_filters=8, kernel_size=3)
+        # Conv eligibility traces + learning rate
+        self.trace_conv_w = np.zeros_like(self.conv.W)   # (n_filters, C, ks, ks)
+        self.trace_conv_b = np.zeros(self.conv.n_filters)
+        self.lr_conv = 1e-9
+        # Activations saved in act() for critic gradient in step()
+        self._act_patches = None
+        self._act_gate    = None
+        self._act_n_pos   = None
         # Diagnostics
         self.last_mean = 0.0
         self.last_action = 0.0
@@ -511,29 +518,9 @@ class SimpleRLController:
         self.rw_c_sin += self.rw_lr * error * basis_sin
 
     @staticmethod
-    def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
-                    wp_env, wp_reward=None, **_) -> np.ndarray:
-        """90-dim pairwise spectral state.
-
-        For each unordered pair (A, B) of the 5 scene objects, compute
-        np.outer(inner_product(A,B), cross_product(A,B)) → (3,3) → flatten (9,).
-        10 pairs × 9 = 90 features total.
-        """
-        objects = [wp_ball, wp_paddle_l, wp_paddle_r, wp_env]
-        if wp_reward is not None:
-            objects.append(wp_reward)
-        feats = []
-        for i in range(len(objects)):
-            for j in range(i + 1, len(objects)):
-                ip = objects[i].inner_product(objects[j])   # (3,)
-                cp = objects[i].cross_product(objects[j])   # (3,)
-                feats.append(np.outer(ip, cp).flatten())    # (9,)
-        return np.concatenate(feats)  # (90,)
-
-    @staticmethod
-    def build_state_2d(feature_maps: np.ndarray,
-                       conv: 'ConvFeatureExtractor') -> np.ndarray:
-        """Conv features from outer-product maps. Returns (n_filters,)."""
+    def build_state(feature_maps: np.ndarray,
+                    conv: 'ConvFeatureExtractor', **_) -> np.ndarray:
+        """8-dim state from 2D conv over 6-channel outer-product feature maps."""
         return conv.forward_fast(feature_maps)
 
     def _normalize(self, state: np.ndarray) -> np.ndarray:
@@ -567,6 +554,25 @@ class SimpleRLController:
             self.gamma * self.lam * self.trace_a_b + grad_b,
             -self.TRACE_CLIP, self.TRACE_CLIP)
 
+        # Conv actor gradient: ∂log π/∂W[f] = d_z · w_a[f] · mean_p(gate[:,f] · patches)
+        p = self.conv._last_patches     # (N, C*ks*ks)
+        g = self.conv._last_gate        # (N, n_filters)
+        n = self.conv._last_n_pos
+        scale = d_z * self.w_a          # (n_filters,)
+        grad_conv_w = ((g * scale[None, :]).T @ p) / n   # (n_filters, C*ks*ks)
+        grad_conv_b = scale * g.mean(axis=0)             # (n_filters,)
+        self.trace_conv_w = np.clip(
+            self.gamma * self.lam * self.trace_conv_w
+            + grad_conv_w.reshape(self.conv.W.shape),
+            -self.TRACE_CLIP, self.TRACE_CLIP)
+        self.trace_conv_b = np.clip(
+            self.gamma * self.lam * self.trace_conv_b + grad_conv_b,
+            -self.TRACE_CLIP, self.TRACE_CLIP)
+        # Save activations for critic gradient in step()
+        self._act_patches = p
+        self._act_gate    = g
+        self._act_n_pos   = n
+
         # Diagnostics
         self.last_mean = mean
         self.last_action = action
@@ -598,6 +604,17 @@ class SimpleRLController:
         self.w_a += self.lr_actor * td_error * self.trace_a_w
         self.b_a += self.lr_actor * td_error * self.trace_a_b
 
+        # Conv update: combine actor trace with critic gradient at prev_state
+        if self._act_patches is not None:
+            p, g, n = self._act_patches, self._act_gate, self._act_n_pos
+            scale_c = self.w_c                                       # (n_filters,)
+            grad_conv_c_w = ((g * scale_c[None, :]).T @ p) / n      # (n_filters, C*ks*ks)
+            grad_conv_c_b = scale_c * g.mean(axis=0)                 # (n_filters,)
+            self.conv.W += self.lr_conv * td_error * (
+                self.trace_conv_w + grad_conv_c_w.reshape(self.conv.W.shape))
+            self.conv.b += self.lr_conv * td_error * (
+                self.trace_conv_b + grad_conv_c_b)
+
         self.prev_state = state.copy()
 
     def on_reset(self) -> None:
@@ -607,6 +624,11 @@ class SimpleRLController:
         self.trace_a_b = 0.0
         self.trace_c_w[:] = 0
         self.trace_c_b = 0.0
+        self.trace_conv_w[:] = 0
+        self.trace_conv_b[:] = 0
+        self._act_patches = None
+        self._act_gate    = None
+        self._act_n_pos   = None
 
 
 # -- helpers ------------------------------------------------------------------
@@ -614,10 +636,10 @@ class SimpleRLController:
 def reset_ball(ball: dict, toward: str = 'random',
                speed: float = BALL_SPEED) -> None:
     ball['x'] = 0.0
-    ball['y'] = 0.0
+    ball['y'] = np.random.uniform(COURT_BOTTOM * 0.6, COURT_TOP * 0.6)
     if toward == 'random':
         toward = 'left' if np.random.random() < 0.5 else 'right'
-    angle = np.random.uniform(-0.4, 0.4)
+    angle = np.random.uniform(-1.0, 1.0)
     vx = speed * np.cos(angle)
     vy = speed * np.sin(angle)
     ball['vx'] = -vx if toward == 'left' else vx
@@ -640,7 +662,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 lr_tracking: float = 0.01,
                 force_scale: float = 0.0,
                 lr_k: float = 0.0,
-                reward_replay_n: int = 5):
+                reward_replay_n: int = 1):
 
     # -- spectral setup (3D: x, y, reward) ------------------------------------
     NDIM = 3
@@ -664,7 +686,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
     # Env field: basis [0,1,0] only — acts on y only (cheat: x axis disabled)
     env_c_cos = np.zeros((K, NDIM))
-    # env_c_cos[0, 0] = 1.0  # frequency 0 → x  (disabled)
+    env_c_cos[0, 0] = 1.0  # frequency 0 → x
     env_c_cos[1, 1] = 1.0  # frequency 1 → y
     wp_env = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1e6, ndim=NDIM,
@@ -707,6 +729,18 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
              'rally_touches': 0, 'total_touches': 0,
              'last_rally': 0, 'rally_lengths': []}
 
+    # Sample-efficiency tracking: measure when ball-tracking behavior emerges.
+    # Metric: mean |left_paddle_y - ball_y| per episode (lower = better tracking).
+    # Random baseline ~2.0 (uniform over ±3 court); threshold 1.0 = one paddle-height.
+    tracking_buf: list[float] = []          # per-frame errors this episode
+    tracking_history: deque = deque(maxlen=10)  # per-episode means (rolling)
+    tracking_total_goals = 0
+    tracking_emerged = False
+    TRACKING_THRESHOLD = 1.0               # units; court half-height = 3.0
+    TRACKING_WINDOW = 5                    # episodes for rolling mean
+    if spectral_paddle:
+        print('goal,episode_mean_err,rolling5_mean_err,emerged')
+
     window = 200
     anomaly_hist = deque(maxlen=window)
     history_t = deque(maxlen=window)
@@ -721,19 +755,25 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
     r_fm = np.linspace(-1.0, 1.0, FM_NY)  # reward domain, same height
 
-    fig = plt.figure(figsize=(15, 9))
+    fig = plt.figure(figsize=(15, 11))
     fig.patch.set_facecolor(BG_COLOR)
-    fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
+    fig.suptitle('Spectral Pong — Wavepackets + Conv Feature Maps',
                  color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
-    gs = fig.add_gridspec(2, 1, height_ratios=[1, 3],
-                          hspace=0.2,
-                          left=0.04, right=0.97, top=0.93, bottom=0.05)
-    gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
+    # Layout:  [  feature maps (6 panels, full width)  ]   row 0 (thin)
+    #          [ Y-wave | X-wave                        ]   row 1
+    #          [ Y-wave | Court                         ]   row 2
+    gs = fig.add_gridspec(3, 2, width_ratios=[1, 3],
+                          height_ratios=[0.55, 1, 2],
+                          hspace=0.3, wspace=0.2,
+                          left=0.06, right=0.97, top=0.93, bottom=0.04)
+    gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, :],
                                     wspace=0.15)
     ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
-    ax_court = fig.add_subplot(gs[1, 0])
+    ax_y     = fig.add_subplot(gs[1:3, 0])
+    ax_x     = fig.add_subplot(gs[1, 1])
+    ax_court = fig.add_subplot(gs[2, 1])
 
-    for ax in ax_fmaps + [ax_court]:
+    for ax in ax_fmaps + [ax_y, ax_x, ax_court]:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
@@ -754,6 +794,40 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                           origin='lower', aspect='auto', cmap=cmap,
                           vmin=-0.5, vmax=0.5, interpolation='bilinear')
         fm_artists.append(im)
+
+    # -- X-domain wave panel --------------------------------------------------
+    x_dom = np.linspace(COURT_LEFT - 1, COURT_RIGHT + 1, 400)
+    ax_x.set_xlim(x_dom[0], x_dom[-1])
+    ax_x.set_ylim(-0.05, 1.0)
+    ax_x.set_title('X-domain spectral fields', color=TITLE_COLOR, fontsize=10)
+    ax_x.set_ylabel('F²(x)', color=LABEL_COLOR, fontsize=8)
+    ax_x.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
+    lx_ball,  = ax_x.plot([], [], color=BALL_COLOR,      lw=2,   label='Ball')
+    lx_pad_l, = ax_x.plot([], [], color=PADDLE_COLOR_L,  lw=1.5, alpha=0.7, label='L paddle')
+    lx_pad_r, = ax_x.plot([], [], color=PADDLE_COLOR_R,  lw=1.5, alpha=0.7, label='R paddle')
+    lx_env,   = ax_x.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8, label='Env')
+    lx_dot,   = ax_x.plot([], [], 'o', color=BALL_COLOR, markersize=8,
+                          zorder=5, markeredgecolor='white', markeredgewidth=1)
+    ax_x.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
+                edgecolor='#333', labelcolor='#ccc')
+
+    # -- Y-domain wave panel --------------------------------------------------
+    y_dom = np.linspace(COURT_BOTTOM - 1, COURT_TOP + 1, 400)
+    ax_y.set_ylim(y_dom[0], y_dom[-1])
+    ax_y.set_xlim(-0.05, 1.5)
+    ax_y.set_title('Y-domain', color=TITLE_COLOR, fontsize=10)
+    ax_y.set_xlabel('F²(y)', color=LABEL_COLOR, fontsize=8)
+    ax_y.grid(True, color=GRID_COLOR, alpha=GRID_ALPHA, linewidth=0.5)
+    ax_y.axhline(COURT_TOP,    color=RESIDUAL_COLOR, ls='--', lw=1, alpha=0.5)
+    ax_y.axhline(COURT_BOTTOM, color=RESIDUAL_COLOR, ls='--', lw=1, alpha=0.5)
+    ly_ball,  = ax_y.plot([], [], color=BALL_COLOR,      lw=2,   label='Ball')
+    ly_pad_l, = ax_y.plot([], [], color=PADDLE_COLOR_L,  lw=1.5, alpha=0.7, label='L paddle')
+    ly_pad_r, = ax_y.plot([], [], color=PADDLE_COLOR_R,  lw=1.5, alpha=0.7, label='R paddle')
+    ly_env,   = ax_y.plot([], [], color=ENV_FIELD_COLOR, lw=1.5, alpha=0.8, label='Env')
+    ly_dot,   = ax_y.plot([], [], 'o', color=BALL_COLOR, markersize=8,
+                          zorder=5, markeredgecolor='white', markeredgewidth=1)
+    ax_y.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e',
+                edgecolor='#333', labelcolor='#ccc')
 
     # -- Court panel ----------------------------------------------------------
     ax_court.set_xlim(COURT_LEFT - 0.5, COURT_RIGHT + 0.5)
@@ -829,6 +903,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         return ()
 
     def step(_frame):
+        nonlocal tracking_total_goals, tracking_emerged
         t = state['t']
 
         # Freeze after scoring
@@ -842,12 +917,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if auto_paddle:
             if spectral_paddle and rl_left is not None:
                 # RL policy: wavepacket state → paddle velocity (one per paddle)
-                rl_state_l = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
-                    wp_reward=wp_reward_l)
-                rl_state_r = SimpleRLController.build_state(
-                    wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
-                    wp_reward=wp_reward_r)
+                fmaps_l = compute_feature_maps(
+                    wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+                    wp_reward_l, x_fm, y_fm, r_fm)
+                fmaps_r = compute_feature_maps(
+                    wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+                    wp_reward_r, x_fm, y_fm, r_fm)
+                rl_state_l = SimpleRLController.build_state(fmaps_l, rl_left.conv)
+                rl_state_r = SimpleRLController.build_state(fmaps_r, rl_right.conv)
                 act_l = rl_left.act(rl_state_l)
                 act_r = rl_right.act(rl_state_r)
                 left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -879,6 +956,10 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                    COURT_BOTTOM + half_h, COURT_TOP - half_h)
         right_paddle['y'] = np.clip(right_paddle['y'],
                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
+
+        # Accumulate per-frame tracking error (left paddle vs ball y)
+        if spectral_paddle:
+            tracking_buf.append(abs(left_paddle['y'] - ball['y']))
 
         # -- Newtonian ball step ------------------------------------------
         vx_before, vy_before = ball['vx'], ball['vy']
@@ -942,6 +1023,25 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             state['last_rally'] = state['rally_touches']
             state['rally_lengths'].append(state['rally_touches'])
             state['rally_touches'] = 0
+
+            # Sample-efficiency measurement: log tracking error per episode
+            if spectral_paddle and tracking_buf:
+                ep_err = float(np.mean(tracking_buf))
+                tracking_buf.clear()
+                tracking_history.append(ep_err)
+                tracking_total_goals += 1
+                rolling = (float(np.mean(list(tracking_history)[-TRACKING_WINDOW:]))
+                           if len(tracking_history) >= TRACKING_WINDOW else float('nan'))
+                emerged_flag = ''
+                if (not tracking_emerged
+                        and len(tracking_history) >= TRACKING_WINDOW
+                        and rolling < TRACKING_THRESHOLD):
+                    tracking_emerged = True
+                    emerged_flag = '*EMERGED*'
+                    print(f'[TRACKING EMERGED] goal={tracking_total_goals}  '
+                          f'rolling{TRACKING_WINDOW}={rolling:.3f}')
+                print(f'{tracking_total_goals},{ep_err:.4f},'
+                      f'{rolling:.4f},{emerged_flag}')
             # Replay reward frame N times through predict→correct→learn
             goal_pos_rew = np.array([ball['x'], ball['y'], reward])
             goal_vel = np.array([0.0, 0.0, 0.0])  # ball stopped at goal
@@ -1086,13 +1186,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_paddle_r.pos[:] = paddle_r_pos
 
         # TD update AFTER wavepacket updates
+        fmaps_ns_l = compute_feature_maps(
+            wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+            wp_reward_l, x_fm, y_fm, r_fm)
         if rl_left is not None and not scored:
-            ns_l = SimpleRLController.build_state(
-                wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
-                wp_reward=wp_reward_l)
-            ns_r = SimpleRLController.build_state(
-                wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
-                wp_reward=wp_reward_r)
+            fmaps_ns_r = compute_feature_maps(
+                wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
+                wp_reward_r, x_fm, y_fm, r_fm)
+            ns_l = SimpleRLController.build_state(fmaps_ns_l, rl_left.conv)
+            ns_r = SimpleRLController.build_state(fmaps_ns_r, rl_right.conv)
             rl_left.step(ns_l, 0.0)
             rl_right.step(ns_r, 0.0)
 
@@ -1108,11 +1210,22 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         state['t'] = t + 1
 
         # -- draw 2D feature maps (outer products) -------------------------
-        fmaps = compute_feature_maps(
-            wp_ball, wp_env, wp_paddle_l, wp_paddle_r,
-            wp_reward_l, x_fm, y_fm, r_fm)
         for i in range(FM_CHANNELS):
-            fm_artists[i].set_array(fmaps[i])
+            fm_artists[i].set_array(fmaps_ns_l[i])
+
+        # -- draw X-domain wave graphs ------------------------------------
+        lx_ball.set_data(x_dom,  wp_ball.evaluate(x_dom, axis=0) ** 2)
+        lx_pad_l.set_data(x_dom, wp_paddle_l.evaluate(x_dom, axis=0) ** 2)
+        lx_pad_r.set_data(x_dom, wp_paddle_r.evaluate(x_dom, axis=0) ** 2)
+        lx_env.set_data(x_dom,   wp_env.evaluate(x_dom, axis=0) ** 2)
+        lx_dot.set_data([ball['x']], [0])
+
+        # -- draw Y-domain wave graphs ------------------------------------
+        ly_ball.set_data(wp_ball.evaluate(y_dom, axis=1) ** 2,     y_dom)
+        ly_pad_l.set_data(wp_paddle_l.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_pad_r.set_data(wp_paddle_r.evaluate(y_dom, axis=1) ** 2, y_dom)
+        ly_env.set_data(wp_env.evaluate(y_dom, axis=1) ** 2,        y_dom)
+        ly_dot.set_data([0], [ball['y']])
 
         # -- draw court ---------------------------------------------------
         ball_dot.set_data([ball['x']], [ball['y']])
@@ -1174,8 +1287,8 @@ def main():
                         help='Number of spectral components (default: 8)')
     parser.add_argument('--alpha', type=float, default=0.15,
                         help='Force coupling strength (default: 0.15)')
-    parser.add_argument('--lr', type=float, default=0.15,
-                        help='LMS learning rate (default: 0.15)')
+    parser.add_argument('--lr', type=float, default=0.0015,
+                        help='LMS learning rate (default: 0.0015)')
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Ball speed multiplier (default: 1.0)')
     parser.add_argument('--fps', type=int, default=30,
@@ -1197,15 +1310,15 @@ def main():
     parser.add_argument('--gamma-paddle', type=float, default=0.2,
                         help='Reward-gradient coupling strength '
                              '(default: 0.2)')
-    parser.add_argument('--ball-lr', type=float, default=0.15,
+    parser.add_argument('--ball-lr', type=float, default=0.0015,
                         help='Ball interaction LMS learning rate '
-                             '(default: 0.15)')
-    parser.add_argument('--paddle-lr', type=float, default=0.1,
+                             '(default: 0.0015)')
+    parser.add_argument('--paddle-lr', type=float, default=0.001,
                         help='Paddle interaction LMS learning rate '
-                             '(default: 0.1)')
-    parser.add_argument('--lr-tracking', type=float, default=0.01,
+                             '(default: 0.001)')
+    parser.add_argument('--lr-tracking', type=float, default=0.0001,
                         help='Always-on tracking LMS learning rate '
-                             '(default: 0.01)')
+                             '(default: 0.0001)')
     args = parser.parse_args()
 
     if args.save and args.frames is None:
