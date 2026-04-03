@@ -212,6 +212,53 @@ class WavepacketObject2D:
             self.c_cos[j, axis] = oc * ca - os * sa
             self.c_sin[j, axis] = oc * sa + os * ca
 
+    def predict_force(self, env_wp: 'WavepacketObject2D',
+                      nip_env: float,
+                      force_scale: float = 0.5) -> np.ndarray:
+        """Predict force on this object from the env field gradient.
+
+        The env field has high density near walls.  Its gradient at our
+        position points toward walls, so the *negative* gradient is a
+        repulsive force.  Scaled by NIP (spectral proximity) so the
+        force is only active when the ball is near the env structure.
+
+        Returns predicted acceleration (2,).
+        """
+        force = np.zeros(2)
+        for d in range(2):
+            grad_env = env_wp.gradient(self.pos[d], axis=d)
+            force[d] = -force_scale * nip_env * grad_env
+        return force
+
+    def predict_position(self, vel: np.ndarray, dt: float,
+                         env_force: np.ndarray) -> np.ndarray:
+        """Predict next position using velocity + env force.
+
+        Returns predicted_pos (2,).  Does NOT modify coefficients.
+        """
+        corrected_vel = vel + env_force * dt
+        return self.pos + corrected_vel * dt
+
+    def learn_from_residual(self, predicted_pos: np.ndarray,
+                            observed_pos: np.ndarray,
+                            lr_k: float = 0.001) -> np.ndarray:
+        """Update spatial frequencies to reduce prediction error.
+
+        Analytically computes dF_d/dk_j and adjusts self.k via gradient
+        descent on ||observed - predicted||².
+
+        Returns prediction_residual (2,).
+        """
+        residual = observed_pos - predicted_pos  # (2,)
+        for d in range(2):
+            x = self.pos[d]
+            # dF/dk_j = -c_cos[j,d] * x * sin(k_j*x) + c_sin[j,d] * x * cos(k_j*x)
+            dF_dk = (-self.c_cos[:, d] * x * np.sin(self.k * x)
+                     + self.c_sin[:, d] * x * np.cos(self.k * x))  # (K,)
+            self.k += lr_k * residual[d] * dF_dk
+        self.k = np.clip(self.k, 0.1, 5.0)
+        return residual
+
     def set_position(self, new_pos: np.ndarray) -> None:
         """Shift both axes so the wavepacket tracks new_pos."""
         for d in range(2):
@@ -462,7 +509,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 gamma_paddle: float = 0.2,
                 ball_lr: float = 0.15,
                 paddle_lr: float = 0.1,
-                lr_tracking: float = 0.01):
+                lr_tracking: float = 0.01,
+                force_scale: float = 0.0,
+                lr_k: float = 0.0):
 
     # -- spectral setup -------------------------------------------------------
     wp_ball = WavepacketObject2D(
@@ -879,14 +928,29 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                              mass=1.0, sigma=ball_sigma,
                              lr=ball_lr, lr_tracking=lr_tracking)
 
-        # -- update wavepackets: shift + LMS + PMF deviation learning ----
+        # -- update wavepackets: predict → correct → learn ----------------
         ball_pos = np.array([ball['x'], ball['y']])
         paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
         paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
 
-        # 1. Propagation: shift by velocity (free-flight kinematics)
+        # 1. PREDICT: env-field force + velocity-based forward step
+        if not scored:
+            nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
+            nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
+            nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
+
+            env_force = wp_ball.predict_force(wp_env, nip_ball_env,
+                                              force_scale=force_scale)
+            ball_vel = np.array([ball['vx'], ball['vy']])
+            predicted_pos = wp_ball.predict_position(ball_vel, dt, env_force)
+        else:
+            nip_ball_env = nip_ball_padL = nip_ball_padR = 0.0
+            predicted_pos = ball_pos.copy()
+
+        # Shift ball wavepacket by velocity (propagation)
         for d in range(2):
             wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
+        # Paddle shifts
         delta_l = left_paddle['y'] - wp_paddle_l.pos[1]
         delta_r = right_paddle['y'] - wp_paddle_r.pos[1]
         if abs(delta_l) > 1e-12:
@@ -894,12 +958,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if abs(delta_r) > 1e-12:
             wp_paddle_r.shift(delta_r, axis=1)
 
-        # 2. Attention-weighted LMS correction (shape only, target=1.0)
+        # 2. CORRECT: attention-weighted LMS toward observed position
         if not scored:
-            nip_ball_env = abs(wp_ball.normalized_inner_product(wp_env))
-            nip_ball_padL = abs(wp_ball.normalized_inner_product(wp_paddle_l))
-            nip_ball_padR = abs(wp_ball.normalized_inner_product(wp_paddle_r))
-
             unity = np.array([1.0, 1.0])
             wp_ball.update_with_attention(
                 ball_pos, unity,
@@ -909,18 +969,19 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             wp_paddle_r.update_with_attention(
                 paddle_r_pos, unity, [nip_ball_padR])
 
-        # 3. Measure integral deviation BEFORE normalizing
-        #    Deviation from PMF=1 reveals environmental interaction
+        # 3. Prediction residual
+        prediction_residual = ball_pos - predicted_pos
+
+        # 4. Measure integral deviation BEFORE normalizing
         ball_deviation = np.array([wp_ball.integrate_squared(d) - 1.0
                                    for d in range(2)])
 
-        # 4. Normalize observed objects back to PMF
+        # 5. Normalize observed objects back to PMF
         wp_ball.normalize()
         wp_paddle_l.normalize()
         wp_paddle_r.normalize()
 
-        # 5. Attribute deviation via NIP soft attention — env only gets
-        #    its fraction; paddle fraction is discarded (observed objects)
+        # 6. Attribute deviation via NIP soft attention — env learns
         deviation_mag = np.linalg.norm(ball_deviation)
         if not scored and deviation_mag > 1e-8:
             total_nip = nip_ball_env + nip_ball_padL + nip_ball_padR + 1e-8
@@ -929,7 +990,11 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                               anomaly_scale=deviation_mag * env_fraction)
             wp_env.normalize()
 
-        # 6. Update stored positions
+        # 7. LEARN: update spatial frequencies from prediction residual
+        if not scored and lr_k > 0:
+            wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=lr_k)
+
+        # 8. Update stored positions
         wp_ball.pos[:] = ball_pos
         wp_paddle_l.pos[:] = paddle_l_pos
         wp_paddle_r.pos[:] = paddle_r_pos

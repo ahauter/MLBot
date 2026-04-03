@@ -23,7 +23,8 @@ from spectral_pong_viz import (
 def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                  lr_critic: float = 1e-1, gamma: float = 0.95,
                  lam: float = 0.9, std: float = 0.3, seed: int = 0,
-                 verbose: bool = True) -> list[int]:
+                 verbose: bool = True,
+                 force_scale: float = 0.0, lr_k: float = 0.0) -> list[int]:
     """Run pong with RL paddles, return list of goal-frame indices."""
     np.random.seed(seed)
     K = 8
@@ -153,11 +154,26 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                              mass=1.0, sigma=0.8,
                              lr=0.15, lr_tracking=0.01)
 
-        # -- Wavepacket updates --
+        # -- Wavepacket updates: predict → correct → learn --
         ball_pos = np.array([ball['x'], ball['y']])
         paddle_l_pos = np.array([paddle_lx, left_paddle['y']])
         paddle_r_pos = np.array([paddle_rx, right_paddle['y']])
 
+        # 1. PREDICT: env-field force + velocity forward step
+        if not scored:
+            nip_env = abs(wp_ball.normalized_inner_product(wp_env))
+            nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
+            nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
+
+            env_force = wp_ball.predict_force(wp_env, nip_env,
+                                              force_scale=force_scale)
+            ball_vel = np.array([ball['vx'], ball['vy']])
+            predicted_pos = wp_ball.predict_position(ball_vel, dt, env_force)
+        else:
+            nip_env = nip_padL = nip_padR = 0.0
+            predicted_pos = ball_pos.copy()
+
+        # Shift ball by velocity (propagation)
         for d in range(2):
             wp_ball.shift([ball['vx'], ball['vy']][d] * dt, axis=d)
         delta_l = left_paddle['y'] - wp_pl.pos[1]
@@ -167,23 +183,25 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
         if abs(delta_r) > 1e-12:
             wp_pr.shift(delta_r, axis=1)
 
+        # 2. CORRECT: LMS toward observed position
         if not scored:
-            nip_env = abs(wp_ball.normalized_inner_product(wp_env))
-            nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
-            nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
-
             unity = np.array([1.0, 1.0])
             wp_ball.update_with_attention(ball_pos, unity,
                                           [nip_env, nip_padL, nip_padR])
             wp_pl.update_with_attention(paddle_l_pos, unity, [nip_padL])
             wp_pr.update_with_attention(paddle_r_pos, unity, [nip_padR])
 
+        # 3. Prediction residual
+        prediction_residual = ball_pos - predicted_pos
+
+        # 4. Deviation + normalize
         ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
                              for d in range(2)])
         wp_ball.normalize()
         wp_pl.normalize()
         wp_pr.normalize()
 
+        # 5. Env learns from deviation
         dev_mag = np.linalg.norm(ball_dev)
         if not scored and dev_mag > 1e-8:
             total_nip = nip_env + nip_padL + nip_padR + 1e-8
@@ -192,6 +210,11 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                               anomaly_scale=dev_mag * env_frac)
             wp_env.normalize()
 
+        # 6. LEARN: update frequencies from prediction error
+        if not scored and lr_k > 0:
+            wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=lr_k)
+
+        # 7. Store positions
         wp_ball.pos[:] = ball_pos
         wp_pl.pos[:] = paddle_l_pos
         wp_pr.pos[:] = paddle_r_pos
