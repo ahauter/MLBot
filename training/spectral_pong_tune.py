@@ -17,6 +17,7 @@ from spectral_pong_viz import (
     PADDLE_X_OFFSET, PADDLE_WIDTH, PADDLE_HEIGHT, PADDLE_SPEED,
     BALL_RADIUS, BALL_SPEED, SPIN_FACTOR,
     COEFF_CLIP, WORLD_BOUNDS, reset_ball,
+    compute_feature_maps, FM_NX, FM_NY,
 )
 
 
@@ -75,6 +76,11 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                                    lr_actor=lr_actor, lr_critic=lr_critic,
                                    gamma=gamma, lam=lam, std=std)
 
+    # Feature map grids for conv state extraction
+    x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
+    y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
+    r_fm = np.linspace(-1.0, 1.0, FM_NY)
+
     # Game state
     ball = {'x': 0.0, 'y': 0.0, 'vx': 0.0, 'vy': 0.0}
     reset_ball(ball, toward='right', speed=ball_speed)
@@ -93,10 +99,12 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             continue
 
         # -- RL paddle movement --
-        rl_state_l = SimpleRLController.build_state(
-            wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_l)
-        rl_state_r = SimpleRLController.build_state(
-            wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_r)
+        fmaps_l = compute_feature_maps(
+            wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l, x_fm, y_fm, r_fm)
+        fmaps_r = compute_feature_maps(
+            wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r, x_fm, y_fm, r_fm)
+        rl_state_l = SimpleRLController.build_state(fmaps_l, rl_left.conv)
+        rl_state_r = SimpleRLController.build_state(fmaps_r, rl_right.conv)
         act_l = rl_left.act(rl_state_l)
         act_r = rl_right.act(rl_state_r)
         left_paddle['y'] += act_l * PADDLE_SPEED * dt
@@ -273,10 +281,14 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
 
         # TD update AFTER wavepacket updates
         if not scored:
-            ns_l = SimpleRLController.build_state(
-                wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_l)
-            ns_r = SimpleRLController.build_state(
-                wp_ball, wp_pl, wp_pr, wp_env, wp_reward=wp_reward_r)
+            ns_fmaps_l = compute_feature_maps(
+                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_l,
+                x_fm, y_fm, r_fm)
+            ns_fmaps_r = compute_feature_maps(
+                wp_ball, wp_env, wp_pl, wp_pr, wp_reward_r,
+                x_fm, y_fm, r_fm)
+            ns_l = SimpleRLController.build_state(ns_fmaps_l, rl_left.conv)
+            ns_r = SimpleRLController.build_state(ns_fmaps_r, rl_right.conv)
             rl_left.step(ns_l, reward)
             rl_right.step(ns_r, -reward)
 

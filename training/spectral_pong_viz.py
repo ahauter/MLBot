@@ -444,6 +444,8 @@ class SimpleRLController:
     """
 
     TRACE_CLIP = 1.0
+    WEIGHT_CLIP = 5.0
+    TD_CLIP = 1.0
 
     # Conv over 6-channel outer-product maps → 8-dim state
     STATE_DIM = 8
@@ -590,19 +592,28 @@ class SimpleRLController:
         v_prev = self._value(self.prev_state)
         v_curr = self._value(state)
         td_error = reward + self.gamma * v_curr - v_prev
+        td_error = np.clip(td_error, -self.TD_CLIP, self.TD_CLIP)
         self.last_td_error = td_error
 
         # Accumulate critic trace: e_c = γλ·e_c + ∇V(s) = γλ·e_c + s
-        self.trace_c_w = self.gamma * self.lam * self.trace_c_w + self.prev_state
-        self.trace_c_b = self.gamma * self.lam * self.trace_c_b + 1.0
+        self.trace_c_w = np.clip(
+            self.gamma * self.lam * self.trace_c_w + self.prev_state,
+            -self.TRACE_CLIP, self.TRACE_CLIP)
+        self.trace_c_b = np.clip(
+            self.gamma * self.lam * self.trace_c_b + 1.0,
+            -self.TRACE_CLIP, self.TRACE_CLIP)
 
         # Critic update via trace: w_c += lr_c · δ · e_c
         self.w_c += self.lr_critic * td_error * self.trace_c_w
         self.b_c += self.lr_critic * td_error * self.trace_c_b
+        np.clip(self.w_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=self.w_c)
+        self.b_c = np.clip(self.b_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
 
         # Actor update via trace: w_a += lr_a · δ · e_a
         self.w_a += self.lr_actor * td_error * self.trace_a_w
         self.b_a += self.lr_actor * td_error * self.trace_a_b
+        np.clip(self.w_a, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=self.w_a)
+        self.b_a = np.clip(self.b_a, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
 
         # Conv update: combine actor trace with critic gradient at prev_state
         if self._act_patches is not None:
@@ -614,6 +625,10 @@ class SimpleRLController:
                 self.trace_conv_w + grad_conv_c_w.reshape(self.conv.W.shape))
             self.conv.b += self.lr_conv * td_error * (
                 self.trace_conv_b + grad_conv_c_b)
+            np.clip(self.conv.W, -self.WEIGHT_CLIP, self.WEIGHT_CLIP,
+                    out=self.conv.W)
+            np.clip(self.conv.b, -self.WEIGHT_CLIP, self.WEIGHT_CLIP,
+                    out=self.conv.b)
 
         self.prev_state = state.copy()
 
