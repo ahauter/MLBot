@@ -72,6 +72,7 @@ PADDLE_SPEED = 4.0
 BALL_RADIUS = 0.15
 BALL_SPEED = 2.0
 SPIN_FACTOR = 2.0
+HIT_REWARD = 0.1
 
 
 # -- WavepacketObject2D ------------------------------------------------------
@@ -345,17 +346,21 @@ class SimpleRLController:
 
     TRACE_CLIP = 1.0
 
-    STATE_DIM = 14
+    # 5 objects → C(5,2)=10 pairs × 9 (3×3 outer product) = 90
+    _SCENE_NAMES = ['ball', 'padL', 'padR', 'env', 'rew']
+    STATE_DIM = 90
     STATE_LABELS = [
-        'nip_env', 'nip_padL', 'nip_padR', 'nip_reward',
-        'nip_x_env_x', 'nip_x_env_y', 'nip_x_env_r',
-        'nip_x_padL_x', 'nip_x_padL_y', 'nip_x_padL_r',
-        'nip_x_padR_x', 'nip_x_padR_y', 'nip_x_padR_r',
-        'reward_cross',
+        f'{n0}/{n1}[{di},{dc}]'
+        for n0, n1 in [
+            ('ball','padL'),('ball','padR'),('ball','env'),('ball','rew'),
+            ('padL','padR'),('padL','env'),('padL','rew'),
+            ('padR','env'),('padR','rew'),('env','rew'),
+        ]
+        for di in range(3) for dc in range(3)
     ]
 
-    def __init__(self, state_dim: int, lr_actor: float = 1e-2,
-                 lr_critic: float = 1e-1, gamma: float = 0.95,
+    def __init__(self, state_dim: int, lr_actor: float = 1e-3,
+                 lr_critic: float = 1e-2, gamma: float = 0.95,
                  lam: float = 0.9, std: float = 0.3,
                  K: int = 8, frequencies: np.ndarray | None = None,
                  **_kwargs):
@@ -384,7 +389,11 @@ class SimpleRLController:
         self.rw_k = np.asarray(frequencies, dtype=np.float64)
         self.rw_c_cos = np.zeros(K, dtype=np.float64)
         self.rw_c_sin = np.zeros(K, dtype=np.float64)
-        self.rw_lr = 0.1
+        self.rw_lr = 0.01
+        # EMA feature normalization
+        self.feat_mean = np.zeros(state_dim)
+        self.feat_var = np.ones(state_dim)
+        self._feat_ema_alpha = 0.01
         # Diagnostics
         self.last_mean = 0.0
         self.last_action = 0.0
@@ -409,47 +418,30 @@ class SimpleRLController:
 
     @staticmethod
     def build_state(wp_ball, wp_paddle_l, wp_paddle_r,
-                    wp_env, wp_reward=None,
-                    reward_pred: float = 0.0) -> np.ndarray:
-        """14-dim spectral interaction features.
+                    wp_env, wp_reward=None, **_) -> np.ndarray:
+        """90-dim pairwise spectral state.
 
-        Cross products use entity.cross(ball) for correct sign convention
-        (positive = ball is above/right of entity) and are weighted by
-        NIP so directional signal is stronger when objects are nearby.
-
-        Reward field cross product dim 2 gives signed reward prediction.
+        For each unordered pair (A, B) of the 5 scene objects, compute
+        np.outer(inner_product(A,B), cross_product(A,B)) → (3,3) → flatten (9,).
+        10 pairs × 9 = 90 features total.
         """
-        nip_env = wp_ball.normalized_inner_product(wp_env)
-        nip_padL = wp_ball.normalized_inner_product(wp_paddle_l)
-        nip_padR = wp_ball.normalized_inner_product(wp_paddle_r)
+        objects = [wp_ball, wp_paddle_l, wp_paddle_r, wp_env]
         if wp_reward is not None:
-            nip_rew = wp_ball.normalized_inner_product(wp_reward)
-            rew_cross = nip_rew * wp_reward.cross_product(wp_ball)
-            # Only the reward dim (index 2) matters for reward signal
-            reward_signal = float(rew_cross[2]) if len(rew_cross) > 2 else 0.0
-        else:
-            nip_rew = 0.0
-            reward_signal = reward_pred
-        return np.array([
-            nip_env, nip_padL, nip_padR, nip_rew,
-            *(nip_env * wp_env.cross_product(wp_ball)),
-            *(nip_padL * wp_paddle_l.cross_product(wp_ball)),
-            *(nip_padR * wp_paddle_r.cross_product(wp_ball)),
-            reward_signal,
-        ])
-
-    # NIPs are in [0,1], NIP×cross products peak at ~0.08
-    _FEAT_SCALE = np.array([
-        1.0, 1.0, 1.0, 1.0,     # NIPs already [0,1]
-        12.0, 12.0, 12.0,        # nip×cross_env  (3 dims now)
-        12.0, 12.0, 12.0,        # nip×cross_padL
-        12.0, 12.0, 12.0,        # nip×cross_padR
-        1.0,                      # reward_cross already ~[-1,1]
-    ])
+            objects.append(wp_reward)
+        feats = []
+        for i in range(len(objects)):
+            for j in range(i + 1, len(objects)):
+                ip = objects[i].inner_product(objects[j])   # (3,)
+                cp = objects[i].cross_product(objects[j])   # (3,)
+                feats.append(np.outer(ip, cp).flatten())    # (9,)
+        return np.concatenate(feats)  # (90,)
 
     def _normalize(self, state: np.ndarray) -> np.ndarray:
-        """Scale features to O(1) range."""
-        return state * self._FEAT_SCALE
+        """EMA per-feature standardization: zero mean, unit variance."""
+        a = self._feat_ema_alpha
+        self.feat_mean = (1 - a) * self.feat_mean + a * state
+        self.feat_var = (1 - a) * self.feat_var + a * (state - self.feat_mean) ** 2
+        return (state - self.feat_mean) / (np.sqrt(self.feat_var) + 1e-8)
 
     def _value(self, state: np.ndarray) -> float:
         return float(self.w_c @ state + self.b_c)
@@ -570,9 +562,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         sigma=0.5, amplitude=1.0, ndim=NDIM,
         lr=paddle_lr, lr_tracking=lr_tracking * 2)
 
-    # Env field: basis [1,0,0] and [0,1,0] — acts on x,y only, not reward
+    # Env field: basis [0,1,0] only — acts on y only (cheat: x axis disabled)
     env_c_cos = np.zeros((K, NDIM))
-    env_c_cos[0, 0] = 1.0  # frequency 0 → x
+    # env_c_cos[0, 0] = 1.0  # frequency 0 → x  (disabled)
     env_c_cos[1, 1] = 1.0  # frequency 1 → y
     wp_env = WavepacketObject2D(
         K, frequencies, pos0=(0.0, 0.0, 0.0), mass=1e6, ndim=NDIM,
@@ -611,7 +603,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     key_times: dict[str, float] = {}
     paddle_vel = {'l': 0.0, 'r': 0.0}
     state = {'freeze': 0, 't': 0,
-             'anomaly': np.zeros(NDIM), 'max_anomaly': 1.0}
+             'anomaly': np.zeros(NDIM), 'max_anomaly': 1.0,
+             'rally_touches': 0, 'total_touches': 0,
+             'last_rally': 0, 'rally_lengths': []}
 
     window = 200
     anomaly_hist = deque(maxlen=window)
@@ -752,6 +746,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     frame_text = ax_court.text(0.98, 0.02, '', transform=ax_court.transAxes,
                                color='#555', fontsize=8,
                                horizontalalignment='right')
+    stats_text = ax_court.text(0.02, 0.02, '', transform=ax_court.transAxes,
+                               color='#aaa', fontsize=8,
+                               horizontalalignment='left')
 
     # -- reward field heatmap overlay -------------------------------------------
     HM_NX = 50
@@ -772,28 +769,32 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
 
     if spectral_paddle:
 
-        # Input features: 10-dim spectral interaction bar chart
+        # Input features: 90-dim pairwise outer-product bar chart
+        # Label one tick per pair group (every 9 features)
         n_feat = SimpleRLController.STATE_DIM
+        _pair_names = [
+            'b/pL','b/pR','b/env','b/rew',
+            'pL/pR','pL/env','pL/rew',
+            'pR/env','pR/rew','env/rew',
+        ]
+        _pair_ticks = [i * 9 + 4 for i in range(10)]  # centre of each 9-bar group
         feat_bars = ax_input.barh(range(n_feat), np.zeros(n_feat),
                                   color=BALL_COLOR, height=0.7)
         debug_heatmap = list(feat_bars)  # reuse name, now a list of bars
         ax_input.set_xlim(-1.2, 1.2)
-        ax_input.set_yticks(range(n_feat))
-        ax_input.set_yticklabels(SimpleRLController.STATE_LABELS,
-                                 fontsize=6, color=LABEL_COLOR)
+        ax_input.set_yticks(_pair_ticks)
+        ax_input.set_yticklabels(_pair_names, fontsize=6, color=LABEL_COLOR)
         ax_input.axvline(0, color='#333', lw=0.5)
         ax_input.invert_yaxis()
-        ax_input.set_title('Spectral Features (9d)',
-                           color=TITLE_COLOR, fontsize=9)
+        ax_input.set_title('Spectral Features (90d)', color=TITLE_COLOR, fontsize=9)
 
         # Weights — left controller
         bars_l = ax_hid_l.barh(range(n_feat), np.zeros(n_feat),
                                color=PADDLE_COLOR_L, height=0.7)
         debug_bars_l = list(bars_l)
         ax_hid_l.set_xlim(-1.0, 1.0)
-        ax_hid_l.set_yticks(range(n_feat))
-        ax_hid_l.set_yticklabels(SimpleRLController.STATE_LABELS,
-                                 fontsize=5, color=LABEL_COLOR)
+        ax_hid_l.set_yticks(_pair_ticks)
+        ax_hid_l.set_yticklabels(_pair_names, fontsize=5, color=LABEL_COLOR)
         ax_hid_l.axvline(0, color='#333', lw=0.5)
         ax_hid_l.set_title('L Weights', color=PADDLE_COLOR_L, fontsize=9)
         ax_hid_l.invert_yaxis()
@@ -803,9 +804,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                color=PADDLE_COLOR_R, height=0.7)
         debug_bars_r = list(bars_r)
         ax_hid_r.set_xlim(-1.0, 1.0)
-        ax_hid_r.set_yticks(range(n_feat))
-        ax_hid_r.set_yticklabels(SimpleRLController.STATE_LABELS,
-                                 fontsize=5, color=LABEL_COLOR)
+        ax_hid_r.set_yticks(_pair_ticks)
+        ax_hid_r.set_yticklabels(_pair_names, fontsize=5, color=LABEL_COLOR)
         ax_hid_r.axvline(0, color='#333', lw=0.5)
         ax_hid_r.set_title('R Weights', color=PADDLE_COLOR_R, fontsize=9)
         ax_hid_r.invert_yaxis()
@@ -855,6 +855,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         ly_dot.set_data([], [])
         ball_dot.set_data([], [])
         frame_text.set_text('')
+        stats_text.set_text('')
         return ()
 
     def step(_frame):
@@ -910,6 +911,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                                     COURT_BOTTOM + half_h, COURT_TOP - half_h)
 
         # -- Newtonian ball step ------------------------------------------
+        touch_reward_l = 0.0
+        touch_reward_r = 0.0
         vx_before, vy_before = ball['vx'], ball['vy']
 
         ball['x'] += ball['vx'] * dt
@@ -935,6 +938,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             spd = np.hypot(ball['vx'], ball['vy'])
             ball['vx'] *= ball_speed / spd
             ball['vy'] *= ball_speed / spd
+            state['rally_touches'] += 1
+            state['total_touches'] += 1
+            touch_reward_l = HIT_REWARD
 
         # Right paddle collision
         if (ball['vx'] > 0
@@ -948,6 +954,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             spd = np.hypot(ball['vx'], ball['vy'])
             ball['vx'] *= ball_speed / spd
             ball['vy'] *= ball_speed / spd
+            state['rally_touches'] += 1
+            state['total_touches'] += 1
+            touch_reward_r = HIT_REWARD
 
         vx_after, vy_after = ball['vx'], ball['vy']
 
@@ -964,6 +973,9 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             scored = True
 
         if scored:
+            state['last_rally'] = state['rally_touches']
+            state['rally_lengths'].append(state['rally_touches'])
+            state['rally_touches'] = 0
             # Replay reward frame N times through predict→correct→learn
             goal_pos_rew = np.array([ball['x'], ball['y'], reward])
             goal_vel = np.array([0.0, 0.0, 0.0])  # ball stopped at goal
@@ -1009,8 +1021,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
                 rl_right.step(term_state, -reward)
                 rl_left.on_reset()
                 rl_right.on_reset()
-            reset_ball(ball, toward='left' if reward < 0 else 'right',
-                       speed=ball_speed)
+            reset_ball(ball, toward='random', speed=ball_speed)
             state['freeze'] = int(0.5 / dt)
             paddle_vel['l'] = 0.0
             paddle_vel['r'] = 0.0
@@ -1079,13 +1090,22 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         wp_paddle_l.normalize()
         wp_paddle_r.normalize()
 
-        # 6. Attribute deviation via NIP soft attention — env learns
-        deviation_mag = np.linalg.norm(ball_deviation[:2])  # physics dims only
-        if not scored and deviation_mag > 1e-8:
+        # 6. Env learns from prediction residual (velocity explained → only structural
+        #    events like wall bounces drive env, not free-flight kinetic motion).
+        #    Restrict to Y axis only to match env basis [0,1,0].
+        pred_res_y = np.zeros(NDIM)
+        pred_res_y[1] = prediction_residual[1]  # Y only
+        pred_res_mag = abs(prediction_residual[1])
+        if not scored and pred_res_mag > 1e-8:
             total_nip = nip_ball_env + nip_ball_padL + nip_ball_padR + 1e-8
             env_fraction = nip_ball_env / total_nip
-            wp_env.update_lms(ball_pos, ball_deviation,
-                              anomaly_scale=deviation_mag * env_fraction)
+            wp_env.update_lms(ball_pos, pred_res_y,
+                              anomaly_scale=pred_res_mag * env_fraction)
+            # Hard-enforce Y-only basis: zero out X and reward dims
+            wp_env.c_cos[:, 0] = 0.0
+            wp_env.c_sin[:, 0] = 0.0
+            wp_env.c_cos[:, 2] = 0.0
+            wp_env.c_sin[:, 2] = 0.0
             wp_env.normalize()
 
         # 7. LEARN: update spatial frequencies from prediction residual
@@ -1105,8 +1125,8 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
             ns_r = SimpleRLController.build_state(
                 wp_ball, wp_paddle_l, wp_paddle_r, wp_env,
                 wp_reward=wp_reward_r)
-            rl_left.step(ns_l, reward)
-            rl_right.step(ns_r, -reward)
+            rl_left.step(ns_l, touch_reward_l)
+            rl_right.step(ns_r, touch_reward_r)
 
         # Deviation magnitude for display
         a_residual = ball_deviation
@@ -1140,6 +1160,15 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         score_text.set_text(
             f'{left_paddle["score"]} \u2014 {right_paddle["score"]}')
         frame_text.set_text(f't={t}')
+        rally_lengths = state['rally_lengths']
+        avg_rally = (sum(rally_lengths) / len(rally_lengths)
+                     if rally_lengths else 0.0)
+        stats_text.set_text(
+            f'touches: {state["total_touches"]}  '
+            f'rally: {state["rally_touches"]}  '
+            f'last: {state["last_rally"]}  '
+            f'avg: {avg_rally:.1f}'
+        )
 
         # Anomaly arrow on court
         if anomaly_arrow[0] is not None:
@@ -1165,14 +1194,14 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         if spectral_paddle and debug_heatmap is not None:
             # Input features bar chart
             for i, bar in enumerate(debug_heatmap):
-                bar.set_width(rl_state[i])
+                bar.set_width(rl_state_l[i])
 
             # Hidden activations
             # Weights
             for i, bar in enumerate(debug_bars_l):
-                bar.set_width(rl_left.w[i])
+                bar.set_width(rl_left.w_a[i])
             for i, bar in enumerate(debug_bars_r):
-                bar.set_width(rl_right.w[i])
+                bar.set_width(rl_right.w_a[i])
 
             # Output gauges
             debug_mean_l.set_xdata([rl_left.last_mean])
