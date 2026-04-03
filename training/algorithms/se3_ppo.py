@@ -68,11 +68,19 @@ class SE3PPOAlgorithm(Algorithm):
         _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(_device)
 
-        self.momentum_mode = params.get('momentum_mode', 'both')
+        self.momentum_mode = params.get('momentum_mode', 'correction')
 
         # Networks
         self.encoder = SE3Encoder(momentum_mode=self.momentum_mode)
         self.policy = StochasticSE3Policy(obs_dim=EMBED_DIM)
+
+        # Optionally load pretrained encoder weights (Axis 5 intervention)
+        pretrained_path = params.get('pretrained_encoder')
+        if pretrained_path is not None:
+            state = torch.load(pretrained_path, map_location='cpu', weights_only=True)
+            self.encoder.load_state_dict(state)
+            print(f'[SE3PPO] Loaded pretrained encoder from {pretrained_path}')
+
         self.encoder.to(self.device)
         self.policy.to(self.device)
 

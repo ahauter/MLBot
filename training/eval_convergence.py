@@ -43,6 +43,7 @@ from se3_field import (
     SE3Encoder,
     ACCEL_HIST_DIM,
     COEFF_DIM,
+    EMBED_DIM,
     D_AMP,
     N_OBJECTS,
     OBJECTS,
@@ -112,6 +113,8 @@ def evaluate_convergence(
     residual_sum = torch.zeros(window_len, N_OBJECTS, D_AMP, device=device)
     delta_norm_sum = torch.zeros(window_len, N_OBJECTS, device=device)
     surprise_norm_sum = torch.zeros(window_len, N_OBJECTS, device=device)
+    embed_norm_sum = torch.zeros(window_len, device=device)
+    embed_var_sum = torch.zeros(window_len, device=device)
     n_windows = 0
     t0 = time.time()
 
@@ -147,6 +150,11 @@ def evaluate_convergence(
                 delta_norm_sum[t] += accel_delta.norm(dim=-1).mean(dim=0)      # (N_OBJECTS,)
                 surprise_norm_sum[t] += accel_surprise.norm(dim=-1).mean(dim=0)
 
+                # Policy embedding metrics (exercises correction path)
+                embed, _, _ = encoder.encode_for_policy(packed)
+                embed_norm_sum[t] += embed.norm(dim=-1).mean()          # scalar
+                embed_var_sum[t] += embed.var(dim=-1).mean()            # scalar
+
                 coefficients = new_coeff.detach()
                 accel_hist = new_accel_hist.detach()
 
@@ -180,6 +188,8 @@ def evaluate_convergence(
     # Momentum signal curves
     delta_norm_curve = (delta_norm_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
     surprise_norm_curve = (surprise_norm_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
+    embed_norm_curve = (embed_norm_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
+    embed_var_curve = (embed_var_sum / max(n_windows, 1)).cpu().numpy().astype(np.float32)
 
     return {
         "residual_curve": residual_curve,
@@ -190,6 +200,8 @@ def evaluate_convergence(
         "dim_summary": final_residual.mean(axis=0),
         "delta_norm_curve": delta_norm_curve,       # (W, N_OBJECTS)
         "surprise_norm_curve": surprise_norm_curve,  # (W, N_OBJECTS)
+        "embed_norm_curve": embed_norm_curve,        # (W,)
+        "embed_var_curve": embed_var_curve,          # (W,)
         "n_windows": n_windows,
         "window_len": window_len,
     }
@@ -198,7 +210,8 @@ def evaluate_convergence(
 # ── reporting ─────────────────────────────────────────────────────────────────
 
 
-def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
+def print_report(results: Dict[str, np.ndarray], label: str = "",
+                 momentum_mode: str = "correction") -> None:
     """Print a formatted convergence report."""
     W = results["window_len"]
     n = results["n_windows"]
@@ -210,6 +223,7 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
     print(header)
     print(f"{'=' * 60}")
     steady_start = int(W * 0.75)
+    print(f"Momentum mode: {momentum_mode}")
     print(f"Windows evaluated: {n}")
     print(f"Window length: {W} steps")
 
@@ -242,6 +256,17 @@ def print_report(results: Dict[str, np.ndarray], label: str = "") -> None:
             name = OBJECTS[obj]
             print(f"  {name:<12s} {delta_ss[obj]:8.6f} {surprise_ss[obj]:10.6f}")
 
+    # Policy embedding stats
+    if "embed_norm_curve" in results:
+        embed_norm = results["embed_norm_curve"]
+        embed_var = results["embed_var_curve"]
+        print(f"\nPolicy Embedding (EMBED_DIM={EMBED_DIM}):")
+        print(f"  Mean L2 norm (final step):  {embed_norm[-1]:.6f}")
+        print(f"  Mean L2 norm (steady-state): {embed_norm[steady_start:].mean():.6f}")
+        print(f"  Std of norm across window:  {embed_norm.std():.6f}")
+        print(f"  Mean variance (final step):  {embed_var[-1]:.6f}")
+        print(f"  Mean variance (steady-state):{embed_var[steady_start:].mean():.6f}")
+
     overall = results["final_residual"].mean()
     n_converged = (results["convergence_step"] < W).sum()
     print(
@@ -268,8 +293,10 @@ def save_plot(
     curve = results["residual_curve"]   # (W, N_OBJECTS, D_AMP)
     W = curve.shape[0]
     steps = np.arange(W)
+    has_embed = "embed_norm_curve" in results
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    ncols = 3 if has_embed else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 5))
 
     ax = axes[0]
     for obj in range(N_OBJECTS):
@@ -310,6 +337,21 @@ def save_plot(
     ax.legend(fontsize=8)
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
+
+    if has_embed:
+        ax = axes[2]
+        ax.plot(steps, results["embed_norm_curve"], label="L2 norm", linewidth=1.5)
+        ax.plot(steps, results["embed_var_curve"], label="variance", linewidth=1.5)
+        if compare_results is not None and "embed_norm_curve" in compare_results:
+            ax.plot(steps, compare_results["embed_norm_curve"], ":",
+                    alpha=0.5, label="L2 norm (random)")
+            ax.plot(steps, compare_results["embed_var_curve"], ":",
+                    alpha=0.5, label="variance (random)")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Value")
+        ax.set_title("Policy Embedding")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(path, dpi=150)
@@ -357,6 +399,11 @@ def main():
         help="Number of .npz files to load at a time",
     )
     parser.add_argument(
+        "--momentum-mode", type=str, default="correction",
+        choices=["additive", "correction", "both"],
+        help="SE3Encoder momentum mode (default: correction)",
+    )
+    parser.add_argument(
         "--plot", type=str, default=None,
         help="Save convergence plot to this path (e.g. convergence.png)",
     )
@@ -365,7 +412,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    encoder = SE3Encoder()
+    encoder = SE3Encoder(momentum_mode=args.momentum_mode)
     if args.encoder:
         print(f"Loading encoder from {args.encoder}...")
         state = torch.load(args.encoder, map_location="cpu", weights_only=True)
@@ -386,14 +433,15 @@ def main():
 
     print(f"\nEvaluating ({label})...")
     results = evaluate_convergence(encoder, **eval_kwargs)
-    print_report(results, label=label)
+    print_report(results, label=label, momentum_mode=args.momentum_mode)
 
     compare_results = None
     if args.compare_random and args.encoder:
         print("Evaluating (random init)...")
-        random_encoder = SE3Encoder()
+        random_encoder = SE3Encoder(momentum_mode=args.momentum_mode)
         compare_results = evaluate_convergence(random_encoder, **eval_kwargs)
-        print_report(compare_results, label="random init")
+        print_report(compare_results, label="random init",
+                     momentum_mode=args.momentum_mode)
 
     if args.plot:
         save_plot(results, args.plot, compare_results=compare_results)

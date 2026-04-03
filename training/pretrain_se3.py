@@ -121,7 +121,7 @@ def pretrain(args):
         num_workers=0, pin_memory=(device.type == 'cuda'))
 
     # Encoder
-    encoder = SE3Encoder().to(device)
+    encoder = SE3Encoder(momentum_mode=args.momentum_mode).to(device)
     encoder.train()
 
     # Optimizer — field geometry + optionally conv params
@@ -274,6 +274,9 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output', type=str, default='models/pretrained_se3/')
+    parser.add_argument('--momentum-mode', type=str, default='correction',
+                        choices=['additive', 'correction', 'both'],
+                        help='SE3Encoder momentum mode (default: correction)')
     parser.add_argument('--pretrain-conv', action='store_true',
                         help='Also pretrain interaction conv parameters')
     parser.add_argument('--wandb', action='store_true',

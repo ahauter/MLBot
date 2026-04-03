@@ -1561,6 +1561,11 @@ def main():
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--total-steps', type=int, default=None)
     parser.add_argument('--num-envs', type=int, default=None)
+    parser.add_argument('--momentum-mode', type=str, default=None,
+                        choices=['additive', 'correction', 'both'],
+                        help='SE3Encoder momentum mode (passed to algorithm params)')
+    parser.add_argument('--pretrained-encoder', type=str, default=None,
+                        help='Path to pretrained SE3Encoder state_dict (.pt)')
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable W&B logging')
     parser.add_argument('--resume', action='store_true',
@@ -1599,6 +1604,14 @@ def main():
             config['total_steps'] = args.total_steps
         if args.num_envs is not None:
             config['num_envs'] = args.num_envs
+
+    # Inject SE3 params into algorithm config
+    if args.momentum_mode is not None or args.pretrained_encoder is not None:
+        algo_params = config.setdefault('algorithm', {}).setdefault('params', {})
+        if args.momentum_mode is not None:
+            algo_params['momentum_mode'] = args.momentum_mode
+        if args.pretrained_encoder is not None:
+            algo_params['pretrained_encoder'] = args.pretrained_encoder
 
     if args.no_wandb:
         config.setdefault('logger', {})['params'] = {'enabled': False}
