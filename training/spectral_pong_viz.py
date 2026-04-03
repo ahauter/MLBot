@@ -721,45 +721,19 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
     y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
     r_fm = np.linspace(-1.0, 1.0, FM_NY)  # reward domain, same height
 
-    if spectral_paddle:
-        fig = plt.figure(figsize=(15, 11))
-        fig.patch.set_facecolor(BG_COLOR)
-        fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
-                     color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
-        gs = fig.add_gridspec(3, 1, height_ratios=[1, 3, 0.6],
-                              hspace=0.25,
-                              left=0.04, right=0.97, top=0.93, bottom=0.04)
-        # Top row: 6 feature map thumbnails
-        gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
-                                        wspace=0.15)
-        ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
-        ax_court = fig.add_subplot(gs[1, 0])
+    fig = plt.figure(figsize=(15, 9))
+    fig.patch.set_facecolor(BG_COLOR)
+    fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
+                 color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 3],
+                          hspace=0.2,
+                          left=0.04, right=0.97, top=0.93, bottom=0.05)
+    gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
+                                    wspace=0.15)
+    ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
+    ax_court = fig.add_subplot(gs[1, 0])
 
-        # Debug strip: [input heatmap | L hidden | L out | R hidden | R out]
-        gs_dbg = GridSpecFromSubplotSpec(
-            1, 5, subplot_spec=gs[2, 0],
-            width_ratios=[4, 2, 1, 2, 1], wspace=0.4)
-        ax_input = fig.add_subplot(gs_dbg[0, 0])
-        ax_hid_l = fig.add_subplot(gs_dbg[0, 1])
-        ax_out_l = fig.add_subplot(gs_dbg[0, 2])
-        ax_hid_r = fig.add_subplot(gs_dbg[0, 3])
-        ax_out_r = fig.add_subplot(gs_dbg[0, 4])
-        debug_axes = [ax_input, ax_hid_l, ax_out_l, ax_hid_r, ax_out_r]
-    else:
-        fig = plt.figure(figsize=(15, 9))
-        fig.patch.set_facecolor(BG_COLOR)
-        fig.suptitle('Spectral Pong — 2D Outer-Product Feature Maps',
-                     color=TITLE_COLOR, fontsize=14, fontweight='bold', y=0.98)
-        gs = fig.add_gridspec(2, 1, height_ratios=[1, 3],
-                              hspace=0.2,
-                              left=0.04, right=0.97, top=0.93, bottom=0.05)
-        gs_fm = GridSpecFromSubplotSpec(1, FM_CHANNELS, subplot_spec=gs[0, 0],
-                                        wspace=0.15)
-        ax_fmaps = [fig.add_subplot(gs_fm[0, i]) for i in range(FM_CHANNELS)]
-        ax_court = fig.add_subplot(gs[1, 0])
-        debug_axes = []
-
-    for ax in ax_fmaps + [ax_court] + debug_axes:
+    for ax in ax_fmaps + [ax_court]:
         ax.set_facecolor(BG_COLOR)
         ax.tick_params(colors='#555', labelsize=7)
         for spine in ax.spines.values():
@@ -840,86 +814,6 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         origin='lower', aspect='auto', cmap='RdYlGn',
         alpha=0.25, vmin=-2.0, vmax=2.0, zorder=0,
         interpolation='bilinear')
-
-    # -- debug strip artists (only when spectral_paddle) ----------------------
-    debug_heatmap = None
-    debug_bars_l = []
-    debug_bars_r = []
-    debug_mean_l = debug_act_l = debug_text_l = None
-    debug_mean_r = debug_act_r = debug_text_r = None
-
-    if spectral_paddle:
-
-        # Input features: 90-dim pairwise outer-product bar chart
-        # Label one tick per pair group (every 9 features)
-        n_feat = SimpleRLController.STATE_DIM
-        _pair_names = [
-            'b/pL','b/pR','b/env','b/rew',
-            'pL/pR','pL/env','pL/rew',
-            'pR/env','pR/rew','env/rew',
-        ]
-        _pair_ticks = [i * 9 + 4 for i in range(10)]  # centre of each 9-bar group
-        feat_bars = ax_input.barh(range(n_feat), np.zeros(n_feat),
-                                  color=BALL_COLOR, height=0.7)
-        debug_heatmap = list(feat_bars)  # reuse name, now a list of bars
-        ax_input.set_xlim(-1.2, 1.2)
-        ax_input.set_yticks(_pair_ticks)
-        ax_input.set_yticklabels(_pair_names, fontsize=6, color=LABEL_COLOR)
-        ax_input.axvline(0, color='#333', lw=0.5)
-        ax_input.invert_yaxis()
-        ax_input.set_title('Spectral Features (90d)', color=TITLE_COLOR, fontsize=9)
-
-        # Weights — left controller
-        bars_l = ax_hid_l.barh(range(n_feat), np.zeros(n_feat),
-                               color=PADDLE_COLOR_L, height=0.7)
-        debug_bars_l = list(bars_l)
-        ax_hid_l.set_xlim(-1.0, 1.0)
-        ax_hid_l.set_yticks(_pair_ticks)
-        ax_hid_l.set_yticklabels(_pair_names, fontsize=5, color=LABEL_COLOR)
-        ax_hid_l.axvline(0, color='#333', lw=0.5)
-        ax_hid_l.set_title('L Weights', color=PADDLE_COLOR_L, fontsize=9)
-        ax_hid_l.invert_yaxis()
-
-        # Weights — right controller
-        bars_r = ax_hid_r.barh(range(n_feat), np.zeros(n_feat),
-                               color=PADDLE_COLOR_R, height=0.7)
-        debug_bars_r = list(bars_r)
-        ax_hid_r.set_xlim(-1.0, 1.0)
-        ax_hid_r.set_yticks(_pair_ticks)
-        ax_hid_r.set_yticklabels(_pair_names, fontsize=5, color=LABEL_COLOR)
-        ax_hid_r.axvline(0, color='#333', lw=0.5)
-        ax_hid_r.set_title('R Weights', color=PADDLE_COLOR_R, fontsize=9)
-        ax_hid_r.invert_yaxis()
-
-        # Output gauge — left: bar for mean, dot for action
-        ax_out_l.set_xlim(-1.2, 1.2)
-        ax_out_l.set_ylim(-0.5, 0.5)
-        ax_out_l.axvline(0, color='#333', lw=0.5)
-        debug_mean_l, = ax_out_l.plot([0], [0], 's', color=PADDLE_COLOR_L,
-                                      markersize=12, alpha=0.4)
-        debug_act_l, = ax_out_l.plot([0], [0], 'o', color=PADDLE_COLOR_L,
-                                     markersize=8, zorder=5)
-        debug_text_l = ax_out_l.text(0, -0.35, '0.00', color=PADDLE_COLOR_L,
-                                     fontsize=8, ha='center')
-        ax_out_l.set_yticks([])
-        ax_out_l.set_xticks([-1, 0, 1])
-        ax_out_l.tick_params(labelsize=6)
-        ax_out_l.set_title('L Act', color=PADDLE_COLOR_L, fontsize=9)
-
-        # Output gauge — right
-        ax_out_r.set_xlim(-1.2, 1.2)
-        ax_out_r.set_ylim(-0.5, 0.5)
-        ax_out_r.axvline(0, color='#333', lw=0.5)
-        debug_mean_r, = ax_out_r.plot([0], [0], 's', color=PADDLE_COLOR_R,
-                                      markersize=12, alpha=0.4)
-        debug_act_r, = ax_out_r.plot([0], [0], 'o', color=PADDLE_COLOR_R,
-                                     markersize=8, zorder=5)
-        debug_text_r = ax_out_r.text(0, -0.35, '0.00', color=PADDLE_COLOR_R,
-                                     fontsize=8, ha='center')
-        ax_out_r.set_yticks([])
-        ax_out_r.set_xticks([-1, 0, 1])
-        ax_out_r.tick_params(labelsize=6)
-        ax_out_r.set_title('R Act', color=PADDLE_COLOR_R, fontsize=9)
 
     # -- keyboard -------------------------------------------------------------
     def on_key_press(event):
@@ -1257,29 +1151,7 @@ def create_game(K: int, frequencies: np.ndarray, alpha: float,
         rew_vals = wp_reward_l.evaluate(r_dom_hm, axis=2)
         reward_heatmap.set_array(rew_vals.reshape(1, -1))
 
-        # -- update debug strip -------------------------------------------
-        if spectral_paddle and debug_heatmap is not None:
-            # Input features bar chart
-            for i, bar in enumerate(debug_heatmap):
-                bar.set_width(rl_state_l[i])
 
-            # Hidden activations
-            # Weights
-            for i, bar in enumerate(debug_bars_l):
-                bar.set_width(rl_left.w_a[i])
-            for i, bar in enumerate(debug_bars_r):
-                bar.set_width(rl_right.w_a[i])
-
-            # Output gauges
-            debug_mean_l.set_xdata([rl_left.last_mean])
-            debug_act_l.set_xdata([rl_left.last_action])
-            debug_text_l.set_text(f'{rl_left.last_action:+.2f}')
-            debug_text_l.set_x(rl_left.last_action)
-
-            debug_mean_r.set_xdata([rl_right.last_mean])
-            debug_act_r.set_xdata([rl_right.last_action])
-            debug_text_r.set_text(f'{rl_right.last_action:+.2f}')
-            debug_text_r.set_x(rl_right.last_action)
 
         return ()
 
