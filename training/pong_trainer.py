@@ -198,8 +198,8 @@ class PongEnv:
                              c_sin=np.zeros((K, NDIM)),
                              lr=0.15, lr_tracking=0.0)
 
-    def _update_wavepackets(self, scored: bool = False):
-        """Full wavepacket update: predict → shift → correct → deviation → env learn."""
+    def _update_wavepackets(self, scored: bool = False, reward: float = 0.0):
+        """Full wavepacket update: predict → shift → correct → deviation → env learn → reward learn."""
         NDIM = self._NDIM
         ball_pos = np.array([self.ball_x, self.ball_y, 0.0])
         pad_l_pos = np.array([self.paddle_lx, self.agent_y, 0.0])
@@ -257,7 +257,24 @@ class PongEnv:
                               anomaly_scale=dev_mag * env_frac)
             wp_env.normalize()
 
-        # 6. Frequency learning from prediction residual
+        # 6. Reward wavepacket learns from reward signal
+        if abs(reward) > 1e-8:
+            wp_reward = self._wp_reward
+            # Update reward field: at ball's (x, y), the reward dim
+            # gets pushed toward the reward value
+            reward_pos = np.array([self.ball_x, self.ball_y, 0.0])
+            reward_target = np.array([0.0, 0.0, reward])
+            wp_reward.update_lms(reward_pos, reward_target,
+                                 anomaly_scale=1.0)
+            wp_reward.soft_normalize(max_energy=2.0)
+            # Also update ball's reward dimension toward the reward
+            ball_reward_pos = np.array([self.ball_x, self.ball_y, reward])
+            nip_rew = abs(wp_ball.normalized_inner_product(wp_reward))
+            wp_ball.update_with_attention(
+                ball_reward_pos, np.ones(NDIM), [nip_rew])
+            wp_ball.normalize()
+
+        # 7. Frequency learning from prediction residual
         if not scored and self._lr_k_env > 0:
             wp_ball.learn_from_residual(predicted_pos, ball_pos,
                                         lr_k=self._lr_k_env)
@@ -381,10 +398,26 @@ class PongEnv:
         opp_missed = self.ball_x > COURT_RIGHT
         scored = agent_missed or opp_missed
 
+        # Determine reward for spectral encoder update
+        if self.reward_mode == 'goal':
+            if agent_missed:
+                step_reward = -1.0
+            elif opp_missed:
+                step_reward = 1.0
+            else:
+                step_reward = 0.0
+        else:
+            if agent_missed:
+                step_reward = -1.0
+            elif agent_hit:
+                step_reward = 1.0
+            else:
+                step_reward = 0.0
+
         # Compute obs BEFORE wavepacket update (matching tune.py timing)
         if self.obs_mode == 'spectral':
             pre_update_obs = self._spectral_obs()
-            self._update_wavepackets(scored=scored)
+            self._update_wavepackets(scored=scored, reward=step_reward)
         else:
             pre_update_obs = None
 
