@@ -1,0 +1,57 @@
+================================================================================
+SPECTRAL ENCODER HYPERPARAMETER SWEEP REPORT
+================================================================================
+Total experiments: 33
+Total wall time: 6056s (1.7h)
+
+--- TOP 20 CONFIGURATIONS ---
+#   Name                                                   WR   Peak
+----------------------------------------------------------------------
+1   p1_gamma0.0_spectral_goal                            51%   57%
+2   p1_gamma0.3_spectral_goal                            50%   62%
+3   p1_gamma0.8_raw_goal                                 50%   61%
+4   p1_gamma0.7_raw_goal                                 49%   61%
+5   p1_gamma0.0_raw_goal                                 49%   59%
+6   p1_gamma0.8_spectral_goal                            49%   59%
+7   p1_gamma0.9_spectral_goal                            49%   56%
+8   p1_gamma0.95_spectral_goal                           48%   58%
+9   p1_gamma0.5_raw_goal                                 47%   62%
+10  p1_gamma0.7_spectral_goal                            47%   63%
+11  p1_gamma0.5_spectral_goal                            45%   56%
+12  p1_gamma0.9_raw_goal                                 44%   56%
+13  p1_gamma0.99_spectral_goal                           44%   58%
+14  p1_gamma0.3_raw_goal                                 43%   58%
+15  p1_gamma0.95_raw_goal                                40%   51%
+16  p1_gamma0.99_raw_goal                                40%   58%
+17  p1_gamma0.99_raw_paddle                              23%   33%
+18  p1_gamma0.7_spectral_paddle                          19%   25%
+19  p1_gamma0.0_spectral_paddle                          17%   26%
+20  p2_lr0.001_g0.0_spec_paddle                          17%   26%
+
+--- SPECTRAL vs RAW ---
+  spectral: n=17, mean=31%, median=19%, best=51% (p1_gamma0.0_spectral_goal)
+       raw: n=16, mean=29%, median=31%, best=50% (p1_gamma0.8_raw_goal)
+
+--- GAMMA ANALYSIS (spectral only) ---
+  γ=0.0  : n=  3, mean=28%, std=16%, best=51%, worst=17%
+  γ=0.3  : n=  2, mean=32%, std=18%, best=50%, worst=14%
+  γ=0.5  : n=  2, mean=31%, std=15%, best=45%, worst=16%
+  γ=0.7  : n=  2, mean=33%, std=14%, best=47%, worst=19%
+  γ=0.8  : n=  2, mean=32%, std=16%, best=49%, worst=16%
+  γ=0.9  : n=  2, mean=32%, std=16%, best=49%, worst=16%
+  γ=0.95 : n=  2, mean=32%, std=17%, best=48%, worst=15%
+  γ=0.99 : n=  2, mean=29%, std=14%, best=44%, worst=15%
+
+--- ACTIVATION HEALTH (final checkpoint) ---
+  p1_gamma0.0_spectral_goal:
+    WR=51%, W1_norm=7.852, dead=4/28, out_std=0.0228
+  p1_gamma0.3_spectral_goal:
+    WR=50%, W1_norm=7.851, dead=8/24, out_std=0.0062
+  p1_gamma0.8_spectral_goal:
+    WR=49%, W1_norm=7.852, dead=2/30, out_std=0.0157
+  p1_gamma0.9_spectral_goal:
+    WR=49%, W1_norm=7.851, dead=5/27, out_std=0.0101
+  p1_gamma0.95_spectral_goal:
+    WR=48%, W1_norm=7.851, dead=3/29, out_std=0.0227
+  p1_gamma0.7_spectral_goal:
+    WR=47%, W1_norm=7.851, dead=4/28, out_std=0.0119
