@@ -2,18 +2,26 @@
 Minimal Pong RL trainer — numpy-only REINFORCE with value baseline.
 
 Self-contained: Pong env + agent + training loop in one file.
-Trains one agent against a perfect-tracker opponent.
+Trains one agent against a configurable opponent.
+
+Supports two reward modes:
+  - 'goal':   +1 opponent miss, -1 agent miss (sparse, episode-terminal)
+  - 'paddle': +1 agent paddle hit, -1 agent miss (frequent signal)
+
+Supports two observation modes:
+  - 'raw':      4-dim egocentric [ball_dy, ball_vx_sign, ball_vy, ball_x]
+  - 'spectral': 8-dim from wavepacket outer-product maps → conv features
 
 Usage:
-    python training/pong_trainer.py                    # Train with defaults
-    python training/pong_trainer.py --episodes 5000    # More episodes
-    python training/pong_trainer.py --hidden 32        # MLP policy
-    python training/pong_trainer.py --seeds 5          # Multi-seed
+    python training/pong_trainer.py --reward-mode paddle --obs-mode raw
+    python training/pong_trainer.py --reward-mode goal --obs-mode spectral --hidden 32
 """
 
 from __future__ import annotations
 import argparse
 import numpy as np
+import sys
+import os
 
 # -- Pong constants (from spectral_pong_viz.py) --------------------------------
 
@@ -32,27 +40,172 @@ DT = 1.0 / 60.0
 # -- PongEnv -------------------------------------------------------------------
 
 class PongEnv:
-    """Minimal Pong with egocentric observations and fixed opponent.
+    """Minimal Pong with configurable reward and observation modes.
 
-    Agent controls the LEFT paddle. Opponent (right) uses a noisy tracker
-    with configurable skill (0.0 = random, 1.0 = perfect).
+    Agent controls the LEFT paddle. Opponent (right) uses a noisy tracker.
 
-    Observation (4-dim, all roughly in [-1, 1]):
-        0: ball_y - paddle_y  (normalized by court height)
-        1: ball_vx sign       (-1 = approaching, +1 = going away)
-        2: ball_vy             (normalized by ball speed)
-        3: ball_x              (normalized, -1 = at agent, +1 = far side)
+    Raw observation (4-dim, all roughly in [-1, 1]):
+        0: (ball_y - paddle_y) / court_height
+        1: ball_vx sign  (-1 = approaching agent, +1 = going away)
+        2: ball_vy / ball_speed
+        3: ball_x normalized  (-1 = agent side, +1 = opponent side)
+
+    Spectral observation (8-dim):
+        Conv features from wavepacket outer-product maps.
     """
 
-    OBS_DIM = 4
-
-    def __init__(self, opp_skill: float = 0.5):
-        """opp_skill: 0.0 = random, 1.0 = perfect tracker."""
+    def __init__(self, opp_skill: float = 0.0, reward_mode: str = 'goal',
+                 obs_mode: str = 'raw'):
         self.paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
         self.paddle_rx = COURT_RIGHT - PADDLE_X_OFFSET
         self.half_h = PADDLE_HEIGHT / 2.0
         self.opp_skill = opp_skill
-        self.reset()
+        self.reward_mode = reward_mode
+        self.obs_mode = obs_mode
+
+        if obs_mode == 'spectral':
+            self._init_spectral()
+
+    @property
+    def obs_dim(self) -> int:
+        return 8 if self.obs_mode == 'spectral' else 4
+
+    def _init_spectral(self):
+        """Initialize wavepacket objects and conv feature extractor."""
+        # Add training dir to path for imports
+        training_dir = os.path.dirname(os.path.abspath(__file__))
+        if training_dir not in sys.path:
+            sys.path.insert(0, training_dir)
+        from spectral_pong_viz import (
+            WavepacketObject2D, compute_feature_maps, ConvFeatureExtractor,
+            FM_NX, FM_NY, FM_CHANNELS
+        )
+        self._compute_feature_maps = compute_feature_maps
+        self._FM_NX = FM_NX
+        self._FM_NY = FM_NY
+
+        K = 8
+        NDIM = 3
+        self._K = K
+        self._NDIM = NDIM
+        self._freqs = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
+        self._WavepacketObject2D = WavepacketObject2D
+
+        # Feature map grids
+        self._x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
+        self._y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
+        self._r_fm = np.linspace(-1.0, 1.0, FM_NY)
+
+        # Conv feature extractor (fixed random projections, shared across resets)
+        self._conv = ConvFeatureExtractor(
+            n_channels=FM_CHANNELS, n_filters=8, kernel_size=3, seed=0)
+
+    def _create_wavepackets(self):
+        """Create fresh wavepackets for a new episode."""
+        WP = self._WavepacketObject2D
+        K, NDIM, freqs = self._K, self._NDIM, self._freqs
+
+        self._wp_ball = WP(K, freqs, pos0=(self.ball_x, self.ball_y, 0),
+                           sigma=0.8, ndim=NDIM, lr=0.15, lr_tracking=0.01)
+        self._wp_pl = WP(K, freqs,
+                         pos0=(self.paddle_lx, self.agent_y, 0),
+                         mass=1e6, sigma=0.5, amplitude=1.0,
+                         ndim=NDIM, lr=0.1, lr_tracking=0.02)
+        self._wp_pr = WP(K, freqs,
+                         pos0=(self.paddle_rx, self.opp_y, 0),
+                         mass=1e6, sigma=0.5, amplitude=1.0,
+                         ndim=NDIM, lr=0.1, lr_tracking=0.02)
+
+        # Env field: basis on physics dims
+        env_c = np.zeros((K, NDIM))
+        env_c[0, 0] = 1.0
+        env_c[1, 1] = 1.0
+        self._wp_env = WP(K, freqs, pos0=(0, 0, 0), mass=1e6, ndim=NDIM,
+                          c_cos=env_c, c_sin=np.zeros((K, NDIM)),
+                          lr=0.15, lr_tracking=0.0)
+
+        # Reward field: basis on reward dim
+        rew_c = np.zeros((K, NDIM))
+        rew_c[0, 2] = 1.0
+        self._wp_reward = WP(K, freqs, pos0=(0, 0, 0), mass=1e6, ndim=NDIM,
+                             c_cos=rew_c.copy(), c_sin=np.zeros((K, NDIM)),
+                             lr=0.15, lr_tracking=0.0)
+
+    def _update_wavepackets(self):
+        """Per-frame wavepacket update: shift, correct, normalize."""
+        NDIM = self._NDIM
+        ball_pos = np.array([self.ball_x, self.ball_y, 0.0])
+        pad_l_pos = np.array([self.paddle_lx, self.agent_y, 0.0])
+        pad_r_pos = np.array([self.paddle_rx, self.opp_y, 0.0])
+
+        wp_ball = self._wp_ball
+        wp_pl = self._wp_pl
+        wp_pr = self._wp_pr
+        wp_env = self._wp_env
+
+        # Normalized inner products for attention
+        nip_env = abs(wp_ball.normalized_inner_product(wp_env))
+        nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
+        nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
+
+        # Shift wavepackets by velocity
+        wp_ball.shift(self.ball_vx * DT, axis=0)
+        wp_ball.shift(self.ball_vy * DT, axis=1)
+        delta_l = self.agent_y - wp_pl.pos[1]
+        delta_r = self.opp_y - wp_pr.pos[1]
+        if abs(delta_l) > 1e-12:
+            wp_pl.shift(delta_l, axis=1)
+        if abs(delta_r) > 1e-12:
+            wp_pr.shift(delta_r, axis=1)
+
+        # LMS correction toward observed positions
+        unity = np.ones(NDIM)
+        wp_ball.update_with_attention(ball_pos, unity,
+                                      [nip_env, nip_padL, nip_padR])
+        wp_pl.update_with_attention(pad_l_pos, unity, [nip_padL])
+        wp_pr.update_with_attention(pad_r_pos, unity, [nip_padR])
+
+        # Deviation + normalize
+        ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
+                             for d in range(NDIM)])
+        wp_ball.normalize()
+        wp_pl.normalize()
+        wp_pr.normalize()
+
+        # Env learns from deviation
+        dev_mag = np.linalg.norm(ball_dev[:2])
+        if dev_mag > 1e-8:
+            total_nip = nip_env + nip_padL + nip_padR + 1e-8
+            env_frac = nip_env / total_nip
+            wp_env.update_lms(ball_pos, ball_dev,
+                              anomaly_scale=dev_mag * env_frac)
+            wp_env.normalize()
+
+        # Store positions
+        wp_ball.pos[:] = ball_pos
+        wp_pl.pos[:] = pad_l_pos
+        wp_pr.pos[:] = pad_r_pos
+
+    def _spectral_obs(self) -> np.ndarray:
+        """8-dim spectral features from current wavepacket state."""
+        fmaps = self._compute_feature_maps(
+            self._wp_ball, self._wp_env, self._wp_pl, self._wp_pr,
+            self._wp_reward, self._x_fm, self._y_fm, self._r_fm)
+        return self._conv.forward_fast(fmaps)
+
+    def _raw_obs(self) -> np.ndarray:
+        """4-dim egocentric observation."""
+        return np.array([
+            (self.ball_y - self.agent_y) / (COURT_TOP - COURT_BOTTOM),
+            -1.0 if self.ball_vx < 0 else 1.0,
+            self.ball_vy / BALL_SPEED,
+            (self.ball_x - COURT_LEFT) / (COURT_RIGHT - COURT_LEFT) * 2 - 1,
+        ])
+
+    def _obs(self) -> np.ndarray:
+        if self.obs_mode == 'spectral':
+            return self._spectral_obs()
+        return self._raw_obs()
 
     def reset(self) -> np.ndarray:
         self.ball_x = 0.0
@@ -60,24 +213,19 @@ class PongEnv:
         angle = np.random.uniform(-1.0, 1.0)
         self.ball_vx = BALL_SPEED * np.cos(angle)
         self.ball_vy = BALL_SPEED * np.sin(angle)
-        # Random initial direction
         if np.random.random() < 0.5:
             self.ball_vx = -abs(self.ball_vx)
         else:
             self.ball_vx = abs(self.ball_vx)
         self.agent_y = 0.0
         self.opp_y = 0.0
-        self.touched = False
-        return self._obs()
+        self.agent_touches = 0
+        self.touched = False  # at least one touch this episode
 
-    def _obs(self) -> np.ndarray:
-        """Egocentric observation for the left (agent) paddle."""
-        return np.array([
-            (self.ball_y - self.agent_y) / (COURT_TOP - COURT_BOTTOM),
-            -1.0 if self.ball_vx < 0 else 1.0,  # -1 = approaching agent
-            self.ball_vy / BALL_SPEED,
-            (self.ball_x - COURT_LEFT) / (COURT_RIGHT - COURT_LEFT) * 2 - 1,
-        ])
+        if self.obs_mode == 'spectral':
+            self._create_wavepackets()
+
+        return self._obs()
 
     def step(self, action: float):
         """Returns (obs, reward, done). Action in [-1, 1] moves paddle."""
@@ -88,11 +236,12 @@ class PongEnv:
                                COURT_BOTTOM + self.half_h,
                                COURT_TOP - self.half_h)
 
-        # Opponent: noisy tracker (skill controls tracking vs random)
+        # Opponent: noisy tracker
         opp_target = self.ball_y
         track_action = np.clip((opp_target - self.opp_y) * 5.0, -1.0, 1.0)
         random_action = np.random.uniform(-1.0, 1.0)
-        opp_action = self.opp_skill * track_action + (1 - self.opp_skill) * random_action
+        opp_action = (self.opp_skill * track_action
+                      + (1 - self.opp_skill) * random_action)
         self.opp_y += opp_action * PADDLE_SPEED * DT
         self.opp_y = np.clip(self.opp_y,
                              COURT_BOTTOM + self.half_h,
@@ -110,6 +259,9 @@ class PongEnv:
             self.ball_y = 2 * (COURT_BOTTOM + BALL_RADIUS) - self.ball_y
             self.ball_vy = abs(self.ball_vy)
 
+        # Track paddle reward before collision detection
+        agent_hit = False
+
         # Agent paddle collision (left)
         if (self.ball_vx < 0
                 and self.ball_x - BALL_RADIUS <= self.paddle_lx + PADDLE_WIDTH / 2
@@ -120,7 +272,9 @@ class PongEnv:
             spd = np.hypot(self.ball_vx, self.ball_vy)
             self.ball_vx *= BALL_SPEED / spd
             self.ball_vy *= BALL_SPEED / spd
+            self.agent_touches += 1
             self.touched = True
+            agent_hit = True
 
         # Opponent paddle collision (right)
         if (self.ball_vx > 0
@@ -133,13 +287,30 @@ class PongEnv:
             self.ball_vx *= BALL_SPEED / spd
             self.ball_vy *= BALL_SPEED / spd
 
-        # Scoring
-        if self.ball_x < COURT_LEFT:
-            return self._obs(), -1.0, True   # Agent missed
-        if self.ball_x > COURT_RIGHT:
-            return self._obs(), +1.0, True   # Agent scored (opponent missed)
+        # Update wavepackets AFTER physics (they track the new positions)
+        if self.obs_mode == 'spectral':
+            self._update_wavepackets()
 
-        return self._obs(), 0.0, False
+        # Scoring / reward
+        agent_missed = self.ball_x < COURT_LEFT
+        opp_missed = self.ball_x > COURT_RIGHT
+
+        if self.reward_mode == 'goal':
+            # Sparse: only terminal reward on scoring
+            if agent_missed:
+                return self._obs(), -1.0, True
+            if opp_missed:
+                return self._obs(), +1.0, True
+            return self._obs(), 0.0, False
+
+        else:  # reward_mode == 'paddle'
+            # +1 on agent paddle hit, -1 on agent miss, episode ends on any goal
+            if agent_missed:
+                return self._obs(), -1.0, True
+            if opp_missed:
+                return self._obs(), 0.0, True  # opponent miss = neutral for agent
+            reward = 1.0 if agent_hit else 0.0
+            return self._obs(), reward, False
 
 
 # -- REINFORCE Agent -----------------------------------------------------------
@@ -160,37 +331,31 @@ class REINFORCEAgent:
         self.lr = lr
         self.lr_baseline = lr_baseline
         self.hidden = hidden
+        self.obs_dim = obs_dim
 
         if hidden > 0:
-            # MLP: obs → hidden → 1
             self.W1 = np.random.randn(hidden, obs_dim) * np.sqrt(2.0 / obs_dim)
             self.b1 = np.zeros(hidden)
             self.W2 = np.random.randn(hidden) * 0.01
             self.b2 = 0.0
         else:
-            # Linear: obs → 1
             self.w = np.zeros(obs_dim)
             self.b = 0.0
 
-        # Linear value baseline
         self.w_v = np.zeros(obs_dim)
         self.b_v = 0.0
 
-        # Episode buffer
         self._obs_buf = []
         self._act_buf = []
         self._rew_buf = []
-        # MLP internals saved per step (for gradient)
         self._h_buf = []
         self._mask_buf = []
 
-        # Running return stats for normalization
         self._ret_mean = 0.0
         self._ret_var = 1.0
         self._ret_count = 0
 
     def _policy_forward(self, obs: np.ndarray) -> float:
-        """Compute policy mean."""
         if self.hidden > 0:
             h = obs @ self.W1.T + self.b1
             mask = (h > 0).astype(np.float64)
@@ -245,18 +410,18 @@ class REINFORCEAgent:
         values = obs @ self.w_v + self.b_v
         advantages = returns_norm - values
 
-        # Update baseline (MSE gradient)
+        # Update baseline (MSE gradient, averaged over episode)
+        grad_wv = np.zeros_like(self.w_v)
+        grad_bv = 0.0
         for t in range(T):
-            grad = advantages[t]  # d/d_params (return - V)^2 ∝ advantage * obs
-            self.w_v += self.lr_baseline * grad * obs[t]
-            self.b_v += self.lr_baseline * grad
-
-        # Clip baseline weights
+            grad_wv += advantages[t] * obs[t]
+            grad_bv += advantages[t]
+        self.w_v += self.lr_baseline * grad_wv / T
+        self.b_v += self.lr_baseline * grad_bv / T
         np.clip(self.w_v, -10.0, 10.0, out=self.w_v)
         self.b_v = np.clip(self.b_v, -10.0, 10.0)
 
-        # Policy gradient: d_log_pi = (action - mean) / std^2
-        # Accumulate then apply averaged gradient (prevents blowup on long eps)
+        # Policy gradient (averaged over episode)
         if self.hidden > 0:
             gW1 = np.zeros_like(self.W1)
             gb1 = np.zeros_like(self.b1)
@@ -273,7 +438,6 @@ class REINFORCEAgent:
                 d_h = d_logpi * self.W2 * mask
                 gW1 += adv * np.outer(d_h, obs[t])
                 gb1 += adv * d_h
-            # Apply averaged gradient
             self.W1 += self.lr * gW1 / T
             self.b1 += self.lr * gb1 / T
             self.W2 += self.lr * gW2 / T
@@ -296,7 +460,6 @@ class REINFORCEAgent:
             np.clip(self.w, -10.0, 10.0, out=self.w)
             self.b = np.clip(self.b, -10.0, 10.0)
 
-        # Clear buffers
         ep_return = returns[0]
         self._obs_buf.clear()
         self._act_buf.clear()
@@ -311,15 +474,17 @@ class REINFORCEAgent:
 def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
           lr_baseline: float = 1e-2, gamma: float = 0.99, std: float = 0.5,
           seed: int = 0, verbose: bool = True, max_steps: int = 2000,
-          opp_skill: float = 0.5):
+          opp_skill: float = 0.0, reward_mode: str = 'goal',
+          obs_mode: str = 'raw'):
     """Train agent, return per-episode results."""
     np.random.seed(seed)
-    env = PongEnv(opp_skill=opp_skill)
-    agent = REINFORCEAgent(obs_dim=PongEnv.OBS_DIM, hidden=hidden,
+    env = PongEnv(opp_skill=opp_skill, reward_mode=reward_mode,
+                  obs_mode=obs_mode)
+    agent = REINFORCEAgent(obs_dim=env.obs_dim, hidden=hidden,
                            lr=lr, lr_baseline=lr_baseline,
                            gamma=gamma, std=std)
 
-    results = []  # (episode_length, reward, touched)
+    results = []
     for ep in range(n_episodes):
         obs = env.reset()
         ep_reward = 0.0
@@ -334,6 +499,7 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
         results.append({
             'length': step + 1,
             'reward': ep_reward,
+            'touches': env.agent_touches,
             'touched': env.touched,
             'return': ep_return,
         })
@@ -342,10 +508,10 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
             recent = results[-100:]
             wins = sum(1 for r in recent if r['reward'] > 0)
             losses = sum(1 for r in recent if r['reward'] < 0)
-            touches = sum(1 for r in recent if r['touched'])
+            avg_touches = np.mean([r['touches'] for r in recent])
             avg_len = np.mean([r['length'] for r in recent])
-            print(f'ep {ep+1:5d}: W/L={wins}/{losses} touches={touches}/100 '
-                  f'avg_len={avg_len:.0f}')
+            print(f'ep {ep+1:5d}: W/L={wins}/{losses} '
+                  f'touches={avg_touches:.1f}/ep avg_len={avg_len:.0f}')
 
     return results
 
@@ -363,8 +529,12 @@ def main():
     parser.add_argument('--std', type=float, default=0.5)
     parser.add_argument('--seeds', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=2000)
-    parser.add_argument('--opp-skill', type=float, default=0.5,
+    parser.add_argument('--opp-skill', type=float, default=0.0,
                         help='Opponent skill: 0=random, 1=perfect tracker')
+    parser.add_argument('--reward-mode', choices=['goal', 'paddle'],
+                        default='goal')
+    parser.add_argument('--obs-mode', choices=['raw', 'spectral'],
+                        default='raw')
     args = parser.parse_args()
 
     for seed in range(args.seeds):
@@ -373,14 +543,14 @@ def main():
         results = train(n_episodes=args.episodes, hidden=args.hidden,
                         lr=args.lr, lr_baseline=args.lr_baseline,
                         gamma=args.gamma, std=args.std, seed=seed,
-                        max_steps=args.max_steps, opp_skill=args.opp_skill)
-        # Final summary
+                        max_steps=args.max_steps, opp_skill=args.opp_skill,
+                        reward_mode=args.reward_mode, obs_mode=args.obs_mode)
         last_200 = results[-200:] if len(results) >= 200 else results
         wins = sum(1 for r in last_200 if r['reward'] > 0)
         losses = sum(1 for r in last_200 if r['reward'] < 0)
-        touches = sum(1 for r in last_200 if r['touched'])
+        avg_touches = np.mean([r['touches'] for r in last_200])
         print(f'\nFinal (last {len(last_200)} eps): W/L={wins}/{losses} '
-              f'touches={touches}/{len(last_200)}')
+              f'touches={avg_touches:.1f}/ep')
 
 
 if __name__ == '__main__':
