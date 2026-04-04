@@ -591,7 +591,8 @@ class SimpleRLController:
         self.last_value = self._value(state)
         return action
 
-    def step(self, raw_state: np.ndarray, reward: float) -> None:
+    def step(self, raw_state: np.ndarray, reward: float,
+             terminal: bool = False) -> None:
         """TD update — per-frame (batch_size=1) or buffered (batch_size>1)."""
         state = self._normalize(raw_state)
         if self.prev_state is None:
@@ -600,7 +601,7 @@ class SimpleRLController:
 
         # TD error (always computed for diagnostics)
         v_prev = self._value(self.prev_state)
-        v_curr = self._value(state)
+        v_curr = 0.0 if terminal else self._value(state)
         td_error = reward + self.gamma * v_curr - v_prev
         td_error = np.clip(td_error, -self.TD_CLIP, self.TD_CLIP)
         self.last_td_error = td_error
@@ -642,7 +643,7 @@ class SimpleRLController:
                     'd_z': self._pending_act['d_z'],
                     'reward': reward,
                     'next_state': state.copy(),
-                    'terminal': False,
+                    'terminal': terminal,
                 })
                 self._pending_act = None
                 if len(self._buffer) >= self.batch_size:
@@ -651,10 +652,9 @@ class SimpleRLController:
         self.prev_state = state.copy()
 
     def _flush_batch(self) -> None:
-        """Compute batch-averaged TD(0) gradients and apply."""
+        """Compute summed TD(0) gradients and apply."""
         if not self._buffer:
             return
-        n = len(self._buffer)
         grad_wc = np.zeros_like(self.w_c)
         grad_bc = 0.0
         grad_wa = np.zeros_like(self.w_a)
@@ -674,11 +674,11 @@ class SimpleRLController:
             grad_wa += delta * d_z * s
             grad_ba += delta * d_z
 
-        # Apply averaged gradients
-        self.w_c += (self.lr_critic / n) * grad_wc
-        self.b_c += (self.lr_critic / n) * grad_bc
-        self.w_a += (self.lr_actor / n) * grad_wa
-        self.b_a += (self.lr_actor / n) * grad_ba
+        # Apply summed gradients (no averaging)
+        self.w_c += self.lr_critic * grad_wc
+        self.b_c += self.lr_critic * grad_bc
+        self.w_a += self.lr_actor * grad_wa
+        self.b_a += self.lr_actor * grad_ba
         np.clip(self.w_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=self.w_c)
         self.b_c = np.clip(self.b_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
         np.clip(self.w_a, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=self.w_a)
@@ -817,24 +817,23 @@ class MLPController(SimpleRLController):
 # -- MLP actor-critic (nonlinear policy) ---------------------------------------
 
 class MLPActorCriticController(SimpleRLController):
-    """Nonlinear actor-critic with hidden layer on spectral conv features.
+    """Nonlinear actor-critic with hidden layer.
 
-    Actor:  state(8) → W1(H×8)+b1 → ReLU → W2(1×H)+b2 → tanh → mean
-    Critic: state(8) → W1(H×8)+b1 → ReLU → W2(1×H)+b2 → value
+    Actor:  state → W1(H×D)+b1 → ReLU → W2(1×H)+b2 → tanh → mean
+    Critic: state → W1(H×D)+b1 → ReLU → W2(1×H)+b2 → value
 
-    Batch-only: accumulates transitions, applies averaged TD(0) gradients.
+    Supports both per-frame TD(λ) traces (batch_size=1) and batched TD(0).
     """
 
     def __init__(self, state_dim: int = 8, hidden: int = 32,
                  lr_actor: float = 3e-3, lr_critic: float = 3e-2,
-                 gamma: float = 0.3, std: float = 0.3,
-                 batch_size: int = 128, **kwargs):
-        kwargs.pop('lam', None)
+                 gamma: float = 0.99, lam: float = 0.92,
+                 std: float = 0.3, batch_size: int = 1, **kwargs):
         kwargs.pop('K', None)
         kwargs.pop('frequencies', None)
         super().__init__(state_dim=state_dim, lr_actor=lr_actor,
-                         lr_critic=lr_critic, gamma=gamma, lam=0.0,
-                         std=std, batch_size=max(batch_size, 2), **kwargs)
+                         lr_critic=lr_critic, gamma=gamma, lam=lam,
+                         std=std, batch_size=batch_size, **kwargs)
         # Override linear weights with MLP
         self.hidden = hidden
         # Actor MLP
@@ -847,11 +846,34 @@ class MLPActorCriticController(SimpleRLController):
         self.b1_c = np.zeros(hidden)
         self.W2_c = np.random.randn(1, hidden) * 0.01
         self.b2_c = 0.0
+        # Eligibility traces for all 8 MLP parameter groups
+        self.tr_W1_a = np.zeros_like(self.W1_a)
+        self.tr_b1_a = np.zeros(hidden)
+        self.tr_W2_a = np.zeros_like(self.W2_a)
+        self.tr_b2_a = 0.0
+        self.tr_W1_c = np.zeros_like(self.W1_c)
+        self.tr_b1_c = np.zeros(hidden)
+        self.tr_W2_c = np.zeros_like(self.W2_c)
+        self.tr_b2_c = 0.0
 
     def _value(self, state: np.ndarray) -> float:
         h = state @ self.W1_c.T + self.b1_c
         h_relu = np.maximum(h, 0)
         return float(self.W2_c.ravel() @ h_relu + self.b2_c)
+
+    def _critic_grads(self, state: np.ndarray):
+        """Return (gW1, gb1, gW2, gb2) = ∇_params V(state)."""
+        h = state @ self.W1_c.T + self.b1_c
+        mask = (h > 0).astype(np.float64)
+        h_relu = h * mask
+        # dV/dW2 = h_relu, dV/db2 = 1
+        gW2 = h_relu.reshape(1, -1)
+        gb2 = 1.0
+        # dV/dh = W2 * mask, dh/dW1 = outer(mask*W2, state)
+        d_h = self.W2_c.ravel() * mask
+        gW1 = np.outer(d_h, state)
+        gb1 = d_h
+        return gW1, gb1, gW2, gb2
 
     def act(self, raw_state: np.ndarray) -> float:
         state = self._normalize(raw_state)
@@ -865,46 +887,97 @@ class MLPActorCriticController(SimpleRLController):
         # Policy gradient components
         d_logpi = (action - mean) / (self.std ** 2)
         d_z = d_logpi * (1 - mean ** 2)
-        self._pending_act = {
-            'state': state.copy(),
-            'd_z': d_z,
-            'h_relu': h_relu.copy(),
-            'mask': mask.copy(),
-        }
+
+        if self.batch_size <= 1:
+            # Per-frame: accumulate actor traces
+            gl = self.gamma * self.lam
+            # dz/dW2 = h_relu, dz/db2 = 1
+            self.tr_W2_a = np.clip(
+                gl * self.tr_W2_a + d_z * h_relu.reshape(1, -1),
+                -self.TRACE_CLIP, self.TRACE_CLIP)
+            self.tr_b2_a = np.clip(
+                gl * self.tr_b2_a + d_z,
+                -self.TRACE_CLIP, self.TRACE_CLIP)
+            # dz/dW1 = outer(d_z * W2 * mask, state)
+            d_h = d_z * self.W2_a.ravel() * mask
+            self.tr_W1_a = np.clip(
+                gl * self.tr_W1_a + np.outer(d_h, state),
+                -self.TRACE_CLIP, self.TRACE_CLIP)
+            self.tr_b1_a = np.clip(
+                gl * self.tr_b1_a + d_h,
+                -self.TRACE_CLIP, self.TRACE_CLIP)
+        else:
+            self._pending_act = {
+                'state': state.copy(),
+                'd_z': d_z,
+                'h_relu': h_relu.copy(),
+                'mask': mask.copy(),
+            }
+
         self.last_mean = mean
         self.last_action = action
         self.last_value = self._value(state)
         return action
 
-    def step(self, raw_state: np.ndarray, reward: float) -> None:
+    def step(self, raw_state: np.ndarray, reward: float,
+             terminal: bool = False) -> None:
         state = self._normalize(raw_state)
         if self.prev_state is None:
             self.prev_state = state.copy()
             return
         v_prev = self._value(self.prev_state)
-        v_curr = self._value(state)
+        v_curr = 0.0 if terminal else self._value(state)
         td_error = reward + self.gamma * v_curr - v_prev
         td_error = np.clip(td_error, -self.TD_CLIP, self.TD_CLIP)
         self.last_td_error = td_error
-        if self._pending_act is not None:
-            self._buffer.append({
-                'state': self._pending_act['state'],
-                'd_z': self._pending_act['d_z'],
-                'h_relu': self._pending_act['h_relu'],
-                'mask': self._pending_act['mask'],
-                'reward': reward,
-                'next_state': state.copy(),
-                'terminal': False,
-            })
-            self._pending_act = None
-            if len(self._buffer) >= self.batch_size:
-                self._flush_batch()
+
+        if self.batch_size <= 1:
+            # Per-frame trace update for critic
+            gl = self.gamma * self.lam
+            gW1, gb1, gW2, gb2 = self._critic_grads(self.prev_state)
+            self.tr_W1_c = np.clip(gl * self.tr_W1_c + gW1,
+                                   -self.TRACE_CLIP, self.TRACE_CLIP)
+            self.tr_b1_c = np.clip(gl * self.tr_b1_c + gb1,
+                                   -self.TRACE_CLIP, self.TRACE_CLIP)
+            self.tr_W2_c = np.clip(gl * self.tr_W2_c + gW2,
+                                   -self.TRACE_CLIP, self.TRACE_CLIP)
+            self.tr_b2_c = np.clip(gl * self.tr_b2_c + gb2,
+                                   -self.TRACE_CLIP, self.TRACE_CLIP)
+            # Apply: param += lr * delta * trace
+            self.W1_c += self.lr_critic * td_error * self.tr_W1_c
+            self.b1_c += self.lr_critic * td_error * self.tr_b1_c
+            self.W2_c += self.lr_critic * td_error * self.tr_W2_c
+            self.b2_c += self.lr_critic * td_error * self.tr_b2_c
+            self.W1_a += self.lr_actor * td_error * self.tr_W1_a
+            self.b1_a += self.lr_actor * td_error * self.tr_b1_a
+            self.W2_a += self.lr_actor * td_error * self.tr_W2_a
+            self.b2_a += self.lr_actor * td_error * self.tr_b2_a
+            # Clip all weights
+            for arr in [self.W1_c, self.b1_c, self.W2_c,
+                        self.W1_a, self.b1_a, self.W2_a]:
+                np.clip(arr, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=arr)
+            self.b2_c = np.clip(self.b2_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
+            self.b2_a = np.clip(self.b2_a, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
+        else:
+            # Batch mode: buffer transition, flush when full
+            if self._pending_act is not None:
+                self._buffer.append({
+                    'state': self._pending_act['state'],
+                    'd_z': self._pending_act['d_z'],
+                    'h_relu': self._pending_act['h_relu'],
+                    'mask': self._pending_act['mask'],
+                    'reward': reward,
+                    'next_state': state.copy(),
+                    'terminal': terminal,
+                })
+                self._pending_act = None
+                if len(self._buffer) >= self.batch_size:
+                    self._flush_batch()
         self.prev_state = state.copy()
 
     def _flush_batch(self) -> None:
         if not self._buffer:
             return
-        n = len(self._buffer)
         gW1_c = np.zeros_like(self.W1_c)
         gb1_c = np.zeros_like(self.b1_c)
         gW2_c = np.zeros_like(self.W2_c)
@@ -939,15 +1012,15 @@ class MLPActorCriticController(SimpleRLController):
             gW1_a += delta * np.outer(d_h_a, s)
             gb1_a += delta * d_h_a
 
-        inv_n = 1.0 / n
-        self.W1_c += self.lr_critic * inv_n * gW1_c
-        self.b1_c += self.lr_critic * inv_n * gb1_c
-        self.W2_c += self.lr_critic * inv_n * gW2_c.reshape(self.W2_c.shape)
-        self.b2_c += self.lr_critic * inv_n * gb2_c
-        self.W1_a += self.lr_actor * inv_n * gW1_a
-        self.b1_a += self.lr_actor * inv_n * gb1_a
-        self.W2_a += self.lr_actor * inv_n * gW2_a.reshape(self.W2_a.shape)
-        self.b2_a += self.lr_actor * inv_n * gb2_a
+        # Sum of gradients (no averaging)
+        self.W1_c += self.lr_critic * gW1_c
+        self.b1_c += self.lr_critic * gb1_c
+        self.W2_c += self.lr_critic * gW2_c.reshape(self.W2_c.shape)
+        self.b2_c += self.lr_critic * gb2_c
+        self.W1_a += self.lr_actor * gW1_a
+        self.b1_a += self.lr_actor * gb1_a
+        self.W2_a += self.lr_actor * gW2_a.reshape(self.W2_a.shape)
+        self.b2_a += self.lr_actor * gb2_a
         # Clip all weights
         for arr in [self.W1_c, self.b1_c, self.W2_c,
                     self.W1_a, self.b1_a, self.W2_a]:
@@ -957,9 +1030,15 @@ class MLPActorCriticController(SimpleRLController):
         self._buffer.clear()
 
     def on_reset(self) -> None:
-        if self._buffer:
-            self._buffer[-1]['terminal'] = True
-        self._pending_act = None
+        if self.batch_size > 1:
+            if self._buffer:
+                self._buffer[-1]['terminal'] = True
+            self._pending_act = None
+        else:
+            self.tr_W1_a[:] = 0; self.tr_b1_a[:] = 0
+            self.tr_W2_a[:] = 0; self.tr_b2_a = 0.0
+            self.tr_W1_c[:] = 0; self.tr_b1_c[:] = 0
+            self.tr_W2_c[:] = 0; self.tr_b2_c = 0.0
         self.prev_state = None
 
 

@@ -23,8 +23,8 @@ from spectral_pong_viz import (
 
 
 def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
-                 lr_critic: float = 1e-1, gamma: float = 0.95,
-                 lam: float = 0.9, std: float = 0.3, seed: int = 0,
+                 lr_critic: float = 1e-1, gamma: float = 0.99,
+                 lam: float = 0.92, std: float = 0.3, seed: int = 0,
                  verbose: bool = True,
                  force_scale: float = 0.0, lr_k: float = 0.0,
                  reward_replay_n: int = 5,
@@ -233,8 +233,8 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             rl_right.reward_update(ball['x'], -reward)
             sdim = rl_left.W1_c.shape[1] if hasattr(rl_left, 'W1_c') else len(rl_left.w_c)
             term_state = np.zeros(sdim)
-            rl_left.step(term_state, reward)
-            rl_right.step(term_state, -reward)
+            rl_left.step(term_state, reward, terminal=True)
+            rl_right.step(term_state, -reward, terminal=True)
             rl_left.on_reset()
             rl_right.on_reset()
             reset_ball(ball, toward='left' if reward < 0 else 'right',
