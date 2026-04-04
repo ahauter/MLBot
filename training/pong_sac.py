@@ -295,7 +295,7 @@ def train(args):
                   f'Q={last_q_mean:.2f} | '
                   f'H={last_entropy:.2f} | '
                   f'buf={buffer.size} | '
-                  f'{sps:.0f} sps')
+                  f'{sps:.0f} sps', flush=True)
 
             recent_wins.clear()
             recent_losses.clear()
@@ -305,7 +305,7 @@ def train(args):
 
     total_time = time.time() - t0
     print(f'\nDone: {args.total_steps} steps in {total_time:.0f}s '
-          f'({args.total_steps/total_time:.0f} sps)')
+          f'({args.total_steps/total_time:.0f} sps)', flush=True)
 
 
 # ---------------------------------------------------------------------------
