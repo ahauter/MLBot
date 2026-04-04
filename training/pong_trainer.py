@@ -211,6 +211,12 @@ class PongEnv:
         pre_relu = patches @ W_flat.T + conv.b
         return np.maximum(pre_relu, 0).max(axis=0)
 
+    def get_feature_maps(self) -> np.ndarray:
+        """Return raw (6, 16, 24) outer-product maps. Only valid for spectral mode."""
+        return self._compute_feature_maps(
+            self._wp_ball, self._wp_env, self._wp_pl, self._wp_pr,
+            self._wp_reward, self._x_fm, self._y_fm, self._r_fm)
+
     def _raw_obs(self) -> np.ndarray:
         """4-dim egocentric observation."""
         return np.array([
@@ -487,27 +493,203 @@ class REINFORCEAgent:
         return float(ep_return)
 
 
+# -- Conv Policy Agent ---------------------------------------------------------
+
+class ConvPolicyAgent:
+    """Policy that learns a single conv filter over spectral feature maps.
+
+    The filter convolves (6, H, W) outer-product maps down to a (1, oH, oW)
+    activation map. The y-axis center-of-mass of that map is the action mean.
+    REINFORCE updates the 6*ks*ks filter weights + bias directly.
+
+    This tests whether the spectral encoder's spatial structure can serve
+    as a direct policy representation with minimal learned parameters.
+    """
+
+    def __init__(self, n_channels: int = 6, kernel_size: int = 3,
+                 lr: float = 1e-3, gamma: float = 0.99, std: float = 0.3):
+        self.ks = kernel_size
+        self.lr = lr
+        self.gamma = gamma
+        self.std = std
+        # Single conv filter: (1, C, ks, ks)
+        fan_in = n_channels * kernel_size * kernel_size
+        self.W = np.random.randn(n_channels, kernel_size, kernel_size) * np.sqrt(2.0 / fan_in)
+        self.bias = 0.0
+        # Episode buffers
+        self._fmaps_buf = []
+        self._act_buf = []
+        self._mean_buf = []
+        self._rew_buf = []
+        # Running return stats
+        self._ret_mean = 0.0
+        self._ret_var = 1.0
+        self._ret_count = 0
+
+    def _forward(self, fmaps: np.ndarray) -> float:
+        """Conv → ReLU → y-center-of-mass → action mean in [-1, 1]."""
+        C, H, W = fmaps.shape
+        ks = self.ks
+        oH, oW = H - ks + 1, W - ks + 1
+        # im2col
+        patches = np.lib.stride_tricks.as_strided(
+            fmaps, shape=(oH, oW, C, ks, ks),
+            strides=(fmaps.strides[1], fmaps.strides[2],
+                     fmaps.strides[0], fmaps.strides[1], fmaps.strides[2])
+        ).reshape(oH * oW, -1)
+        W_flat = self.W.reshape(1, -1)
+        pre_relu = (patches @ W_flat.T + self.bias).reshape(oH, oW)
+        activated = np.maximum(pre_relu, 0)  # (oH, oW)
+
+        # y-axis center of mass
+        y_grid = np.linspace(-1.0, 1.0, oH)
+        y_marginal = activated.sum(axis=1)  # (oH,)
+        total = y_marginal.sum()
+        if total > 1e-8:
+            mean = float((y_grid * y_marginal).sum() / total)
+        else:
+            mean = 0.0
+        return np.clip(mean, -1.0, 1.0)
+
+    def act(self, fmaps: np.ndarray) -> float:
+        mean = self._forward(fmaps)
+        action = mean + self.std * np.random.randn()
+        self._fmaps_buf.append(fmaps.copy())
+        self._act_buf.append(action)
+        self._mean_buf.append(mean)
+        return float(action)
+
+    def record_reward(self, reward: float):
+        self._rew_buf.append(reward)
+
+    def _forward_with_grad(self, fmaps: np.ndarray):
+        """Forward pass returning (mean, d_mean_d_W, d_mean_d_bias).
+
+        Chain rule through: patches → pre_relu → ReLU → y_marginal → COM.
+        """
+        C, H, W_ = fmaps.shape
+        ks = self.ks
+        oH, oW = H - ks + 1, W_ - ks + 1
+        # im2col: (oH*oW, C*ks*ks)
+        patches = np.lib.stride_tricks.as_strided(
+            fmaps, shape=(oH, oW, C, ks, ks),
+            strides=(fmaps.strides[1], fmaps.strides[2],
+                     fmaps.strides[0], fmaps.strides[1], fmaps.strides[2])
+        ).reshape(oH * oW, -1)
+        W_flat = self.W.reshape(1, -1)
+        pre_relu = (patches @ W_flat.T + self.bias).ravel()  # (oH*oW,)
+        mask = (pre_relu > 0).astype(np.float64)
+        activated = pre_relu * mask  # (oH*oW,)
+        act_2d = activated.reshape(oH, oW)
+
+        # y-marginal and COM
+        y_grid = np.linspace(-1.0, 1.0, oH)
+        y_marginal = act_2d.sum(axis=1)  # (oH,)
+        total = y_marginal.sum()
+        if total < 1e-8:
+            return 0.0, np.zeros_like(self.W), 0.0
+
+        mean = float((y_grid * y_marginal).sum() / total)
+
+        # Backward: d_mean / d_activated
+        # mean = sum(y_i * m_i) / sum(m_i) where m_i = sum_j(act[i,j])
+        # d_mean/d_act[i,j] = (y_i - mean) / total
+        d_mean_d_act = np.zeros(oH * oW)
+        for i in range(oH):
+            for j in range(oW):
+                d_mean_d_act[i * oW + j] = (y_grid[i] - mean) / total
+
+        # Through ReLU: d_act/d_pre = mask
+        d_mean_d_pre = d_mean_d_act * mask  # (oH*oW,)
+
+        # Through conv: pre = patches @ W_flat.T + bias
+        # d_pre/d_W_flat = patches, d_pre/d_bias = 1
+        d_mean_d_W_flat = patches.T @ d_mean_d_pre  # (C*ks*ks,)
+        d_mean_d_bias = d_mean_d_pre.sum()
+
+        return mean, d_mean_d_W_flat.reshape(self.W.shape), d_mean_d_bias
+
+    def end_episode(self):
+        if not self._rew_buf:
+            return 0.0
+        T = len(self._rew_buf)
+        rewards = np.array(self._rew_buf)
+        actions = np.array(self._act_buf[:T])
+        means = np.array(self._mean_buf[:T])
+
+        # MC returns
+        returns = np.zeros(T)
+        G = 0.0
+        for t in reversed(range(T)):
+            G = rewards[t] + self.gamma * G
+            returns[t] = G
+
+        # Normalize returns
+        self._ret_count += T
+        alpha = min(T / self._ret_count, 0.1)
+        self._ret_mean = (1 - alpha) * self._ret_mean + alpha * returns.mean()
+        self._ret_var = (1 - alpha) * self._ret_var + alpha * (returns.var() + 1e-8)
+        returns_norm = (returns - self._ret_mean) / (np.sqrt(self._ret_var) + 1e-8)
+
+        # REINFORCE with analytic gradient through COM
+        gW = np.zeros_like(self.W)
+        g_bias = 0.0
+        for t in range(T):
+            adv = returns_norm[t]
+            d_logpi = (actions[t] - means[t]) / (self.std ** 2)
+            _, d_mean_dW, d_mean_db = self._forward_with_grad(self._fmaps_buf[t])
+            gW += adv * d_logpi * d_mean_dW
+            g_bias += adv * d_logpi * d_mean_db
+
+        self.W += self.lr * gW / T
+        self.bias += self.lr * g_bias / T
+        np.clip(self.W, -5.0, 5.0, out=self.W)
+        self.bias = np.clip(self.bias, -5.0, 5.0)
+
+        ep_return = returns[0]
+        self._fmaps_buf.clear()
+        self._act_buf.clear()
+        self._mean_buf.clear()
+        self._rew_buf.clear()
+        return float(ep_return)
+
+
 # -- Training loop -------------------------------------------------------------
 
 def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
           lr_baseline: float = 1e-2, gamma: float = 0.99, std: float = 0.5,
           seed: int = 0, verbose: bool = True, max_steps: int = 2000,
           opp_skill: float = 0.0, reward_mode: str = 'goal',
-          obs_mode: str = 'raw', pool_mode: str = 'avg'):
-    """Train agent, return per-episode results."""
+          obs_mode: str = 'raw', pool_mode: str = 'avg',
+          agent_type: str = 'reinforce'):
+    """Train agent, return per-episode results.
+
+    agent_type: 'reinforce' (standard) or 'conv_policy' (learns conv filter
+                over spectral feature maps, requires obs_mode='spectral').
+    """
     np.random.seed(seed)
     env = PongEnv(opp_skill=opp_skill, reward_mode=reward_mode,
                   obs_mode=obs_mode, pool_mode=pool_mode)
-    agent = REINFORCEAgent(obs_dim=env.obs_dim, hidden=hidden,
-                           lr=lr, lr_baseline=lr_baseline,
-                           gamma=gamma, std=std)
+
+    use_conv_policy = (agent_type == 'conv_policy')
+    if use_conv_policy:
+        assert obs_mode == 'spectral', 'conv_policy requires obs_mode=spectral'
+        agent = ConvPolicyAgent(lr=lr, gamma=gamma, std=std)
+    else:
+        agent = REINFORCEAgent(obs_dim=env.obs_dim, hidden=hidden,
+                               lr=lr, lr_baseline=lr_baseline,
+                               gamma=gamma, std=std)
 
     results = []
     for ep in range(n_episodes):
         obs = env.reset()
         ep_reward = 0.0
         for step in range(max_steps):
-            action = agent.act(obs)
+            if use_conv_policy:
+                fmaps = env.get_feature_maps()
+                action = agent.act(fmaps)
+            else:
+                action = agent.act(obs)
             obs, reward, done = env.step(action)
             agent.record_reward(reward)
             ep_reward += reward
@@ -553,6 +735,9 @@ def main():
                         default='goal')
     parser.add_argument('--obs-mode', choices=['raw', 'spectral'],
                         default='raw')
+    parser.add_argument('--agent-type', choices=['reinforce', 'conv_policy'],
+                        default='reinforce',
+                        help='conv_policy: learn conv filter as policy head')
     args = parser.parse_args()
 
     for seed in range(args.seeds):
@@ -562,7 +747,8 @@ def main():
                         lr=args.lr, lr_baseline=args.lr_baseline,
                         gamma=args.gamma, std=args.std, seed=seed,
                         max_steps=args.max_steps, opp_skill=args.opp_skill,
-                        reward_mode=args.reward_mode, obs_mode=args.obs_mode)
+                        reward_mode=args.reward_mode, obs_mode=args.obs_mode,
+                        agent_type=args.agent_type)
         last_200 = results[-200:] if len(results) >= 200 else results
         wins = sum(1 for r in last_200 if r['reward'] > 0)
         losses = sum(1 for r in last_200 if r['reward'] < 0)
