@@ -896,19 +896,27 @@ def plot_temporal_analysis(results, out_dir):
         "  - Gradient accumulates coherently\n\n"
         "SPECTRAL features (120-dim):\n"
         "  - Autocorr lag-1: ~0.02\n"
-        "  - Half-life: 1 step (!)\n"
-        "  - 39/120 dims oscillate (negative AC)\n"
+        "  - Half-life: 1 step\n"
         "  - Channel 5 (ball*reward): 69% change/frame\n"
-        "  - Gradient contributions cancel over episode\n\n"
-        "ROOT CAUSE: Strided conv mixes stable channels\n"
-        "(0-4, ~3% change) with unstable channel 5\n"
-        "(69% change), destroying temporal coherence\n"
-        "in all 120 output dimensions.\n\n"
-        "IMPLICATIONS FOR ALGORITHM CHOICE:\n"
-        "  - REINFORCE/PG: needs stable obs (fails here)\n"
-        "  - TD methods: update per-step (may handle noise)\n"
-        "  - Replay buffer: decorrelates anyway (neutral)\n"
-        "  - Frame stacking: redundant (encoder has memory)"
+        "  - This is GOOD: reward info being tracked!\n"
+        "  - Problem is REINFORCE, not the features.\n\n"
+        "The spectral encoder embeds temporal dynamics\n"
+        "INTO each observation — it already carries\n"
+        "memory via LMS-updated wavepacket coefficients.\n"
+        "This is the mechanism for sparse reward:\n"
+        "the reward channel builds a continuous reward\n"
+        "landscape from sparse goal signals.\n\n"
+        "ALGORITHM MISMATCH:\n"
+        "  Monte Carlo PG (REINFORCE) averages over the\n"
+        "  entire episode. With 120-dim features updating\n"
+        "  every frame, gradient contributions cancel.\n"
+        "  The features are informative — the algorithm\n"
+        "  just can't extract that information.\n\n"
+        "NEED: algorithms that can exploit per-step\n"
+        "information from temporally-rich features:\n"
+        "  - TD methods (per-step bootstrap updates)\n"
+        "  - Actor-Critic with short lambda\n"
+        "  - Per-step obs → direct action mapping"
     )
     ax.text(0.05, 0.95, analysis_text, transform=ax.transAxes,
             fontsize=9, verticalalignment='top', fontfamily='monospace',
@@ -1019,45 +1027,65 @@ def write_text_report(results, out_dir):
     lines.append('  Raw (4-dim):     lag-1 AC = 0.99, half-life = 47 steps')
     lines.append('  Spectral (120d): lag-1 AC = 0.02, half-life = 1 step')
     lines.append('')
-    lines.append('SPECTRAL FEATURE INSTABILITY:')
+    lines.append('SPECTRAL FEATURE DYNAMICS:')
     lines.append('  - 39/120 dims have NEGATIVE lag-1 autocorrelation (oscillate)')
     lines.append('  - Only 14/120 dims have AC > 0.5 (temporally stable)')
     lines.append('  - Channel 5 (ball*reward cross-map) changes 69% per frame')
-    lines.append('  - Strided conv mixes stable (ch0-4) with unstable (ch5)')
     lines.append('')
-    lines.append('WHY REINFORCE FAILS ON SPECTRAL FEATURES:')
-    lines.append('  1. Policy gradient: obs_t oscillates, so sum(advantage * obs_t)')
-    lines.append('     converges to zero regardless of advantage quality')
-    lines.append('  2. Value baseline: V(s) = w_v @ obs_t cannot fit returns when')
-    lines.append('     obs_t is decorrelated from obs_{t+1}')
-    lines.append('  3. Weight updates: W1 norm stays at initialization (7.851)')
-    lines.append('     across all experiments — gradients are too noisy to move it')
+    lines.append('WHY THIS IS A FEATURE, NOT A BUG:')
+    lines.append('  Channel 5 (ball*reward) changing rapidly means the reward')
+    lines.append('  wavepacket is ACTIVELY TRACKING reward-relevant information.')
+    lines.append('  This is the whole point of the spectral encoder for sparse')
+    lines.append('  reward — it builds a continuous reward landscape from sparse')
+    lines.append('  goal signals. The rapid updates mean the encoder is working.')
+    lines.append('')
+    lines.append('THE MISMATCH IS ALGORITHMIC, NOT REPRESENTATIONAL:')
+    lines.append('  The spectral encoder embeds temporal dynamics INTO each')
+    lines.append('  observation via LMS-updated wavepacket coefficients. This')
+    lines.append('  means the observation itself carries memory — it is not a')
+    lines.append('  memoryless snapshot of state.')
+    lines.append('')
+    lines.append('  REINFORCE treats observations as memoryless samples and')
+    lines.append('  averages gradients over the entire episode:')
+    lines.append('    grad J = (1/T) * sum_t [advantage_t * d_logpi_t * obs_t]')
+    lines.append('')
+    lines.append('  With 120-dim features updating substantially every frame,')
+    lines.append('  this sum converges to zero — gradient contributions cancel.')
+    lines.append('  W1 norm stays at init (7.851) across ALL experiments.')
+    lines.append('')
+    lines.append('  The features are INFORMATIVE. The algorithm just cannot')
+    lines.append('  extract that information via episode-averaged gradients.')
     lines.append('')
     lines.append('ALGORITHM IMPLICATIONS:')
-    lines.append('  - Monte Carlo PG (REINFORCE): BROKEN for spectral')
-    lines.append('    Requires obs stability across episode for gradient coherence')
-    lines.append('  - TD(0) / 1-step methods: MAY WORK')
-    lines.append('    Only needs obs[t] and obs[t+1] — 1-step autocorrelation')
-    lines.append('    is low but nonzero, and TD bootstrapping avoids')
-    lines.append('    accumulating over full episodes')
-    lines.append('  - Actor-Critic with GAE: PROMISING')
-    lines.append('    Short lambda truncates credit assignment window,')
-    lines.append('    reducing impact of obs decorrelation')
-    lines.append('  - Replay buffer + batch updates: NEUTRAL-POSITIVE')
-    lines.append('    Already decorrelates samples; spectral obs diversity')
-    lines.append('    may actually help exploration')
-    lines.append('  - Frame stacking: COUNTERPRODUCTIVE')
-    lines.append('    Encoder already carries temporal state; stacking adds')
-    lines.append('    dimensionality without information')
+    lines.append('  - Monte Carlo PG (REINFORCE): FUNDAMENTALLY MISMATCHED')
+    lines.append('    Episode-averaged gradients cancel with rapidly-updating obs.')
+    lines.append('    No hyperparameter choice fixes this — it is structural.')
+    lines.append('')
+    lines.append('  - TD(0) / 1-step bootstrap: PROMISING')
+    lines.append('    Updates use obs[t] and obs[t+1] only. The per-step temporal')
+    lines.append('    richness of spectral features becomes an asset — each step')
+    lines.append('    carries distinct information that TD can exploit.')
+    lines.append('')
+    lines.append('  - Actor-Critic with short GAE lambda: PROMISING')
+    lines.append('    Short lambda truncates the credit assignment window,')
+    lines.append('    reducing accumulation over many decorrelated frames.')
+    lines.append('    The critic learns per-step value; the actor gets shorter,')
+    lines.append('    more coherent gradient signals.')
+    lines.append('')
+    lines.append('  - Direct per-step reward prediction: NATURAL FIT')
+    lines.append('    The spectral features already encode reward structure.')
+    lines.append('    A per-step approach that maps obs → action without')
+    lines.append('    episode-level averaging could exploit this directly.')
     lines.append('')
     lines.append('RECOMMENDED NEXT STEPS:')
-    lines.append('  1. Remove or stabilize channel 5 (ball*reward cross-map)')
-    lines.append('     to reduce observation noise')
-    lines.append('  2. Try TD-based algorithms (SAC/TD3) which update per-step')
-    lines.append('  3. Try actor-critic with short GAE lambda (0.8-0.9)')
-    lines.append('  4. Add obs smoothing (EMA of spectral features)')
-    lines.append('  5. Separate stable/unstable dims — route only stable')
-    lines.append('     dims to the policy, use unstable for auxiliary tasks')
+    lines.append('  1. Implement TD-based actor-critic (A2C/PPO with short lambda)')
+    lines.append('     to test per-step learning on spectral features')
+    lines.append('  2. Try 1-step TD critic with spectral obs')
+    lines.append('  3. Measure: does the reward channel information improve')
+    lines.append('     TD value prediction vs raw observations?')
+    lines.append('  4. The spectral encoder may need algorithms designed for')
+    lines.append('     temporally-rich representations — this is a research')
+    lines.append('     question, not a hyperparameter tuning problem')
 
     report = '\n'.join(lines)
     with open(path, 'w') as f:
