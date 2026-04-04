@@ -73,15 +73,12 @@ class PongEnv:
 
     def _init_spectral(self):
         """Initialize wavepacket objects and conv feature extractor."""
-        # Add training dir to path for imports
         training_dir = os.path.dirname(os.path.abspath(__file__))
         if training_dir not in sys.path:
             sys.path.insert(0, training_dir)
         from spectral_pong_viz import (
-            WavepacketObject2D, compute_feature_maps, ConvFeatureExtractor,
-            FM_NX, FM_NY, FM_CHANNELS
+            WavepacketObject2D, ConvFeatureExtractor, FM_NX, FM_NY
         )
-        self._compute_feature_maps = compute_feature_maps
         self._FM_NX = FM_NX
         self._FM_NY = FM_NY
 
@@ -95,106 +92,170 @@ class PongEnv:
         # Feature map grids
         self._x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
         self._y_fm = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
-        self._r_fm = np.linspace(-1.0, 1.0, FM_NY)
 
-        # Conv feature extractor (fixed random projections, shared across resets)
+        # Conv feature extractor: 2 channels (ball + own paddle)
         self._conv = ConvFeatureExtractor(
-            n_channels=FM_CHANNELS, n_filters=8, kernel_size=3, seed=0)
+            n_channels=2, n_filters=8, kernel_size=3, seed=0)
 
     def _create_wavepackets(self):
-        """Create fresh wavepackets for a new episode."""
+        """Create fresh wavepackets for a new episode (ball + own paddle only)."""
         WP = self._WavepacketObject2D
         K, NDIM, freqs = self._K, self._NDIM, self._freqs
 
-        self._wp_ball = WP(K, freqs, pos0=(self.ball_x, self.ball_y, 0),
+        self._wp_ball = WP(K, freqs.copy(), pos0=(self.ball_x, self.ball_y, 0),
                            sigma=0.8, ndim=NDIM, lr=0.15, lr_tracking=0.01)
-        self._wp_pl = WP(K, freqs,
+        self._wp_pl = WP(K, freqs.copy(),
                          pos0=(self.paddle_lx, self.agent_y, 0),
                          mass=1e6, sigma=0.5, amplitude=1.0,
                          ndim=NDIM, lr=0.1, lr_tracking=0.02)
-        self._wp_pr = WP(K, freqs,
-                         pos0=(self.paddle_rx, self.opp_y, 0),
-                         mass=1e6, sigma=0.5, amplitude=1.0,
-                         ndim=NDIM, lr=0.1, lr_tracking=0.02)
-
-        # Env field: basis on physics dims
-        env_c = np.zeros((K, NDIM))
-        env_c[0, 0] = 1.0
-        env_c[1, 1] = 1.0
-        self._wp_env = WP(K, freqs, pos0=(0, 0, 0), mass=1e6, ndim=NDIM,
-                          c_cos=env_c, c_sin=np.zeros((K, NDIM)),
-                          lr=0.15, lr_tracking=0.0)
-
-        # Reward field: basis on reward dim
-        rew_c = np.zeros((K, NDIM))
-        rew_c[0, 2] = 1.0
-        self._wp_reward = WP(K, freqs, pos0=(0, 0, 0), mass=1e6, ndim=NDIM,
-                             c_cos=rew_c.copy(), c_sin=np.zeros((K, NDIM)),
-                             lr=0.15, lr_tracking=0.0)
 
     def _update_wavepackets(self):
-        """Per-frame wavepacket update: shift, correct, normalize."""
+        """Per-frame wavepacket update: shift, correct, normalize (ball + own paddle)."""
         NDIM = self._NDIM
         ball_pos = np.array([self.ball_x, self.ball_y, 0.0])
         pad_l_pos = np.array([self.paddle_lx, self.agent_y, 0.0])
-        pad_r_pos = np.array([self.paddle_rx, self.opp_y, 0.0])
 
         wp_ball = self._wp_ball
         wp_pl = self._wp_pl
-        wp_pr = self._wp_pr
-        wp_env = self._wp_env
 
-        # Normalized inner products for attention
-        nip_env = abs(wp_ball.normalized_inner_product(wp_env))
         nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
-        nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
 
         # Shift wavepackets by velocity
         wp_ball.shift(self.ball_vx * DT, axis=0)
         wp_ball.shift(self.ball_vy * DT, axis=1)
         delta_l = self.agent_y - wp_pl.pos[1]
-        delta_r = self.opp_y - wp_pr.pos[1]
         if abs(delta_l) > 1e-12:
             wp_pl.shift(delta_l, axis=1)
-        if abs(delta_r) > 1e-12:
-            wp_pr.shift(delta_r, axis=1)
 
-        # LMS correction toward observed positions
+        # LMS correction
         unity = np.ones(NDIM)
-        wp_ball.update_with_attention(ball_pos, unity,
-                                      [nip_env, nip_padL, nip_padR])
+        wp_ball.update_with_attention(ball_pos, unity, [nip_padL])
         wp_pl.update_with_attention(pad_l_pos, unity, [nip_padL])
-        wp_pr.update_with_attention(pad_r_pos, unity, [nip_padR])
 
-        # Deviation + normalize
-        ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
-                             for d in range(NDIM)])
+        # Normalize
         wp_ball.normalize()
         wp_pl.normalize()
-        wp_pr.normalize()
-
-        # Env learns from deviation
-        dev_mag = np.linalg.norm(ball_dev[:2])
-        if dev_mag > 1e-8:
-            total_nip = nip_env + nip_padL + nip_padR + 1e-8
-            env_frac = nip_env / total_nip
-            wp_env.update_lms(ball_pos, ball_dev,
-                              anomaly_scale=dev_mag * env_frac)
-            wp_env.normalize()
 
         # Store positions
         wp_ball.pos[:] = ball_pos
         wp_pl.pos[:] = pad_l_pos
-        wp_pr.pos[:] = pad_r_pos
+
+    def _compute_2ch_maps(self) -> np.ndarray:
+        """2-channel outer-product maps: [ball, own_paddle]."""
+        maps = np.empty((2, self._FM_NY, self._FM_NX))
+        maps[0] = self._wp_ball.outer_product_map(self._x_fm, self._y_fm, ax0=0, ax1=1)
+        maps[1] = self._wp_pl.outer_product_map(self._x_fm, self._y_fm, ax0=0, ax1=1)
+        return maps
 
     def _spectral_obs(self) -> np.ndarray:
-        """8-dim spectral features from current wavepacket state."""
-        fmaps = self._compute_feature_maps(
-            self._wp_ball, self._wp_env, self._wp_pl, self._wp_pr,
-            self._wp_reward, self._x_fm, self._y_fm, self._r_fm)
+        """8-dim spectral features from 2-channel maps."""
+        fmaps = self._compute_2ch_maps()
+        if self._pool_mode == 'spatial':
+            return self._spatial_stats(fmaps)
         if self._pool_mode == 'max':
             return self._conv_maxpool(fmaps)
         return self._conv.forward_fast(fmaps)
+
+    def _spatial_stats(self, fmaps: np.ndarray) -> np.ndarray:
+        """Extract spatial statistics from 2 outer-product maps → 8-dim.
+
+        Per channel (ball, paddle): y-COM, x-COM, y-spread, peak.
+        """
+        obs, _ = self._spatial_stats_with_grad(fmaps)
+        return obs
+
+    def _spatial_stats_with_grad(self, fmaps: np.ndarray):
+        """Spatial stats + gradient w.r.t. wavepacket frequencies.
+
+        Returns (obs[8], d_obs_d_k[8, 2*K]) where the last dim covers
+        [ball_k[0..K-1], paddle_k[0..K-1]].
+
+        Per channel: [y_com, x_com, y_spread, peak].
+        Gradients computed for y_com and x_com (spread/peak gradients skipped).
+        """
+        K = self._K
+        # Normalized grids for COM (features in [-1, 1])
+        x_grid = np.linspace(-1.0, 1.0, fmaps.shape[2])  # (Nx,)
+        y_grid = np.linspace(-1.0, 1.0, fmaps.shape[1])  # (Ny,)
+        # Actual domain grids for d_evaluate/d_k (court coordinates)
+        x_domain = self._x_fm  # [-5, 5]
+        y_domain = self._y_fm  # [-3, 3]
+        wps = [self._wp_ball, self._wp_pl]
+
+        features = np.zeros(8)
+        d_features_dk = np.zeros((8, 2 * K))
+
+        for ch, wp in enumerate(wps):
+            m = fmaps[ch]  # signed — wavepackets are positive near peak
+            total = m.sum()
+            offset = ch * 4  # feature index offset
+            k_offset = ch * K  # gradient index offset
+
+            if abs(total) < 1e-10:
+                continue
+
+            # Marginals
+            y_marg = m.sum(axis=1)  # (Ny,)
+            x_marg = m.sum(axis=0)  # (Nx,)
+
+            # The map is outer(fy, fx) where fy = evaluate(y_grid, axis=1),
+            # fx = evaluate(x_grid, axis=0). For abs: m = |outer(fy, fx)|.
+            # When fy, fx are both positive (common for wavepackets near peak):
+            #   y_marg[i] = fy[i] * sum(fx), so y_com = sum(y*fy)/sum(fy).
+            # We use the abs marginals directly for robustness.
+
+            # y-COM
+            y_com = float((y_grid * y_marg).sum() / total)
+            features[offset + 0] = y_com
+
+            # x-COM
+            x_com = float((x_grid * x_marg).sum() / total)
+            features[offset + 1] = x_com
+
+            # y-spread
+            y_var = ((y_grid - y_com) ** 2 * y_marg).sum() / total
+            features[offset + 2] = np.sqrt(max(y_var, 0.0) + 1e-8)
+
+            # peak (non-differentiable, skip gradient)
+            features[offset + 3] = float(np.abs(m).max())
+
+            # --- Gradients of y_com and x_com w.r.t. k ---
+            # evaluate uses domain grids (court coords), COM uses normalized grids
+            # fy = evaluate(y_domain, axis=1), y_com = sum(y_norm * fy) / sum(fy)
+            # d_fy[i]/d_k[j] = -c_cos[j,1]*y_dom[i]*sin(k[j]*y_dom[i]) + c_sin[j,1]*y_dom[i]*cos(k[j]*y_dom[i])
+            k = wp.k  # (K,)
+
+            # d_fy/d_k: (Ny, K) — uses DOMAIN grid for the derivative
+            ky = k[None, :] * y_domain[:, None]  # (Ny, K)
+            d_fy_dk = (-wp.c_cos[:, 1] * y_domain[:, None] * np.sin(ky)
+                       + wp.c_sin[:, 1] * y_domain[:, None] * np.cos(ky))  # (Ny, K)
+
+            # d_fx/d_k: (Nx, K) — uses DOMAIN grid
+            kx = k[None, :] * x_domain[:, None]  # (Nx, K)
+            d_fx_dk = (-wp.c_cos[:, 0] * x_domain[:, None] * np.sin(kx)
+                       + wp.c_sin[:, 0] * x_domain[:, None] * np.cos(kx))  # (Nx, K)
+
+            # Get actual fy, fx for gradient through marginals
+            fy = wp.evaluate(y_domain, axis=1)  # (Ny,)
+            fx = wp.evaluate(x_domain, axis=0)  # (Nx,)
+            sum_fx = fx.sum()
+            sum_fy = fy.sum()
+
+            # y_com ≈ sum(y * fy * sum_fx) / (sum_fy * sum_fx) = sum(y * fy) / sum_fy
+            # d_y_com/d_k = sum_i [(y[i] - y_com) / sum_fy] * d_fy[i]/d_k
+            if abs(sum_fy) > 1e-10:
+                coeff_y = (y_grid - y_com) / sum_fy  # (Ny,)
+                d_ycom_dk = coeff_y @ d_fy_dk  # (K,)
+                d_features_dk[offset + 0, k_offset:k_offset + K] = d_ycom_dk
+
+            # x_com = sum(x * fx) / sum_fx
+            # d_x_com/d_k = sum_i [(x[i] - x_com) / sum_fx] * d_fx[i]/d_k
+            if abs(sum_fx) > 1e-10:
+                coeff_x = (x_grid - x_com) / sum_fx  # (Nx,)
+                d_xcom_dk = coeff_x @ d_fx_dk  # (K,)
+                d_features_dk[offset + 1, k_offset:k_offset + K] = d_xcom_dk
+
+        return features, d_features_dk
 
     def _conv_maxpool(self, fmaps: np.ndarray) -> np.ndarray:
         """Conv → ReLU → max pool (instead of avg pool)."""
@@ -212,10 +273,8 @@ class PongEnv:
         return np.maximum(pre_relu, 0).max(axis=0)
 
     def get_feature_maps(self) -> np.ndarray:
-        """Return raw (6, 16, 24) outer-product maps. Only valid for spectral mode."""
-        return self._compute_feature_maps(
-            self._wp_ball, self._wp_env, self._wp_pl, self._wp_pr,
-            self._wp_reward, self._x_fm, self._y_fm, self._r_fm)
+        """Return (2, 16, 24) outer-product maps: [ball, own_paddle]."""
+        return self._compute_2ch_maps()
 
     def _raw_obs(self) -> np.ndarray:
         """4-dim egocentric observation."""
@@ -230,6 +289,13 @@ class PongEnv:
         if self.obs_mode == 'spectral':
             return self._spectral_obs()
         return self._raw_obs()
+
+    def obs_with_grad(self):
+        """Return (obs, d_obs_d_k) for spectral mode. d_obs_d_k is (8, 2K)."""
+        if self.obs_mode != 'spectral' or self._pool_mode != 'spatial':
+            return self._obs(), None
+        fmaps = self._compute_2ch_maps()
+        return self._spatial_stats_with_grad(fmaps)
 
     def reset(self) -> np.ndarray:
         self.ball_x = 0.0
@@ -345,17 +411,22 @@ class REINFORCEAgent:
     Policy: action ~ N(mean, std^2), mean = w @ obs + b  (or MLP if hidden > 0)
     Baseline: V(s) = w_v @ obs + b_v  (always linear)
     Update: w += lr * advantage * grad_log_pi
+
+    Optionally backprops through spectral frequencies via d_obs/d_k.
     """
 
     def __init__(self, obs_dim: int = 4, hidden: int = 0,
                  lr: float = 1e-3, lr_baseline: float = 1e-2,
-                 gamma: float = 0.99, std: float = 0.5):
+                 gamma: float = 0.99, std: float = 0.5,
+                 lr_k: float = 0.0):
         self.gamma = gamma
         self.std = std
         self.lr = lr
         self.lr_baseline = lr_baseline
+        self.lr_k = lr_k
         self.hidden = hidden
         self.obs_dim = obs_dim
+        self._freq_grad = None  # set by end_episode() if lr_k > 0
 
         if hidden > 0:
             self.W1 = np.random.randn(hidden, obs_dim) * np.sqrt(2.0 / obs_dim)
@@ -374,6 +445,7 @@ class REINFORCEAgent:
         self._rew_buf = []
         self._h_buf = []
         self._mask_buf = []
+        self._grad_buf = []  # d_obs/d_k for frequency learning
 
         self._ret_mean = 0.0
         self._ret_var = 1.0
@@ -400,6 +472,10 @@ class REINFORCEAgent:
             self._h_buf.append(self._last_h.copy())
             self._mask_buf.append(self._last_mask.copy())
         return float(action)
+
+    def record_grad(self, d_obs_dk):
+        """Store d_obs/d_k for frequency backprop. None if not applicable."""
+        self._grad_buf.append(d_obs_dk)
 
     def record_reward(self, reward: float):
         self._rew_buf.append(reward)
@@ -484,12 +560,33 @@ class REINFORCEAgent:
             np.clip(self.w, -10.0, 10.0, out=self.w)
             self.b = np.clip(self.b, -10.0, 10.0)
 
+        # Frequency gradient: backprop through spectral encoder
+        # d_J/d_k = sum_t [advantage_t * d_logpi_t * (d_mean/d_obs) @ (d_obs/d_k)]
+        if self.lr_k > 0 and self._grad_buf and self._grad_buf[0] is not None:
+            n_k = self._grad_buf[0].shape[1]  # 2*K
+            grad_k = np.zeros(n_k)
+            for t in range(T):
+                d_obs_dk = self._grad_buf[t]  # (8, 2K)
+                if d_obs_dk is None:
+                    continue
+                mean_t = float(self.w @ obs[t] + self.b) if self.hidden == 0 else float(self.W2 @ self._h_buf[t] + self.b2)
+                d_logpi = (actions[t] - mean_t) / (self.std ** 2)
+                adv = advantages[t]
+                # d_mean/d_obs for linear: w. For MLP: W2 * mask @ W1
+                if self.hidden > 0:
+                    d_mean_d_obs = (self.W2 * self._mask_buf[t]) @ self.W1  # (obs_dim,)
+                else:
+                    d_mean_d_obs = self.w  # (obs_dim,)
+                grad_k += adv * d_logpi * (d_mean_d_obs @ d_obs_dk)  # (2K,)
+            self._freq_grad = self.lr_k * grad_k / T  # store for env to apply
+
         ep_return = returns[0]
         self._obs_buf.clear()
         self._act_buf.clear()
         self._rew_buf.clear()
         self._h_buf.clear()
         self._mask_buf.clear()
+        self._grad_buf.clear()
         return float(ep_return)
 
 
@@ -506,7 +603,7 @@ class ConvPolicyAgent:
     as a direct policy representation with minimal learned parameters.
     """
 
-    def __init__(self, n_channels: int = 6, kernel_size: int = 3,
+    def __init__(self, n_channels: int = 2, kernel_size: int = 3,
                  lr: float = 1e-3, gamma: float = 0.99, std: float = 0.3):
         self.ks = kernel_size
         self.lr = lr
@@ -661,24 +758,25 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
           seed: int = 0, verbose: bool = True, max_steps: int = 2000,
           opp_skill: float = 0.0, reward_mode: str = 'goal',
           obs_mode: str = 'raw', pool_mode: str = 'avg',
-          agent_type: str = 'reinforce'):
+          agent_type: str = 'reinforce', lr_k: float = 0.0):
     """Train agent, return per-episode results.
 
-    agent_type: 'reinforce' (standard) or 'conv_policy' (learns conv filter
-                over spectral feature maps, requires obs_mode='spectral').
+    lr_k: learning rate for spectral frequencies (0 = fixed frequencies).
     """
     np.random.seed(seed)
     env = PongEnv(opp_skill=opp_skill, reward_mode=reward_mode,
                   obs_mode=obs_mode, pool_mode=pool_mode)
 
     use_conv_policy = (agent_type == 'conv_policy')
+    learn_freqs = (lr_k > 0 and obs_mode == 'spectral' and pool_mode == 'spatial')
     if use_conv_policy:
         assert obs_mode == 'spectral', 'conv_policy requires obs_mode=spectral'
         agent = ConvPolicyAgent(lr=lr, gamma=gamma, std=std)
     else:
         agent = REINFORCEAgent(obs_dim=env.obs_dim, hidden=hidden,
                                lr=lr, lr_baseline=lr_baseline,
-                               gamma=gamma, std=std)
+                               gamma=gamma, std=std,
+                               lr_k=lr_k if learn_freqs else 0.0)
 
     results = []
     for ep in range(n_episodes):
@@ -688,6 +786,10 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
             if use_conv_policy:
                 fmaps = env.get_feature_maps()
                 action = agent.act(fmaps)
+            elif learn_freqs:
+                obs, d_obs_dk = env.obs_with_grad()
+                action = agent.act(obs)
+                agent.record_grad(d_obs_dk)
             else:
                 action = agent.act(obs)
             obs, reward, done = env.step(action)
@@ -696,6 +798,16 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
             if done:
                 break
         ep_return = agent.end_episode()
+
+        # Apply frequency gradient to wavepackets
+        if learn_freqs and hasattr(agent, '_freq_grad') and agent._freq_grad is not None:
+            K = env._K
+            grad = agent._freq_grad
+            env._wp_ball.k += grad[:K]
+            env._wp_pl.k += grad[K:2*K]
+            env._wp_ball.k = np.clip(env._wp_ball.k, 0.1, 5.0)
+            env._wp_pl.k = np.clip(env._wp_pl.k, 0.1, 5.0)
+            agent._freq_grad = None
         results.append({
             'length': step + 1,
             'reward': ep_reward,
@@ -738,6 +850,8 @@ def main():
     parser.add_argument('--agent-type', choices=['reinforce', 'conv_policy'],
                         default='reinforce',
                         help='conv_policy: learn conv filter as policy head')
+    parser.add_argument('--lr-k', type=float, default=0.0,
+                        help='Learning rate for spectral frequencies (0=fixed)')
     args = parser.parse_args()
 
     for seed in range(args.seeds):
@@ -748,7 +862,7 @@ def main():
                         gamma=args.gamma, std=args.std, seed=seed,
                         max_steps=args.max_steps, opp_skill=args.opp_skill,
                         reward_mode=args.reward_mode, obs_mode=args.obs_mode,
-                        agent_type=args.agent_type)
+                        agent_type=args.agent_type, lr_k=args.lr_k)
         last_200 = results[-200:] if len(results) >= 200 else results
         wins = sum(1 for r in last_200 if r['reward'] > 0)
         losses = sum(1 for r in last_200 if r['reward'] < 0)
