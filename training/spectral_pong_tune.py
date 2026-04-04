@@ -13,6 +13,7 @@ import argparse
 import numpy as np
 from spectral_pong_viz import (
     WavepacketObject2D, SimpleRLController, MLPController, build_raw_state,
+    MLPActorCriticController, MLPRawController,
     COURT_LEFT, COURT_RIGHT, COURT_TOP, COURT_BOTTOM,
     PADDLE_X_OFFSET, PADDLE_WIDTH, PADDLE_HEIGHT, PADDLE_SPEED,
     BALL_RADIUS, BALL_SPEED, SPIN_FACTOR,
@@ -28,7 +29,10 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                  force_scale: float = 0.0, lr_k: float = 0.0,
                  reward_replay_n: int = 5,
                  batch_size: int = 1,
-                 use_raw: bool = False) -> list[int]:
+                 use_raw: bool = False,
+                 nonlinear: bool = False,
+                 std_decay_frame: int = 0,
+                 std_final: float = 0.1) -> dict:
     """Run pong with RL paddles, return list of goal-frame indices."""
     np.random.seed(seed)
     K = 8
@@ -70,15 +74,25 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
                                       c_sin=np.zeros((K, NDIM)),
                                       lr=0.15, lr_tracking=0.0)
 
-    # RL controllers (actor-critic with TD(λ))
-    rl_kwargs = dict(lr_actor=lr_actor, lr_critic=lr_critic,
-                     gamma=gamma, lam=lam, std=std, batch_size=batch_size)
-    if use_raw:
-        rl_left = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
-        rl_right = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
+    # RL controllers
+    if nonlinear:
+        rl_kwargs = dict(lr_actor=lr_actor, lr_critic=lr_critic,
+                         gamma=gamma, std=std, batch_size=batch_size)
+        if use_raw:
+            rl_left = MLPRawController(state_dim=6, **rl_kwargs)
+            rl_right = MLPRawController(state_dim=6, **rl_kwargs)
+        else:
+            rl_left = MLPActorCriticController(state_dim=8, **rl_kwargs)
+            rl_right = MLPActorCriticController(state_dim=8, **rl_kwargs)
     else:
-        rl_left = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
-        rl_right = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
+        rl_kwargs = dict(lr_actor=lr_actor, lr_critic=lr_critic,
+                         gamma=gamma, lam=lam, std=std, batch_size=batch_size)
+        if use_raw:
+            rl_left = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
+            rl_right = MLPController(state_dim=MLPController.STATE_DIM, **rl_kwargs)
+        else:
+            rl_left = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
+            rl_right = SimpleRLController(SimpleRLController.STATE_DIM, **rl_kwargs)
 
     # Feature map grids for conv state extraction
     x_fm = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
@@ -94,6 +108,7 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
     paddle_rx = COURT_RIGHT - PADDLE_X_OFFSET
     half_h = PADDLE_HEIGHT / 2
     freeze = 0
+    total_touches = 0
 
     goal_frames = []
 
@@ -101,6 +116,11 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
         if freeze > 0:
             freeze -= 1
             continue
+
+        # Std annealing
+        if std_decay_frame > 0 and t == std_decay_frame:
+            rl_left.std = std_final
+            rl_right.std = std_final
 
         # -- RL paddle movement --
         if use_raw:
@@ -146,6 +166,7 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             spd = np.hypot(ball['vx'], ball['vy'])
             ball['vx'] *= ball_speed / spd
             ball['vy'] *= ball_speed / spd
+            total_touches += 1
 
         if (ball['vx'] > 0
                 and ball['x'] + BALL_RADIUS >= paddle_rx - PADDLE_WIDTH / 2
@@ -158,6 +179,7 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             spd = np.hypot(ball['vx'], ball['vy'])
             ball['vx'] *= ball_speed / spd
             ball['vy'] *= ball_speed / spd
+            total_touches += 1
 
         # Scoring
         scored = False
@@ -209,7 +231,8 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
 
             rl_left.reward_update(ball['x'], reward)
             rl_right.reward_update(ball['x'], -reward)
-            term_state = np.zeros(SimpleRLController.STATE_DIM)
+            sdim = rl_left.W1_c.shape[1] if hasattr(rl_left, 'W1_c') else len(rl_left.w_c)
+            term_state = np.zeros(sdim)
             rl_left.step(term_state, reward)
             rl_right.step(term_state, -reward)
             rl_left.on_reset()
@@ -304,7 +327,7 @@ def run_headless(n_frames: int = 6000, lr_actor: float = 3e-3,
             rl_left.step(ns_l, reward)
             rl_right.step(ns_r, -reward)
 
-    return goal_frames
+    return {'goal_frames': goal_frames, 'touches': total_touches}
 
 
 def analyse(goal_frames: list[int], n_frames: int,
@@ -361,6 +384,8 @@ def main():
                         help='Batch size for gradient updates (default: 1 = per-frame)')
     parser.add_argument('--raw', action='store_true',
                         help='Use raw MLP controller (no spectral encoder)')
+    parser.add_argument('--nonlinear', action='store_true',
+                        help='Use MLP actor-critic (nonlinear policy)')
     args = parser.parse_args()
 
     if args.lr is not None:
@@ -388,11 +413,13 @@ def main():
     for cfg in configs:
         improvements = []
         for seed in range(args.seeds):
-            goals = run_headless(n_frames=args.frames, seed=seed, **cfg,
-                                 verbose=False, batch_size=args.batch_size,
-                                 use_raw=args.raw)
+            run = run_headless(n_frames=args.frames, seed=seed, **cfg,
+                              verbose=False, batch_size=args.batch_size,
+                              use_raw=args.raw, nonlinear=args.nonlinear)
+            goals = run['goal_frames']
             label = (f'lr_a={cfg["lr_actor"]:.0e} lr_c={cfg["lr_critic"]:.0e} '
-                     f'std={cfg["std"]:.1f} γ={cfg["gamma"]:.2f} seed={seed}')
+                     f'std={cfg["std"]:.1f} γ={cfg["gamma"]:.2f} seed={seed}'
+                     f' touches={run["touches"]}')
             result = analyse(goals, args.frames, label=label)
             if result:
                 improvements.append(result['improvement'])

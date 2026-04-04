@@ -814,6 +814,166 @@ class MLPController(SimpleRLController):
         self.prev_state = None
 
 
+# -- MLP actor-critic (nonlinear policy) ---------------------------------------
+
+class MLPActorCriticController(SimpleRLController):
+    """Nonlinear actor-critic with hidden layer on spectral conv features.
+
+    Actor:  state(8) → W1(H×8)+b1 → ReLU → W2(1×H)+b2 → tanh → mean
+    Critic: state(8) → W1(H×8)+b1 → ReLU → W2(1×H)+b2 → value
+
+    Batch-only: accumulates transitions, applies averaged TD(0) gradients.
+    """
+
+    def __init__(self, state_dim: int = 8, hidden: int = 32,
+                 lr_actor: float = 3e-3, lr_critic: float = 3e-2,
+                 gamma: float = 0.3, std: float = 0.3,
+                 batch_size: int = 128, **kwargs):
+        kwargs.pop('lam', None)
+        kwargs.pop('K', None)
+        kwargs.pop('frequencies', None)
+        super().__init__(state_dim=state_dim, lr_actor=lr_actor,
+                         lr_critic=lr_critic, gamma=gamma, lam=0.0,
+                         std=std, batch_size=max(batch_size, 2), **kwargs)
+        # Override linear weights with MLP
+        self.hidden = hidden
+        # Actor MLP
+        self.W1_a = np.random.randn(hidden, state_dim) * np.sqrt(2.0 / state_dim)
+        self.b1_a = np.zeros(hidden)
+        self.W2_a = np.random.randn(1, hidden) * 0.01
+        self.b2_a = 0.0
+        # Critic MLP
+        self.W1_c = np.random.randn(hidden, state_dim) * np.sqrt(2.0 / state_dim)
+        self.b1_c = np.zeros(hidden)
+        self.W2_c = np.random.randn(1, hidden) * 0.01
+        self.b2_c = 0.0
+
+    def _value(self, state: np.ndarray) -> float:
+        h = state @ self.W1_c.T + self.b1_c
+        h_relu = np.maximum(h, 0)
+        return float(self.W2_c.ravel() @ h_relu + self.b2_c)
+
+    def act(self, raw_state: np.ndarray) -> float:
+        state = self._normalize(raw_state)
+        # MLP forward
+        h = state @ self.W1_a.T + self.b1_a
+        mask = (h > 0).astype(np.float64)
+        h_relu = h * mask
+        z = float(self.W2_a.ravel() @ h_relu + self.b2_a)
+        mean = np.tanh(z)
+        action = float(np.clip(mean + self.std * np.random.randn(), -1, 1))
+        # Policy gradient components
+        d_logpi = (action - mean) / (self.std ** 2)
+        d_z = d_logpi * (1 - mean ** 2)
+        self._pending_act = {
+            'state': state.copy(),
+            'd_z': d_z,
+            'h_relu': h_relu.copy(),
+            'mask': mask.copy(),
+        }
+        self.last_mean = mean
+        self.last_action = action
+        self.last_value = self._value(state)
+        return action
+
+    def step(self, raw_state: np.ndarray, reward: float) -> None:
+        state = self._normalize(raw_state)
+        if self.prev_state is None:
+            self.prev_state = state.copy()
+            return
+        v_prev = self._value(self.prev_state)
+        v_curr = self._value(state)
+        td_error = reward + self.gamma * v_curr - v_prev
+        td_error = np.clip(td_error, -self.TD_CLIP, self.TD_CLIP)
+        self.last_td_error = td_error
+        if self._pending_act is not None:
+            self._buffer.append({
+                'state': self._pending_act['state'],
+                'd_z': self._pending_act['d_z'],
+                'h_relu': self._pending_act['h_relu'],
+                'mask': self._pending_act['mask'],
+                'reward': reward,
+                'next_state': state.copy(),
+                'terminal': False,
+            })
+            self._pending_act = None
+            if len(self._buffer) >= self.batch_size:
+                self._flush_batch()
+        self.prev_state = state.copy()
+
+    def _flush_batch(self) -> None:
+        if not self._buffer:
+            return
+        n = len(self._buffer)
+        gW1_c = np.zeros_like(self.W1_c)
+        gb1_c = np.zeros_like(self.b1_c)
+        gW2_c = np.zeros_like(self.W2_c)
+        gb2_c = 0.0
+        gW1_a = np.zeros_like(self.W1_a)
+        gb1_a = np.zeros_like(self.b1_a)
+        gW2_a = np.zeros_like(self.W2_a)
+        gb2_a = 0.0
+
+        for t in self._buffer:
+            s, ns, r = t['state'], t['next_state'], t['reward']
+            v_s = self._value(s)
+            v_ns = 0.0 if t['terminal'] else self._value(ns)
+            delta = np.clip(r + self.gamma * v_ns - v_s,
+                            -self.TD_CLIP, self.TD_CLIP)
+            # Critic gradient: delta * dV/dparams
+            h_c = s @ self.W1_c.T + self.b1_c
+            mask_c = (h_c > 0).astype(np.float64)
+            h_relu_c = h_c * mask_c
+            gW2_c += delta * h_relu_c
+            gb2_c += delta
+            d_h_c = self.W2_c.ravel() * mask_c
+            gW1_c += delta * np.outer(d_h_c, s)
+            gb1_c += delta * d_h_c
+            # Actor gradient: delta * d_z * dz/dparams
+            d_z = t['d_z']
+            h_relu_a = t['h_relu']
+            mask_a = t['mask']
+            gW2_a += delta * d_z * h_relu_a
+            gb2_a += delta * d_z
+            d_h_a = d_z * self.W2_a.ravel() * mask_a
+            gW1_a += delta * np.outer(d_h_a, s)
+            gb1_a += delta * d_h_a
+
+        inv_n = 1.0 / n
+        self.W1_c += self.lr_critic * inv_n * gW1_c
+        self.b1_c += self.lr_critic * inv_n * gb1_c
+        self.W2_c += self.lr_critic * inv_n * gW2_c.reshape(self.W2_c.shape)
+        self.b2_c += self.lr_critic * inv_n * gb2_c
+        self.W1_a += self.lr_actor * inv_n * gW1_a
+        self.b1_a += self.lr_actor * inv_n * gb1_a
+        self.W2_a += self.lr_actor * inv_n * gW2_a.reshape(self.W2_a.shape)
+        self.b2_a += self.lr_actor * inv_n * gb2_a
+        # Clip all weights
+        for arr in [self.W1_c, self.b1_c, self.W2_c,
+                    self.W1_a, self.b1_a, self.W2_a]:
+            np.clip(arr, -self.WEIGHT_CLIP, self.WEIGHT_CLIP, out=arr)
+        self.b2_c = np.clip(self.b2_c, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
+        self.b2_a = np.clip(self.b2_a, -self.WEIGHT_CLIP, self.WEIGHT_CLIP)
+        self._buffer.clear()
+
+    def on_reset(self) -> None:
+        if self._buffer:
+            self._buffer[-1]['terminal'] = True
+        self._pending_act = None
+        self.prev_state = None
+
+
+class MLPRawController(MLPActorCriticController):
+    """MLP actor-critic on raw game state (no spectral encoder)."""
+
+    STATE_DIM = 6
+
+    def __init__(self, state_dim: int = 6, **kwargs):
+        super().__init__(state_dim=state_dim, **kwargs)
+        self.conv = None
+        self.lr_conv = 0.0
+
+
 # -- helpers ------------------------------------------------------------------
 
 def reset_ball(ball: dict, toward: str = 'random',
