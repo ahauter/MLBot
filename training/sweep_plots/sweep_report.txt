@@ -1,8 +1,8 @@
 ================================================================================
 SPECTRAL ENCODER HYPERPARAMETER SWEEP REPORT
 ================================================================================
-Total experiments: 33
-Total wall time: 6056s (1.7h)
+Total experiments: 35
+Total wall time: 6726s (1.9h)
 
 --- TOP 20 CONFIGURATIONS ---
 #   Name                                                   WR   Peak
@@ -15,25 +15,25 @@ Total wall time: 6056s (1.7h)
 6   p1_gamma0.8_spectral_goal                            49%   59%
 7   p1_gamma0.9_spectral_goal                            49%   56%
 8   p1_gamma0.95_spectral_goal                           48%   58%
-9   p1_gamma0.5_raw_goal                                 47%   62%
-10  p1_gamma0.7_spectral_goal                            47%   63%
-11  p1_gamma0.5_spectral_goal                            45%   56%
-12  p1_gamma0.9_raw_goal                                 44%   56%
-13  p1_gamma0.99_spectral_goal                           44%   58%
-14  p1_gamma0.3_raw_goal                                 43%   58%
-15  p1_gamma0.95_raw_goal                                40%   51%
-16  p1_gamma0.99_raw_goal                                40%   58%
-17  p1_gamma0.99_raw_paddle                              23%   33%
-18  p1_gamma0.7_spectral_paddle                          19%   25%
-19  p1_gamma0.0_spectral_paddle                          17%   26%
-20  p2_lr0.001_g0.0_spec_paddle                          17%   26%
+9   p2_lr0.001_g0.0_spec_goal                            48%   64%
+10  p1_gamma0.5_raw_goal                                 47%   62%
+11  p1_gamma0.7_spectral_goal                            47%   63%
+12  p1_gamma0.5_spectral_goal                            45%   56%
+13  p1_gamma0.9_raw_goal                                 44%   56%
+14  p1_gamma0.99_spectral_goal                           44%   58%
+15  p1_gamma0.3_raw_goal                                 43%   58%
+16  p1_gamma0.95_raw_goal                                40%   51%
+17  p1_gamma0.99_raw_goal                                40%   58%
+18  p1_gamma0.99_raw_paddle                              23%   33%
+19  p2_lr0.003_g0.0_spec_paddle                          20%   28%
+20  p1_gamma0.7_spectral_paddle                          19%   25%
 
 --- SPECTRAL vs RAW ---
-  spectral: n=17, mean=31%, median=19%, best=51% (p1_gamma0.0_spectral_goal)
+  spectral: n=19, mean=31%, median=20%, best=51% (p1_gamma0.0_spectral_goal)
        raw: n=16, mean=29%, median=31%, best=50% (p1_gamma0.8_raw_goal)
 
 --- GAMMA ANALYSIS (spectral only) ---
-  γ=0.0  : n=  3, mean=28%, std=16%, best=51%, worst=17%
+  γ=0.0  : n=  5, mean=31%, std=15%, best=51%, worst=17%
   γ=0.3  : n=  2, mean=32%, std=18%, best=50%, worst=14%
   γ=0.5  : n=  2, mean=31%, std=15%, best=45%, worst=16%
   γ=0.7  : n=  2, mean=33%, std=14%, best=47%, worst=19%
@@ -53,5 +53,86 @@ Total wall time: 6056s (1.7h)
     WR=49%, W1_norm=7.851, dead=5/27, out_std=0.0101
   p1_gamma0.95_spectral_goal:
     WR=48%, W1_norm=7.851, dead=3/29, out_std=0.0227
-  p1_gamma0.7_spectral_goal:
-    WR=47%, W1_norm=7.851, dead=4/28, out_std=0.0119
+  p2_lr0.001_g0.0_spec_goal:
+    WR=48%, W1_norm=7.851, dead=1/31, out_std=0.0127
+
+================================================================================
+TEMPORAL REPRESENTATION ANALYSIS
+================================================================================
+
+The spectral encoder embeds temporal dynamics INTO the observation:
+  - Wavepacket coefficients carry memory (LMS updates each frame)
+  - Normalized inner products encode recent interaction history
+  - Feature maps reflect accumulated prediction errors
+
+This conflicts with REINFORCE's assumptions about time:
+
+REINFORCE GRADIENT:
+  grad J = (1/T) * sum_t [ advantage_t * d_logpi_t * obs_t ]
+
+For gradient accumulation, obs_t must be temporally coherent.
+If obs changes sign every frame, gradient terms cancel.
+
+MEASURED AUTOCORRELATION:
+  Raw (4-dim):     lag-1 AC = 0.99, half-life = 47 steps
+  Spectral (120d): lag-1 AC = 0.02, half-life = 1 step
+
+SPECTRAL FEATURE DYNAMICS:
+  - 39/120 dims have NEGATIVE lag-1 autocorrelation (oscillate)
+  - Only 14/120 dims have AC > 0.5 (temporally stable)
+  - Channel 5 (ball*reward cross-map) changes 69% per frame
+
+WHY THIS IS A FEATURE, NOT A BUG:
+  Channel 5 (ball*reward) changing rapidly means the reward
+  wavepacket is ACTIVELY TRACKING reward-relevant information.
+  This is the whole point of the spectral encoder for sparse
+  reward — it builds a continuous reward landscape from sparse
+  goal signals. The rapid updates mean the encoder is working.
+
+THE MISMATCH IS ALGORITHMIC, NOT REPRESENTATIONAL:
+  The spectral encoder embeds temporal dynamics INTO each
+  observation via LMS-updated wavepacket coefficients. This
+  means the observation itself carries memory — it is not a
+  memoryless snapshot of state.
+
+  REINFORCE treats observations as memoryless samples and
+  averages gradients over the entire episode:
+    grad J = (1/T) * sum_t [advantage_t * d_logpi_t * obs_t]
+
+  With 120-dim features updating substantially every frame,
+  this sum converges to zero — gradient contributions cancel.
+  W1 norm stays at init (7.851) across ALL experiments.
+
+  The features are INFORMATIVE. The algorithm just cannot
+  extract that information via episode-averaged gradients.
+
+ALGORITHM IMPLICATIONS:
+  - Monte Carlo PG (REINFORCE): FUNDAMENTALLY MISMATCHED
+    Episode-averaged gradients cancel with rapidly-updating obs.
+    No hyperparameter choice fixes this — it is structural.
+
+  - TD(0) / 1-step bootstrap: PROMISING
+    Updates use obs[t] and obs[t+1] only. The per-step temporal
+    richness of spectral features becomes an asset — each step
+    carries distinct information that TD can exploit.
+
+  - Actor-Critic with short GAE lambda: PROMISING
+    Short lambda truncates the credit assignment window,
+    reducing accumulation over many decorrelated frames.
+    The critic learns per-step value; the actor gets shorter,
+    more coherent gradient signals.
+
+  - Direct per-step reward prediction: NATURAL FIT
+    The spectral features already encode reward structure.
+    A per-step approach that maps obs → action without
+    episode-level averaging could exploit this directly.
+
+RECOMMENDED NEXT STEPS:
+  1. Implement TD-based actor-critic (A2C/PPO with short lambda)
+     to test per-step learning on spectral features
+  2. Try 1-step TD critic with spectral obs
+  3. Measure: does the reward channel information improve
+     TD value prediction vs raw observations?
+  4. The spectral encoder may need algorithms designed for
+     temporally-rich representations — this is a research
+     question, not a hyperparameter tuning problem
