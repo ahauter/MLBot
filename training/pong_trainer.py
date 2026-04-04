@@ -55,13 +55,14 @@ class PongEnv:
     """
 
     def __init__(self, opp_skill: float = 0.0, reward_mode: str = 'goal',
-                 obs_mode: str = 'raw'):
+                 obs_mode: str = 'raw', pool_mode: str = 'avg'):
         self.paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
         self.paddle_rx = COURT_RIGHT - PADDLE_X_OFFSET
         self.half_h = PADDLE_HEIGHT / 2.0
         self.opp_skill = opp_skill
         self.reward_mode = reward_mode
         self.obs_mode = obs_mode
+        self._pool_mode = pool_mode
 
         if obs_mode == 'spectral':
             self._init_spectral()
@@ -191,7 +192,24 @@ class PongEnv:
         fmaps = self._compute_feature_maps(
             self._wp_ball, self._wp_env, self._wp_pl, self._wp_pr,
             self._wp_reward, self._x_fm, self._y_fm, self._r_fm)
+        if self._pool_mode == 'max':
+            return self._conv_maxpool(fmaps)
         return self._conv.forward_fast(fmaps)
+
+    def _conv_maxpool(self, fmaps: np.ndarray) -> np.ndarray:
+        """Conv → ReLU → max pool (instead of avg pool)."""
+        conv = self._conv
+        W_flat = conv.W.reshape(conv.n_filters, -1)
+        ks = conv.ks
+        C, H, W = fmaps.shape
+        oH, oW = H - ks + 1, W - ks + 1
+        patches = np.lib.stride_tricks.as_strided(
+            fmaps, shape=(oH, oW, C, ks, ks),
+            strides=(fmaps.strides[1], fmaps.strides[2],
+                     fmaps.strides[0], fmaps.strides[1], fmaps.strides[2])
+        ).reshape(oH * oW, -1)
+        pre_relu = patches @ W_flat.T + conv.b
+        return np.maximum(pre_relu, 0).max(axis=0)
 
     def _raw_obs(self) -> np.ndarray:
         """4-dim egocentric observation."""
@@ -475,11 +493,11 @@ def train(n_episodes: int = 2000, hidden: int = 0, lr: float = 1e-3,
           lr_baseline: float = 1e-2, gamma: float = 0.99, std: float = 0.5,
           seed: int = 0, verbose: bool = True, max_steps: int = 2000,
           opp_skill: float = 0.0, reward_mode: str = 'goal',
-          obs_mode: str = 'raw'):
+          obs_mode: str = 'raw', pool_mode: str = 'avg'):
     """Train agent, return per-episode results."""
     np.random.seed(seed)
     env = PongEnv(opp_skill=opp_skill, reward_mode=reward_mode,
-                  obs_mode=obs_mode)
+                  obs_mode=obs_mode, pool_mode=pool_mode)
     agent = REINFORCEAgent(obs_dim=env.obs_dim, hidden=hidden,
                            lr=lr, lr_baseline=lr_baseline,
                            gamma=gamma, std=std)
