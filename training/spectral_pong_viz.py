@@ -164,12 +164,17 @@ class WavepacketObject2D:
                      self.c_sin[:, axis] @ int_sin)
 
     def integrate_squared(self, axis: int) -> float:
-        """∫ F_d(x)² dx over world bounds (numerical trapezoidal)."""
+        """∫ F_d(x)² dx over world bounds.
+
+        Uses Parseval-like identity: for F = Σ [a_j cos(k_j x) + b_j sin(k_j x)],
+        ∫F²dx ≈ (b-a)/2 · Σ_j (a_j² + b_j²) when the domain spans many wavelengths.
+        This is exact for orthogonal basis and a good approximation for our frequencies.
+        """
         a, b = WORLD_BOUNDS[axis]
-        grid = np.linspace(a, b, 200)
-        v2 = self.evaluate(grid, axis) ** 2
-        dx = (b - a) / 199
-        return float((v2[0] + v2[-1]) * 0.5 + v2[1:-1].sum()) * dx
+        L = b - a
+        cc = self.c_cos[:, axis]
+        ss = self.c_sin[:, axis]
+        return float(0.5 * L * np.sum(cc**2 + ss**2))
 
     def normalize(self) -> None:
         """Rescale coefficients so ∫ F_d(x)² dx = 1 (F² is PMF)."""
@@ -244,14 +249,14 @@ class WavepacketObject2D:
         return float(np.linalg.norm(nip) / np.sqrt(self.ndim))
 
     def shift(self, delta: float, axis: int) -> None:
-        """Fourier-domain phase rotation for one axis."""
-        for j in range(self.K):
-            angle = self.k[j] * delta
-            ca, sa = np.cos(angle), np.sin(angle)
-            oc = self.c_cos[j, axis]
-            os = self.c_sin[j, axis]
-            self.c_cos[j, axis] = oc * ca - os * sa
-            self.c_sin[j, axis] = oc * sa + os * ca
+        """Fourier-domain phase rotation for one axis (vectorized)."""
+        angles = self.k * delta  # (K,)
+        ca = np.cos(angles)
+        sa = np.sin(angles)
+        oc = self.c_cos[:, axis].copy()
+        os = self.c_sin[:, axis].copy()
+        self.c_cos[:, axis] = oc * ca - os * sa
+        self.c_sin[:, axis] = oc * sa + os * ca
 
     def predict_force(self, field_wp: 'WavepacketObject2D',
                       nip: float,

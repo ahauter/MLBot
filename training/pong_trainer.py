@@ -68,18 +68,22 @@ class StridedConvExtractor:
         self.out_dim = n_filters * oH2 * oW2  # 8 * 3 * 5 = 120
 
     def _strided_conv2d(self, x, W, b, stride):
-        """Apply conv2d with stride. x: (C, H, W), W: (F, C, ks, ks) → (F, oH, oW)."""
+        """Apply conv2d with stride using vectorized im2col.
+        x: (C, H, W), W: (F, C, ks, ks) → (F, oH, oW)."""
         F, C, ks, _ = W.shape
         _, H, Wx = x.shape
         oH = (H - ks) // stride + 1
         oW = (Wx - ks) // stride + 1
-        out = np.empty((F, oH, oW))
-        for f in range(F):
-            for i in range(oH):
-                for j in range(oW):
-                    si, sj = i * stride, j * stride
-                    out[f, i, j] = np.sum(
-                        x[:, si:si+ks, sj:sj+ks] * W[f]) + b[f]
+        # im2col: extract all patches at stride positions
+        # Shape: (oH, oW, C, ks, ks)
+        patches = np.lib.stride_tricks.as_strided(
+            x,
+            shape=(oH, oW, C, ks, ks),
+            strides=(x.strides[1] * stride, x.strides[2] * stride,
+                     x.strides[0], x.strides[1], x.strides[2])
+        ).reshape(oH * oW, C * ks * ks)
+        W_flat = W.reshape(F, -1)
+        out = (patches @ W_flat.T + b).reshape(oH, oW, F).transpose(2, 0, 1)
         return out
 
     def forward(self, fmaps: np.ndarray) -> np.ndarray:
@@ -581,6 +585,24 @@ class REINFORCEAgent:
             self._freq_grad = self.lr_k * grad_k / T  # store for env to apply
 
         ep_return = returns[0]
+
+        # Store episode diagnostics for instrumentation
+        self.last_ep_stats = {
+            'return_mean': float(returns.mean()),
+            'return_std': float(returns.std()),
+            'advantage_mean': float(advantages.mean()),
+            'advantage_std': float(advantages.std()),
+            'advantage_abs_mean': float(np.abs(advantages).mean()),
+            'value_pred_mean': float(values.mean()),
+            'value_pred_std': float(values.std()),
+            'value_error': float(np.mean((values - returns_norm) ** 2)),
+            'action_mean': float(actions.mean()),
+            'action_std': float(actions.std()),
+            'obs_mean': float(obs.mean()),
+            'obs_std': float(obs.std()),
+            'ep_length': T,
+        }
+
         self._obs_buf.clear()
         self._act_buf.clear()
         self._rew_buf.clear()
