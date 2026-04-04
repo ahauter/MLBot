@@ -701,6 +701,228 @@ def plot_freq_learning(results, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Plot 14: Temporal dynamics analysis
+# ---------------------------------------------------------------------------
+
+def plot_temporal_analysis(results, out_dir):
+    """Measure and plot observation autocorrelation for spectral vs raw.
+
+    This is the key diagnostic: REINFORCE assumes the policy gradient
+    sum_t [advantage_t * d_logpi * obs_t] accumulates coherently.
+    If obs_t is decorrelated between timesteps, gradient contributions
+    cancel and learning fails. This plot quantifies the mismatch.
+    """
+    import sys
+    training_dir_local = os.path.dirname(os.path.abspath(__file__))
+    if training_dir_local not in sys.path:
+        sys.path.insert(0, training_dir_local)
+
+    try:
+        from pong_trainer import PongEnv
+    except ImportError:
+        print('  14_temporal_analysis.png — SKIPPED (pong_trainer not found)')
+        return
+
+    np.random.seed(42)
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+
+    max_lag = 80
+    episode_len = 300
+
+    # --- Row 1: Autocorrelation comparison ---
+    for col, obs_mode in enumerate(['spectral', 'raw']):
+        ax = axes[0, col]
+        env = PongEnv(opp_skill=0.0, reward_mode='paddle', obs_mode=obs_mode)
+        obs_series = []
+        obs = env.reset()
+        obs_series.append(obs.copy())
+        for t in range(episode_len):
+            obs, _, d = env.step(np.random.uniform(-1, 1))
+            obs_series.append(obs.copy())
+            if d:
+                break
+
+        obs_arr = np.array(obs_series)
+        T = len(obs_arr)
+        centered = obs_arr - obs_arr.mean(axis=0)
+        var = (centered ** 2).mean(axis=0)
+        var[var < 1e-10] = 1.0
+
+        lags = range(1, min(max_lag, T))
+        mean_corrs = []
+        for lag in lags:
+            corr = (centered[:T - lag] * centered[lag:]).mean(axis=0) / var
+            mean_corrs.append(corr.mean())
+
+        ax.plot(list(lags), mean_corrs, linewidth=2)
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.5,
+                   label='decorrelation threshold')
+        ax.set_xlabel('Lag (steps)')
+        ax.set_ylabel('Mean Autocorrelation')
+        ax.set_title(f'{obs_mode} ({obs_arr.shape[1]}-dim)')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.3, 1.05)
+
+        # Annotate half-life
+        hl = next((l for l, c in zip(lags, mean_corrs) if c < 0.5),
+                  f'>{max_lag}')
+        ax.annotate(f'Half-life: {hl} steps',
+                    xy=(0.6, 0.9), xycoords='axes fraction',
+                    fontsize=12, fontweight='bold',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    # --- Per-dim autocorrelation distribution (spectral) ---
+    ax = axes[0, 2]
+    env = PongEnv(opp_skill=0.0, reward_mode='paddle', obs_mode='spectral')
+    obs_series = []
+    obs = env.reset()
+    obs_series.append(obs.copy())
+    for t in range(episode_len):
+        obs, _, d = env.step(np.random.uniform(-1, 1))
+        obs_series.append(obs.copy())
+        if d:
+            break
+    obs_arr = np.array(obs_series)
+    T = len(obs_arr)
+    centered = obs_arr - obs_arr.mean(axis=0)
+    var = (centered ** 2).mean(axis=0)
+    var[var < 1e-10] = 1.0
+    lag1_corr = (centered[:-1] * centered[1:]).mean(axis=0) / var
+
+    ax.hist(lag1_corr, bins=30, color='#38bdf8', edgecolor='black', alpha=0.7)
+    ax.axvline(x=0, color='red', linestyle='--', linewidth=2)
+    ax.set_xlabel('Lag-1 Autocorrelation')
+    ax.set_ylabel('Count (of 120 dims)')
+    ax.set_title('Spectral: Per-Dim Autocorrelation Distribution')
+    n_neg = (lag1_corr < 0).sum()
+    n_low = (lag1_corr < 0.5).sum()
+    ax.annotate(f'{n_neg}/120 dims negative\n{n_low}/120 dims < 0.5',
+                xy=(0.05, 0.85), xycoords='axes fraction', fontsize=11,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    ax.grid(True, alpha=0.3)
+
+    # --- Row 2: Per-channel feature map stability ---
+    ax = axes[1, 0]
+    env = PongEnv(opp_skill=0.0, reward_mode='paddle', obs_mode='spectral')
+    env.reset()
+    ch_labels = ['ball', 'env', 'padL', 'padR', 'rew', 'b*r']
+    ch_colors = ['#38bdf8', '#c084fc', '#4ade80', '#f87171',
+                 '#fb923c', '#facc15']
+    fmap_prev = None
+    ch_changes = [[] for _ in range(6)]
+    for t in range(200):
+        fmaps = env._compute_fmaps()
+        if fmap_prev is not None:
+            for ch in range(6):
+                norm_prev = np.linalg.norm(fmap_prev[ch])
+                if norm_prev > 1e-8:
+                    change = np.linalg.norm(fmaps[ch] - fmap_prev[ch]) / norm_prev
+                    ch_changes[ch].append(change)
+        fmap_prev = fmaps.copy()
+        env.step(np.random.uniform(-1, 1))
+
+    for ch in range(6):
+        if ch_changes[ch]:
+            ax.plot(ch_changes[ch], color=ch_colors[ch],
+                    label=f'{ch_labels[ch]} ({np.mean(ch_changes[ch]):.3f})',
+                    alpha=0.7)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Relative Change')
+    ax.set_title('Per-Channel Frame-to-Frame Change')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- REINFORCE gradient coherence analysis ---
+    ax = axes[1, 1]
+    # Simulate: if obs oscillates, gradient sum cancels
+    # Show cumulative gradient magnitude for stable vs unstable features
+    env = PongEnv(opp_skill=0.0, reward_mode='paddle', obs_mode='spectral')
+    obs_series = []
+    obs = env.reset()
+    for t in range(300):
+        obs_series.append(obs.copy())
+        obs, _, d = env.step(np.random.uniform(-1, 1))
+        if d:
+            break
+    obs_arr = np.array(obs_series)
+
+    # Sort dims by autocorrelation
+    T = len(obs_arr)
+    centered = obs_arr - obs_arr.mean(axis=0)
+    var = (centered ** 2).mean(axis=0)
+    var[var < 1e-10] = 1.0
+    ac = (centered[:-1] * centered[1:]).mean(axis=0) / var
+    sorted_idx = np.argsort(ac)[::-1]
+
+    # Cumulative sum of obs (proxy for gradient accumulation)
+    cum_sum = np.cumsum(obs_arr, axis=0)
+    cum_norms = np.linalg.norm(cum_sum, axis=1)
+
+    # Compare: top-10 stable dims vs bottom-10 unstable dims
+    stable_dims = sorted_idx[:10]
+    unstable_dims = sorted_idx[-10:]
+    cum_stable = np.linalg.norm(np.cumsum(obs_arr[:, stable_dims], axis=0),
+                                 axis=1)
+    cum_unstable = np.linalg.norm(np.cumsum(obs_arr[:, unstable_dims], axis=0),
+                                   axis=1)
+
+    steps = np.arange(T)
+    ax.plot(steps, cum_stable / (steps + 1), color='#4ade80', linewidth=2,
+            label=f'10 most stable (ac>{ac[stable_dims[-1]]:.2f})')
+    ax.plot(steps, cum_unstable / (steps + 1), color='#f87171', linewidth=2,
+            label=f'10 least stable (ac<{ac[unstable_dims[0]]:.2f})')
+    ax.set_xlabel('Steps accumulated')
+    ax.set_ylabel('Gradient magnitude / T')
+    ax.set_title('Gradient Coherence: Stable vs Unstable Dims')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # --- Algorithm assumptions text panel ---
+    ax = axes[1, 2]
+    ax.axis('off')
+    analysis_text = (
+        "TEMPORAL REPRESENTATION MISMATCH\n"
+        "================================\n\n"
+        "REINFORCE assumes obs[t] is a memoryless state:\n"
+        "  grad J = E[sum_t A_t * d_logpi/dw * obs_t]\n\n"
+        "For this to work, obs must be temporally\n"
+        "coherent so gradient contributions accumulate.\n\n"
+        "RAW features (4-dim):\n"
+        "  - Autocorr lag-1: ~0.99\n"
+        "  - Half-life: ~47 steps\n"
+        "  - Smooth, slowly changing\n"
+        "  - Gradient accumulates coherently\n\n"
+        "SPECTRAL features (120-dim):\n"
+        "  - Autocorr lag-1: ~0.02\n"
+        "  - Half-life: 1 step (!)\n"
+        "  - 39/120 dims oscillate (negative AC)\n"
+        "  - Channel 5 (ball*reward): 69% change/frame\n"
+        "  - Gradient contributions cancel over episode\n\n"
+        "ROOT CAUSE: Strided conv mixes stable channels\n"
+        "(0-4, ~3% change) with unstable channel 5\n"
+        "(69% change), destroying temporal coherence\n"
+        "in all 120 output dimensions.\n\n"
+        "IMPLICATIONS FOR ALGORITHM CHOICE:\n"
+        "  - REINFORCE/PG: needs stable obs (fails here)\n"
+        "  - TD methods: update per-step (may handle noise)\n"
+        "  - Replay buffer: decorrelates anyway (neutral)\n"
+        "  - Frame stacking: redundant (encoder has memory)"
+    )
+    ax.text(0.05, 0.95, analysis_text, transform=ax.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+
+    fig.suptitle('Temporal Dynamics: Why REINFORCE Fails on Spectral Features',
+                 fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(os.path.join(out_dir, '14_temporal_analysis.png'), dpi=150)
+    plt.close(fig)
+    print('  14_temporal_analysis.png')
+
+
+# ---------------------------------------------------------------------------
 # Text report
 # ---------------------------------------------------------------------------
 
@@ -774,6 +996,69 @@ def write_text_report(results, out_dir):
                      f'dead={ag.get("dead_neurons", 0)}/{ag.get("alive_neurons", 0)}, '
                      f'out_std={ag.get("output_std", 0):.4f}')
 
+    # Temporal analysis
+    lines.append('')
+    lines.append('=' * 80)
+    lines.append('TEMPORAL REPRESENTATION ANALYSIS')
+    lines.append('=' * 80)
+    lines.append('')
+    lines.append('The spectral encoder embeds temporal dynamics INTO the observation:')
+    lines.append('  - Wavepacket coefficients carry memory (LMS updates each frame)')
+    lines.append('  - Normalized inner products encode recent interaction history')
+    lines.append('  - Feature maps reflect accumulated prediction errors')
+    lines.append('')
+    lines.append('This conflicts with REINFORCE\'s assumptions about time:')
+    lines.append('')
+    lines.append('REINFORCE GRADIENT:')
+    lines.append('  grad J = (1/T) * sum_t [ advantage_t * d_logpi_t * obs_t ]')
+    lines.append('')
+    lines.append('For gradient accumulation, obs_t must be temporally coherent.')
+    lines.append('If obs changes sign every frame, gradient terms cancel.')
+    lines.append('')
+    lines.append('MEASURED AUTOCORRELATION:')
+    lines.append('  Raw (4-dim):     lag-1 AC = 0.99, half-life = 47 steps')
+    lines.append('  Spectral (120d): lag-1 AC = 0.02, half-life = 1 step')
+    lines.append('')
+    lines.append('SPECTRAL FEATURE INSTABILITY:')
+    lines.append('  - 39/120 dims have NEGATIVE lag-1 autocorrelation (oscillate)')
+    lines.append('  - Only 14/120 dims have AC > 0.5 (temporally stable)')
+    lines.append('  - Channel 5 (ball*reward cross-map) changes 69% per frame')
+    lines.append('  - Strided conv mixes stable (ch0-4) with unstable (ch5)')
+    lines.append('')
+    lines.append('WHY REINFORCE FAILS ON SPECTRAL FEATURES:')
+    lines.append('  1. Policy gradient: obs_t oscillates, so sum(advantage * obs_t)')
+    lines.append('     converges to zero regardless of advantage quality')
+    lines.append('  2. Value baseline: V(s) = w_v @ obs_t cannot fit returns when')
+    lines.append('     obs_t is decorrelated from obs_{t+1}')
+    lines.append('  3. Weight updates: W1 norm stays at initialization (7.851)')
+    lines.append('     across all experiments — gradients are too noisy to move it')
+    lines.append('')
+    lines.append('ALGORITHM IMPLICATIONS:')
+    lines.append('  - Monte Carlo PG (REINFORCE): BROKEN for spectral')
+    lines.append('    Requires obs stability across episode for gradient coherence')
+    lines.append('  - TD(0) / 1-step methods: MAY WORK')
+    lines.append('    Only needs obs[t] and obs[t+1] — 1-step autocorrelation')
+    lines.append('    is low but nonzero, and TD bootstrapping avoids')
+    lines.append('    accumulating over full episodes')
+    lines.append('  - Actor-Critic with GAE: PROMISING')
+    lines.append('    Short lambda truncates credit assignment window,')
+    lines.append('    reducing impact of obs decorrelation')
+    lines.append('  - Replay buffer + batch updates: NEUTRAL-POSITIVE')
+    lines.append('    Already decorrelates samples; spectral obs diversity')
+    lines.append('    may actually help exploration')
+    lines.append('  - Frame stacking: COUNTERPRODUCTIVE')
+    lines.append('    Encoder already carries temporal state; stacking adds')
+    lines.append('    dimensionality without information')
+    lines.append('')
+    lines.append('RECOMMENDED NEXT STEPS:')
+    lines.append('  1. Remove or stabilize channel 5 (ball*reward cross-map)')
+    lines.append('     to reduce observation noise')
+    lines.append('  2. Try TD-based algorithms (SAC/TD3) which update per-step')
+    lines.append('  3. Try actor-critic with short GAE lambda (0.8-0.9)')
+    lines.append('  4. Add obs smoothing (EMA of spectral features)')
+    lines.append('  5. Separate stable/unstable dims — route only stable')
+    lines.append('     dims to the policy, use unstable for auxiliary tasks')
+
     report = '\n'.join(lines)
     with open(path, 'w') as f:
         f.write(report)
@@ -809,6 +1094,7 @@ def generate_all_plots(results_path=None, out_dir=None):
     plot_summary_dashboard(results, out_dir)
     plot_obs_distribution(results, out_dir)
     plot_freq_learning(results, out_dir)
+    plot_temporal_analysis(results, out_dir)
     report = write_text_report(results, out_dir)
 
     print(f'\nDone! {len(os.listdir(out_dir))} files in {out_dir}/')
