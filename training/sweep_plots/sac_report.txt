@@ -1,0 +1,40 @@
+======================================================================
+SAC SPECTRAL ENCODER EXPERIMENT REPORT
+======================================================================
+
+Config                     Peak WR  Final WR  Peak Step
+-------------------------------------------------------
+Spectral + Paddle             86%      73%    170000K
+Raw + Paddle                  78%      53%    130000K
+Spectral + Goal              100%      81%    130000K
+Raw + Goal                   100%      86%     30000K
+
+COMPARISON WITH REINFORCE SWEEP (35 experiments):
+  REINFORCE spectral (any gamma/lr/hidden):
+    Best paddle WR: 19%  Best goal WR: 51%
+  REINFORCE raw (gamma=0.99):
+    Best paddle WR: 23%  Best goal WR: 49%
+
+SAC ADVANTAGE OVER REINFORCE:
+  Spectral paddle: 86% vs 19% (+67 percentage points)
+  Spectral goal:  100% vs 51% (+49 percentage points)
+
+WHY SAC WORKS WHERE REINFORCE FAILS:
+  Spectral features have lag-1 autocorrelation of 0.02
+  (vs raw 0.99). REINFORCE averages gradients over 300+
+  step episodes — decorrelated obs causes cancellation.
+  SAC uses per-step TD updates with replay buffer —
+  each transition is learned from independently.
+
+REWARD WAVEPACKET IMPACT:
+  Without reward updates: 44% peak paddle
+  With reward updates:    86% peak paddle (+42pp)
+  The reward wavepacket builds a continuous reward
+  landscape from sparse signals — critical for the
+  spectral encoder to provide useful features.
+
+NEXT STEP: Learnable conv encoder
+  Current conv filters are random He-initialized
+  projections that never update. Making them learnable
+  (backprop from SAC critic loss) should improve
+  feature quality significantly.
