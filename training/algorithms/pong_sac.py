@@ -4,15 +4,17 @@ Pong SAC Algorithm — Algorithm ABC Implementation
 CleanRL-style SAC for Pong environments, conforming to the training
 framework's Algorithm interface.
 
-Single-file: ReplayBuffer, Actor (squashed Gaussian), twin Q-critics,
-automatic entropy tuning, per-step TD updates.
+Supports two observation modes:
+  - 'raw': 4-dim egocentric obs → flat MLP actor/critic
+  - 'spectral': 6×16×24 feature maps → trainable GPU conv encoder → MLP
 
 Usage (YAML config)
 -------------------
     algorithm:
       class: training.algorithms.pong_sac.PongSACAlgorithm
       params:
-        obs_dim: 4
+        obs_mode: raw      # or 'spectral'
+        obs_dim: 4         # 4 for raw, 2304 for spectral (6*16*24)
         hidden: 256
         lr: 3e-4
 """
@@ -74,6 +76,47 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
+# Spectral Encoder — trainable conv on GPU
+# ---------------------------------------------------------------------------
+
+# Feature map constants from spectral_pong_viz.py
+FM_CHANNELS = 6
+FM_NY = 16
+FM_NX = 24
+
+
+class SpectralEncoder(nn.Module):
+    """Trainable 2-layer strided conv: (6, 16, 24) → embedding_dim.
+
+    Replaces the numpy StridedConvExtractor with GPU-accelerated,
+    gradient-receiving conv layers. Architecture mirrors the original
+    (stride-2, kernel-3, ReLU) but weights are learned end-to-end.
+    """
+
+    def __init__(self, n_filters: int = 16, embedding_dim: int = 64):
+        super().__init__()
+        # Layer 1: (6, 16, 24) → (n_filters, 7, 11)
+        self.conv1 = nn.Conv2d(FM_CHANNELS, n_filters, kernel_size=3, stride=2)
+        # Layer 2: (n_filters, 7, 11) → (n_filters, 3, 5)
+        self.conv2 = nn.Conv2d(n_filters, n_filters, kernel_size=3, stride=2)
+        # Flatten: n_filters * 3 * 5
+        flat_dim = n_filters * 3 * 5
+        self.fc = nn.Linear(flat_dim, embedding_dim)
+        self.embedding_dim = embedding_dim
+
+    def forward(self, fmaps_flat: torch.Tensor) -> torch.Tensor:
+        """(batch, 2304) → (batch, embedding_dim).
+
+        Input is a flat feature map from the env, reshaped to (batch, 6, 16, 24).
+        """
+        x = fmaps_flat.view(-1, FM_CHANNELS, FM_NY, FM_NX)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.reshape(x.shape[0], -1)
+        return self.fc(x)
+
+
+# ---------------------------------------------------------------------------
 # Actor — Squashed Gaussian Policy
 # ---------------------------------------------------------------------------
 
@@ -82,9 +125,9 @@ LOG_STD_MAX = 2.0
 
 
 class Actor(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int = 256):
+    def __init__(self, input_dim: int, hidden: int = 256):
         super().__init__()
-        self.fc1 = nn.Linear(obs_dim, hidden)
+        self.fc1 = nn.Linear(input_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.mean_head = nn.Linear(hidden, 1)
         self.log_std_head = nn.Linear(hidden, 1)
@@ -119,12 +162,12 @@ class Actor(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SoftQNetwork(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int = 256):
+    def __init__(self, input_dim: int, hidden: int = 256):
         super().__init__()
-        self.q1_fc1 = nn.Linear(obs_dim + 1, hidden)
+        self.q1_fc1 = nn.Linear(input_dim + 1, hidden)
         self.q1_fc2 = nn.Linear(hidden, hidden)
         self.q1_out = nn.Linear(hidden, 1)
-        self.q2_fc1 = nn.Linear(obs_dim + 1, hidden)
+        self.q2_fc1 = nn.Linear(input_dim + 1, hidden)
         self.q2_fc2 = nn.Linear(hidden, hidden)
         self.q2_out = nn.Linear(hidden, 1)
 
@@ -147,6 +190,11 @@ class PongSACAlgorithm(Algorithm):
     """
     SAC for Pong environments — implements the Algorithm ABC.
 
+    Supports two observation modes:
+      - 'raw': obs_dim=4, flat MLP actor/critic
+      - 'spectral': obs_dim=2304 (6*16*24 feature maps), trainable conv
+        encoder on GPU that feeds into the MLP actor/critic
+
     Pong uses 1D continuous actions. Internally we work with scalar actions
     and pad to 8-dim when returning ActionResult (framework convention).
     """
@@ -154,10 +202,14 @@ class PongSACAlgorithm(Algorithm):
     def __init__(self, config: dict):
         params = config.get('algorithm', {}).get('params', {})
 
+        # Observation mode
+        self.obs_mode = params.get('obs_mode', 'raw')
+        self.obs_dim = params.get('obs_dim', 4 if self.obs_mode == 'raw' else 2304)
+
         # Hyperparameters
-        self.obs_dim = params.get('obs_dim', 4)
         self.hidden = params.get('hidden', 256)
         self.lr = params.get('lr', 3e-4)
+        self.encoder_lr = params.get('encoder_lr', self.lr)
         self.alpha_lr = params.get('alpha_lr', 1e-3)
         self.gamma = params.get('gamma', 0.99)
         self.tau = params.get('tau', 0.005)
@@ -170,23 +222,40 @@ class PongSACAlgorithm(Algorithm):
         _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(_device)
 
-        # Networks
-        self.actor = Actor(self.obs_dim, self.hidden).to(self.device)
-        self.critic = SoftQNetwork(self.obs_dim, self.hidden).to(self.device)
-        self.target_critic = SoftQNetwork(self.obs_dim, self.hidden).to(self.device)
+        # Spectral encoder (trainable conv on GPU)
+        self.encoder = None
+        if self.obs_mode == 'spectral':
+            n_filters = params.get('n_filters', 16)
+            embedding_dim = params.get('embedding_dim', 64)
+            self.encoder = SpectralEncoder(n_filters, embedding_dim).to(self.device)
+            actor_input_dim = embedding_dim
+        else:
+            actor_input_dim = self.obs_dim
+
+        # Networks — actor/critic take encoder output (or raw obs)
+        self.actor = Actor(actor_input_dim, self.hidden).to(self.device)
+        self.critic = SoftQNetwork(actor_input_dim, self.hidden).to(self.device)
+        self.target_critic = SoftQNetwork(actor_input_dim, self.hidden).to(self.device)
         self.target_critic.load_state_dict(self.critic.state_dict())
 
         if not self._inference_only:
-            # Optimizers
-            self.actor_opt = Adam(self.actor.parameters(), lr=self.lr)
-            self.critic_opt = Adam(self.critic.parameters(), lr=self.lr)
+            # Collect all trainable parameters
+            actor_params = list(self.actor.parameters())
+            critic_params = list(self.critic.parameters())
+            if self.encoder is not None:
+                # Encoder gets gradients from both actor and critic
+                actor_params += list(self.encoder.parameters())
+                critic_params += list(self.encoder.parameters())
+
+            self.actor_opt = Adam(actor_params, lr=self.lr)
+            self.critic_opt = Adam(critic_params, lr=self.lr)
 
             # Entropy tuning
             self.target_entropy = -1.0
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
             self.alpha_opt = Adam([self.log_alpha], lr=self.alpha_lr)
 
-            # Replay buffer
+            # Replay buffer stores raw obs (flat)
             self.buffer = ReplayBuffer(self.obs_dim, self.buffer_size)
 
         self.alpha = 0.0 if self._inference_only else self.log_alpha.exp().item()
@@ -203,10 +272,19 @@ class PongSACAlgorithm(Algorithm):
         self.actor.eval()
         self.critic.eval()
         self.target_critic.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
+
+    def _encode(self, obs_t: torch.Tensor) -> torch.Tensor:
+        """Pass through encoder if spectral, otherwise identity."""
+        if self.encoder is not None:
+            return self.encoder(obs_t)
+        return obs_t
 
     @classmethod
     def default_params(cls) -> dict:
         return {
+            'obs_mode': 'raw',
             'obs_dim': 4,
             'hidden': 256,
             'lr': 3e-4,
@@ -247,7 +325,8 @@ class PongSACAlgorithm(Algorithm):
             action_1d = np.random.uniform(-1.0, 1.0, size=(batch,))
         else:
             obs_t = torch.from_numpy(obs_2d.astype(np.float32)).to(self.device)
-            action_t, _ = self.actor.sample(obs_t)
+            emb = self._encode(obs_t)
+            action_t, _ = self.actor.sample(emb)
             action_1d = action_t.cpu().numpy().ravel()
             action_1d = np.clip(action_1d, -1.0, 1.0)
 
@@ -293,28 +372,37 @@ class PongSACAlgorithm(Algorithm):
 
         self.actor.train()
         self.critic.train()
+        if self.encoder is not None:
+            self.encoder.train()
 
         b_obs, b_act, b_rew, b_next, b_done = self.buffer.sample(
             self.batch_size, self.device)
 
+        # Encode observations
+        b_emb = self._encode(b_obs)
+        b_next_emb = self._encode(b_next)
+
         alpha = self.log_alpha.exp().item()
 
-        # Critic update
+        # Critic update — encoder gets gradients here
         with torch.no_grad():
-            next_action, next_log_prob = self.actor.sample(b_next)
-            q1_next, q2_next = self.target_critic(b_next, next_action)
+            next_action, next_log_prob = self.actor.sample(b_next_emb.detach())
+            q1_next, q2_next = self.target_critic(b_next_emb.detach(), next_action)
             q_next = torch.min(q1_next, q2_next) - alpha * next_log_prob
             q_target = b_rew + self.gamma * (1 - b_done) * q_next
 
-        q1_pred, q2_pred = self.critic(b_obs, b_act)
+        # Re-encode for critic gradient flow
+        b_emb_critic = self._encode(b_obs)
+        q1_pred, q2_pred = self.critic(b_emb_critic, b_act)
         critic_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
 
-        # Actor update
-        new_action, log_prob = self.actor.sample(b_obs)
-        q1_new, q2_new = self.critic(b_obs, new_action)
+        # Actor update — encoder gets gradients here too
+        b_emb_actor = self._encode(b_obs)
+        new_action, log_prob = self.actor.sample(b_emb_actor)
+        q1_new, q2_new = self.critic(b_emb_actor.detach(), new_action)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (alpha * log_prob - q_new).mean()
         self.actor_opt.zero_grad()
@@ -336,6 +424,8 @@ class PongSACAlgorithm(Algorithm):
 
         self.actor.eval()
         self.critic.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
 
         return {
             'critic_loss': critic_loss.item(),
@@ -349,7 +439,7 @@ class PongSACAlgorithm(Algorithm):
     def save_checkpoint(self, path: Path) -> None:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        state = {
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'target_critic': self.target_critic.state_dict(),
@@ -358,7 +448,10 @@ class PongSACAlgorithm(Algorithm):
             'log_alpha': self.log_alpha.detach().cpu(),
             'alpha_opt': self.alpha_opt.state_dict(),
             'total_steps': self._total_steps,
-        }, path / 'checkpoint.pt')
+        }
+        if self.encoder is not None:
+            state['encoder'] = self.encoder.state_dict()
+        torch.save(state, path / 'checkpoint.pt')
 
     def load_checkpoint(self, path: Path) -> None:
         ckpt = torch.load(
@@ -372,20 +465,30 @@ class PongSACAlgorithm(Algorithm):
         self.log_alpha = ckpt['log_alpha'].to(self.device).requires_grad_(True)
         self.alpha_opt.load_state_dict(ckpt['alpha_opt'])
         self._total_steps = ckpt.get('total_steps', 0)
+        if self.encoder is not None and 'encoder' in ckpt:
+            self.encoder.load_state_dict(ckpt['encoder'])
 
     def get_weights(self) -> dict:
-        """Return actor+critic weights for snapshot saving."""
-        return {
+        """Return weights for snapshot saving."""
+        weights = {
             'encoder': {k: v.clone() for k, v in self.actor.state_dict().items()},
             'policy': {k: v.clone() for k, v in self.critic.state_dict().items()},
         }
+        if self.encoder is not None:
+            weights['spectral_encoder'] = {
+                k: v.clone() for k, v in self.encoder.state_dict().items()}
+        return weights
 
     def load_weights(self, weights: dict) -> None:
-        """Load actor+critic weights from snapshot."""
+        """Load weights from snapshot."""
         self.actor.load_state_dict(weights['encoder'])
         self.critic.load_state_dict(weights['policy'])
+        if self.encoder is not None and 'spectral_encoder' in weights:
+            self.encoder.load_state_dict(weights['spectral_encoder'])
         self.actor.eval()
         self.critic.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
 
     @torch.no_grad()
     def infer(self, obs: np.ndarray) -> np.ndarray:
@@ -393,7 +496,8 @@ class PongSACAlgorithm(Algorithm):
         batch = obs.shape[0] if obs.ndim > 1 else 1
         obs_2d = obs.reshape(batch, -1)
         obs_t = torch.from_numpy(obs_2d[:, :self.obs_dim].astype(np.float32)).to(self.device)
-        action_1d = self.actor.get_deterministic(obs_t).cpu().numpy().ravel()
+        emb = self._encode(obs_t)
+        action_1d = self.actor.get_deterministic(emb).cpu().numpy().ravel()
         return self._pad_action(action_1d)
 
     def clone_from(self, other: 'PongSACAlgorithm', noise_scale: float = 0.0) -> None:
@@ -401,9 +505,14 @@ class PongSACAlgorithm(Algorithm):
         self.actor.load_state_dict(copy.deepcopy(other.actor.state_dict()))
         self.critic.load_state_dict(copy.deepcopy(other.critic.state_dict()))
         self.target_critic.load_state_dict(copy.deepcopy(other.target_critic.state_dict()))
+        if self.encoder is not None and other.encoder is not None:
+            self.encoder.load_state_dict(copy.deepcopy(other.encoder.state_dict()))
         if noise_scale > 0:
             with torch.no_grad():
-                for p in list(self.actor.parameters()) + list(self.critic.parameters()):
+                all_params = list(self.actor.parameters()) + list(self.critic.parameters())
+                if self.encoder is not None:
+                    all_params += list(self.encoder.parameters())
+                for p in all_params:
                     p.add_(torch.randn_like(p) * noise_scale)
         self.actor_opt = Adam(self.actor.parameters(), lr=self.lr)
         self.critic_opt = Adam(self.critic.parameters(), lr=self.lr)
