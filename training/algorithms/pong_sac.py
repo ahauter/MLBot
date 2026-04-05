@@ -219,7 +219,8 @@ class PongSACAlgorithm(Algorithm):
         self.batch_size = params.get('batch_size', 256)
         self.buffer_size = params.get('buffer_size', 100_000)
         self.random_steps = params.get('random_steps', 5000)
-        self.update_every = params.get('update_every', 1)
+        self.update_every = params.get('update_every', 64)
+        self.updates_per_call = params.get('updates_per_call', 1)
 
         self._inference_only = config.get('inference', False)
         _device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -309,7 +310,8 @@ class PongSACAlgorithm(Algorithm):
             'batch_size': 256,
             'buffer_size': 100_000,
             'random_steps': 5000,
-            'update_every': 1,
+            'update_every': 64,
+            'updates_per_call': 1,
         }
 
     @classmethod
@@ -387,7 +389,7 @@ class PongSACAlgorithm(Algorithm):
                 and self._steps_since_update >= self.update_every)
 
     def update(self) -> dict:
-        """Run SAC update. Returns metrics dict."""
+        """Run multiple SAC gradient steps. Returns averaged metrics."""
         self._steps_since_update = 0
 
         self.actor.train()
@@ -395,6 +397,23 @@ class PongSACAlgorithm(Algorithm):
         if self.spectral_encoder is not None:
             self.spectral_encoder.train()
 
+        all_metrics = []
+        for _ in range(self.updates_per_call):
+            all_metrics.append(self._single_update())
+
+        self.actor.eval()
+        self.critic.eval()
+        if self.spectral_encoder is not None:
+            self.spectral_encoder.eval()
+
+        # Average metrics across gradient steps
+        avg = {}
+        for k in all_metrics[0]:
+            avg[k] = sum(m[k] for m in all_metrics) / len(all_metrics)
+        return avg
+
+    def _single_update(self) -> dict:
+        """One SAC gradient step on a sampled minibatch."""
         b_obs, b_act, b_rew, b_next, b_done = self.buffer.sample(
             self.batch_size, self.device)
 
@@ -448,11 +467,6 @@ class PongSACAlgorithm(Algorithm):
             for p, tp in zip(self.critic.parameters(),
                              self.target_critic.parameters()):
                 tp.data.lerp_(p.data, self.tau)
-
-        self.actor.eval()
-        self.critic.eval()
-        if self.spectral_encoder is not None:
-            self.spectral_encoder.eval()
 
         metrics = {
             'critic_loss': critic_loss.item(),

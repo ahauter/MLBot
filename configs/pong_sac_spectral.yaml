@@ -13,7 +13,8 @@ algorithm:
     batch_size: 256
     buffer_size: 100000
     random_steps: 5000
-    update_every: 1
+    update_every: 64
+    updates_per_call: 1
 
 env_class: training.environments.pong_env.PongGymEnv
 
