@@ -248,7 +248,7 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                     obs, reward, done, truncated, info = env.step(actions[i])
                     obs_list.append(obs)
                     rewards.append(reward)
-                    dones.append(done)
+                    dones.append(done or truncated)
                     infos.append(info)
                 conn.send((
                     'step',
@@ -272,7 +272,7 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                         blue_actions[i], opp_actions[i])
                     obs_list.append(obs)
                     rewards.append(reward)
-                    dones.append(done)
+                    dones.append(done or truncated)
                     infos.append(info)
                 conn.send((
                     'step',
@@ -542,6 +542,7 @@ class RolloutMetricsProvider:
         self.episode_returns: deque = deque(maxlen=200)
         self.episode_lengths: deque = deque(maxlen=200)
         self.episode_touches: deque = deque(maxlen=200)
+        self.episode_outcomes: deque = deque(maxlen=200)
         self.goals_scored: int = 0
         self.goals_conceded: int = 0
 
@@ -549,6 +550,7 @@ class RolloutMetricsProvider:
         self.episode_returns.append(episode_return)
         self.episode_lengths.append(episode_length)
         self.episode_touches.append(touches)
+        self.episode_outcomes.append(goal)
         if goal > 0:
             self.goals_scored += 1
         elif goal < 0:
@@ -557,10 +559,14 @@ class RolloutMetricsProvider:
     def get_metrics(self) -> dict:
         if not self.episode_returns:
             return {}
+        outcomes = list(self.episode_outcomes)
+        decided = [o for o in outcomes if o != 0]
+        win_rate = sum(1 for o in decided if o > 0) / len(decided) if decided else 0.0
         return {
             'mean_return': float(np.mean(self.episode_returns)),
             'mean_length': float(np.mean(self.episode_lengths)),
             'mean_touches': float(np.mean(self.episode_touches)),
+            'win_rate': win_rate,
             'goals_scored': self.goals_scored,
             'goals_conceded': self.goals_conceded,
         }
@@ -1033,10 +1039,11 @@ def collect_and_train(
                     profiler.incr('transitions_discarded', len(worker_ids))
                 continue
             result = agent_results[agent_idx]
+            worker_infos = {wi: infos[wi] for wi in worker_ids}
             agent.store_transition(
                 obs[worker_ids], result,
                 rewards[worker_ids], next_obs[worker_ids],
-                dones[worker_ids], {})
+                dones[worker_ids], worker_infos)
             if profiler:
                 profiler.incr('transitions_collected', len(worker_ids))
         _t1 = time.perf_counter()
