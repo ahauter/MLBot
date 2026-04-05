@@ -8,7 +8,6 @@ ABCs:
   Algorithm           - RL algorithm (PPO, SAC, etc.)
   MetricLogger        - Logging backend (W&B, TensorBoard, stdout, etc.)
   RewardFunction      - Reward signal (sparse, dense, learned, etc.)
-  EnvironmentProvider - Environment creation and configuration
   ReplayProvider      - Expert demonstration data (Axis 2)
   FeedbackProvider    - Human feedback signal (Axis 3)
   EvaluationHook      - Evaluation protocol and convergence checking
@@ -21,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-import gymnasium as gym
 import numpy as np
 
 
@@ -97,6 +95,21 @@ class Algorithm(ABC):
         """Return encoder+policy state_dicts for opponent loading."""
 
     @abstractmethod
+    def load_weights(self, weights: dict) -> None:
+        """Load encoder+policy state_dicts (complement of get_weights()).
+
+        Used for opponent loading and evaluation — no optimizer state.
+        """
+
+    @abstractmethod
+    def infer(self, obs: np.ndarray) -> np.ndarray:
+        """Deterministic inference. Returns (batch, action_dim) numpy array.
+
+        Used for opponent and evaluation inference. No aux data, no grad.
+        Encapsulates all model-specific details (encoding, action selection).
+        """
+
+    @abstractmethod
     def clone_from(self, other: 'Algorithm', noise_scale: float = 0.0) -> None:
         """Copy weights from another algorithm instance, optionally with noise."""
 
@@ -155,30 +168,6 @@ class RewardFunction(ABC):
     def get_metrics(self) -> dict:
         """Track Axis 4 cost: number of active reward components, etc."""
         return {}
-
-
-# ---------------------------------------------------------------------------
-# EnvironmentProvider — Axis 1 (Simulation)
-# ---------------------------------------------------------------------------
-
-class EnvironmentProvider(ABC):
-    """
-    Controls how environments are created and configured.
-    Swap to change simulation fidelity, domain randomization, etc.
-    """
-
-    @classmethod
-    def default_params(cls) -> dict:
-        return {}
-
-    @abstractmethod
-    def make_env(self, reward_fn: RewardFunction, t_window: int) -> gym.Env:
-        """Create a single environment instance (called per worker)."""
-
-    @abstractmethod
-    def make_vec_env(self, num_envs: int, reward_fn: RewardFunction,
-                     t_window: int):
-        """Create a vectorized environment (called once per population)."""
 
 
 # ---------------------------------------------------------------------------

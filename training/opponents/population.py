@@ -1,8 +1,10 @@
 """
 Population-Based Training
 =========================
-Multiple PPO agents sharing vectorized environments, unified with the
-OpponentPool interface for snapshot management.
+Multiple agents sharing vectorized environments, unified with the
+OpponentPool interface for snapshot management. The algorithm class
+is read from the config dict (config['algorithm']['cls']), so any
+Algorithm implementation can be used — not just PPO.
 
 Extends OpponentPool so Population can be configured as the opponent_pool
 class in YAML configs, handling both agent management and self-play
@@ -35,8 +37,12 @@ from training.opponents.pool import OpponentPool
 
 class Population(OpponentPool):
     """
-    Population-Based Training: multiple PPO agents sharing a set of
+    Population-Based Training: multiple agents sharing a set of
     vectorized environments. Workers are divided evenly among agents.
+
+    The algorithm class is read from ``config['algorithm']['cls']``
+    (set by ``load_config()`` in ``train.py``), so any Algorithm
+    implementation can be used.
 
     Extends OpponentPool to unify agent management and opponent snapshot
     management into a single interface. Implements snapshot save/sample
@@ -46,11 +52,11 @@ class Population(OpponentPool):
     Parameters
     ----------
     num_agents : int
-        Number of PPO agents in the population.
+        Number of agents in the population.
     num_workers : int
         Total number of parallel environment workers.
     config : dict
-        Shared configuration dict passed to each PPOAlgorithm.
+        Shared configuration dict passed to each Algorithm instance.
     envs_per_agent : int, optional
         Explicit env count per agent (overrides worker_assignment inference).
     snapshot_dir : str or Path
@@ -96,14 +102,17 @@ class Population(OpponentPool):
         else:
             envs_per_agent_map = {i: envs_per_agent for i in range(num_agents)}
 
-        # Lazy import to avoid circular dependency (ppo.py no longer imports this module)
-        from training.algorithms.ppo import PPOAlgorithm
+        # Read algorithm class from config (set by load_config() in train.py)
+        AlgoCls = config.get('algorithm', {}).get('cls')
+        if AlgoCls is None:
+            from training.algorithms.ppo import PPOAlgorithm
+            AlgoCls = PPOAlgorithm
 
         # Create agents, each with buffer sized for its env count
-        self._agents: List[PPOAlgorithm] = []
+        self._agents: List = []
         for i in range(num_agents):
             agent_config = {**config, 'num_envs': envs_per_agent_map[i]}
-            self._agents.append(PPOAlgorithm(agent_config))
+            self._agents.append(AlgoCls(agent_config))
 
         # Score tracking per agent
         self.scores: List[List[float]] = [[] for _ in range(num_agents)]

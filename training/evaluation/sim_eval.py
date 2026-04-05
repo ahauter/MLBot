@@ -53,6 +53,7 @@ class SimEvaluationHook(EvaluationHook):
 
     def __init__(self, config: dict):
         self.cfg = EvalConfig.from_config(config)
+        self._config = config
         Path(self.cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         self._last_eval_step = 0
 
@@ -77,11 +78,12 @@ class SimEvaluationHook(EvaluationHook):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = ckpt_dir / 'eval_checkpoint.pt'
 
+        weights = algorithm.get_weights()
         torch.save({
             'encoder': {k: v.cpu().clone()
-                        for k, v in algorithm.encoder.state_dict().items()},
+                        for k, v in weights['encoder'].items()},
             'policy': {k: v.cpu().clone()
-                       for k, v in algorithm.policy.state_dict().items()},
+                       for k, v in weights['policy'].items()},
             'step': step,
             'run_id': run_id,
             'seed': self.cfg.t_window,  # propagate for reproducibility
@@ -108,7 +110,7 @@ class SimEvaluationHook(EvaluationHook):
         Parameters
         ----------
         algorithm : Algorithm
-            Agent with .encoder and .policy attributes.
+            Agent implementing the Algorithm ABC (uses .infer() for actions).
         envs : SubprocVecEnv
             The same env workers used for training.
         step : int
@@ -121,16 +123,7 @@ class SimEvaluationHook(EvaluationHook):
         dict
             Results with 'tiers', 'eval_wall_time', 'convergence_reached', etc.
         """
-        from encoder import N_TOKENS, TOKEN_FEATURES, ENTITY_TYPE_IDS_1V1
-
         t0 = time.monotonic()
-
-        encoder = algorithm.encoder
-        policy = algorithm.policy
-        encoder.eval()
-        policy.eval()
-        entity_ids = torch.tensor(
-            ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
 
         # Clear opponent snapshots — eval uses random opponents only
         envs.set_opponent_snapshot(None)
@@ -140,7 +133,7 @@ class SimEvaluationHook(EvaluationHook):
             if tier not in self.cfg.tier_opponents:
                 continue
             tier_results[tier] = self._eval_tier_inline(
-                envs, encoder, policy, entity_ids, step, tier, device)
+                envs, algorithm, step, tier)
 
         wall_time = time.monotonic() - t0
 
@@ -169,23 +162,17 @@ class SimEvaluationHook(EvaluationHook):
     def _eval_tier_inline(
         self,
         envs,
-        encoder,
-        policy,
-        entity_ids: torch.Tensor,
+        algorithm: Algorithm,
         step: int,
         tier: str,
-        device: str,
     ) -> Dict:
         """Evaluate against a single tier using vectorized envs.
 
         Runs episodes_per_tier episodes across all env workers in parallel.
-        Agent inference is batched on GPU; opponents are random (no snapshot).
+        Agent inference is batched via algorithm.infer(); opponents are random.
         """
-        from encoder import N_TOKENS, TOKEN_FEATURES
-
         num_envs = envs.num_envs
         episodes_needed = self.cfg.episodes_per_tier
-        t_window = self.cfg.t_window
         timeout = self.cfg.episode_timeout_steps
 
         scores = []
@@ -195,13 +182,7 @@ class SimEvaluationHook(EvaluationHook):
         obs = envs.reset_all()  # (num_envs, obs_dim)
 
         while len(scores) < episodes_needed:
-            # Batched GPU inference — deterministic policy
-            with torch.no_grad():
-                x = torch.tensor(obs, dtype=torch.float32, device=device)
-                tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
-                emb = encoder(tokens, entity_ids)
-                actions, _ = policy.act_deterministic(emb)
-            actions_np = actions.cpu().numpy().astype(np.float32)
+            actions_np = algorithm.infer(obs)
 
             # Step all envs (random opponents — no snapshot loaded)
             next_obs, rewards, dones, infos = envs.step(actions_np)
@@ -274,8 +255,21 @@ class SimEvaluationHook(EvaluationHook):
         result_path = str(ckpt_path.parent / 'eval_results.json')
         error_log = str(Path(self.cfg.checkpoint_dir) / 'eval_errors.log')
 
+        # Pass algorithm class string so eval_worker can reconstruct the model
+        algo_class = self._config.get('algorithm', {}).get('class', '')
+        algo_config = {
+            k: v for k, v in self._config.items()
+            if k not in ('algorithm',)
+        }
+        algo_config.setdefault('algorithm', {})
+        algo_config['algorithm']['params'] = self._config.get(
+            'algorithm', {}).get('params', {})
+
         from training.evaluation.eval_worker import run_eval_worker
-        run_eval_worker(str(ckpt_path), result_path, error_log, asdict(self.cfg))
+        run_eval_worker(
+            str(ckpt_path), result_path, error_log, asdict(self.cfg),
+            algo_class=algo_class, algo_config=algo_config,
+        )
 
         rp = Path(result_path)
         if rp.exists():
@@ -295,21 +289,7 @@ class SimEvaluationHook(EvaluationHook):
         configured environment, printing per-episode outcomes.
         Press Ctrl+C to stop.
         """
-        from encoder import (
-            SharedTransformerEncoder, D_MODEL, N_TOKENS,
-            TOKEN_FEATURES, ENTITY_TYPE_IDS_1V1,
-        )
-        from policy_head import StochasticPolicyHead
         from training.evaluation.eval_worker import _load_env_class
-
-        # Build models on CPU from algorithm weights
-        encoder = SharedTransformerEncoder(d_model=D_MODEL)
-        policy = StochasticPolicyHead(d_model=D_MODEL)
-        encoder.load_state_dict(algorithm.encoder.state_dict())
-        policy.load_state_dict(algorithm.policy.state_dict())
-        encoder.eval()
-        policy.eval()
-        entity_ids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long)
 
         EnvCls = _load_env_class(self.cfg.env_class)
         env = EnvCls(
@@ -330,13 +310,7 @@ class SimEvaluationHook(EvaluationHook):
                 done = False
                 steps = 0
                 while not done:
-                    with torch.no_grad():
-                        x = torch.tensor(obs[np.newaxis], dtype=torch.float32)
-                        tokens = x.view(
-                            1, self.cfg.t_window, N_TOKENS, TOKEN_FEATURES)
-                        emb = encoder(tokens, entity_ids)
-                        action, _ = policy.act_deterministic(emb)
-                    action_np = action[0].cpu().numpy().astype(np.float32)
+                    action_np = algorithm.infer(obs[np.newaxis])[0]
                     obs, _reward, done, _, info = env.step(action_np)
                     steps += 1
 

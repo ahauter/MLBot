@@ -21,8 +21,7 @@ _REPO = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO))
 
-from encoder import SharedTransformerEncoder, D_MODEL
-from policy_head import StochasticPolicyHead
+from training.algorithms.ppo import PPOAlgorithm
 from training.evaluation.eval_config import EvalConfig
 from training.evaluation.eval_worker import run_eval_worker, _episode_seed, _load_env_class
 from training.evaluation.sim_eval import SimEvaluationHook
@@ -37,6 +36,11 @@ def _make_config(tmpdir: str, **overrides) -> dict:
         'eval_interval': 1000,
         't_window': 8,
         'env_class': DUMMY_ENV,
+        'algorithm': {
+            'class': 'training.algorithms.ppo.PPOAlgorithm',
+            'cls': PPOAlgorithm,
+            'params': {},
+        },
         'evaluation': {
             'params': {
                 'episodes_per_tier': 3,
@@ -54,13 +58,13 @@ def _make_config(tmpdir: str, **overrides) -> dict:
 
 def _save_dummy_checkpoint(path: str, step: int = 5000) -> str:
     """Save a random-weights checkpoint and return its path."""
-    encoder = SharedTransformerEncoder(d_model=D_MODEL)
-    policy = StochasticPolicyHead(d_model=D_MODEL)
+    algo = PPOAlgorithm({'inference': True, 'device': 'cpu', 't_window': 8})
+    weights = algo.get_weights()
     ckpt_path = Path(path) / 'eval_checkpoint.pt'
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        'encoder': encoder.state_dict(),
-        'policy': policy.state_dict(),
+        'encoder': weights['encoder'],
+        'policy': weights['policy'],
         'step': step,
         'run_id': 'test_run',
         'seed': 42,
@@ -71,12 +75,9 @@ def _save_dummy_checkpoint(path: str, step: int = 5000) -> str:
     return str(ckpt_path)
 
 
-class _FakeAlgo:
-    """Minimal stand-in for Algorithm with encoder + policy."""
-
-    def __init__(self):
-        self.encoder = SharedTransformerEncoder(d_model=D_MODEL)
-        self.policy = StochasticPolicyHead(d_model=D_MODEL)
+def _make_fake_algo():
+    """Create a PPOAlgorithm in inference-only mode for testing."""
+    return PPOAlgorithm({'inference': True, 'device': 'cpu', 't_window': 8})
 
 
 def _make_dummy_vecenv(config: dict):
@@ -230,7 +231,7 @@ class TestSimEvaluationHook:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = _make_config(tmpdir)
             hook = SimEvaluationHook(config)
-            algo = _FakeAlgo()
+            algo = _make_fake_algo()
 
             results = hook.evaluate(algo, step=1000)
 
@@ -270,7 +271,7 @@ class TestSimEvaluationHook:
             # Use 0.0 threshold so convergence is guaranteed
             config = _make_config(tmpdir)
             hook = SimEvaluationHook(config)
-            algo = _FakeAlgo()
+            algo = _make_fake_algo()
 
             results = hook.evaluate(algo, step=2000)
             conv_path = Path(tmpdir) / 'convergence.json'
@@ -286,7 +287,7 @@ class TestSimEvaluationHook:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = _make_config(tmpdir)
             hook = SimEvaluationHook(config)
-            algo = _FakeAlgo()
+            algo = _make_fake_algo()
 
             envs = _make_dummy_vecenv(config)
             try:
@@ -320,7 +321,7 @@ class TestSimEvaluationHook:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = _make_config(tmpdir)
             hook = SimEvaluationHook(config)
-            algo = _FakeAlgo()
+            algo = _make_fake_algo()
 
             envs = _make_dummy_vecenv(config)
             try:

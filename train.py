@@ -43,7 +43,6 @@ _REPO = Path(__file__).parent
 sys.path.insert(0, str(_REPO / 'src'))
 sys.path.insert(0, str(_REPO))
 
-from encoder import N_TOKENS, TOKEN_FEATURES
 
 
 # ── universal defaults ──────────────────────────────────────────────────────
@@ -186,7 +185,9 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                 t_window: int, reward_type: str,
                 dense_reward_weights: Optional[dict] = None,
                 env_class: Optional[str] = None,
-                envs_per_worker: int = 1):
+                envs_per_worker: int = 1,
+                algo_class: Optional[str] = None,
+                algo_config: Optional[dict] = None):
     """Child process: owns one or more gym envs, responds to commands.
 
     When envs_per_worker > 1, multiple rlgym-sim arenas run in a single
@@ -210,11 +211,8 @@ def _env_worker(conn: multiprocessing.connection.Connection,
         for _ in range(n)
     ]
 
-    # Shared opponent state for PPO snapshots (one model for all envs)
-    _opponent_encoder = None
-    _opponent_policy = None
-    _torch = None
-    _EIDS = None
+    # Shared opponent algorithm instance for snapshot inference
+    _opponent_algo = None
 
     while True:
         try:
@@ -234,21 +232,13 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             actions = data
 
             # Pre-compute all opponent actions in one batched forward pass
-            if _opponent_encoder is not None and n > 1:
+            if _opponent_algo is not None and n > 1:
                 flat_list = []
                 for e in envs:
                     stacked = np.stack(list(e._orange_buf), axis=0)
                     flat_list.append(stacked.ravel().astype(np.float32))
                 batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
-
-                with _torch.no_grad():
-                    x = _torch.tensor(batch, dtype=_torch.float32)
-                    tokens = x.view(
-                        n, envs[0].t_window, -1, TOKEN_FEATURES)
-                    eids = _torch.tensor(_EIDS, dtype=_torch.long)
-                    emb = _opponent_encoder(tokens, eids)
-                    opp_actions, _ = _opponent_policy.act_deterministic(emb)
-                opp_np = opp_actions.cpu().numpy().astype(np.float32)
+                opp_np = _opponent_algo.infer(batch).astype(np.float32)
                 for i, e in enumerate(envs):
                     e._cached_opp_action = opp_np[i]
 
@@ -296,23 +286,19 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             if snap_path is not None:
                 from training.opponents.pool import load_opponent_from_snapshot
                 weights = load_opponent_from_snapshot(snap_path, device='cpu')
-                from encoder import SharedTransformerEncoder, D_MODEL
-                from policy_head import StochasticPolicyHead
-                if _opponent_encoder is None:
-                    _opponent_encoder = SharedTransformerEncoder(
-                        d_model=D_MODEL)
-                    _opponent_policy = StochasticPolicyHead(d_model=D_MODEL)
-                _opponent_encoder.load_state_dict(weights['encoder'])
-                _opponent_policy.load_state_dict(weights['policy'])
-                _opponent_encoder.eval()
-                _opponent_policy.eval()
 
-                # Import torch/constants once for use in step handler
-                if _torch is None:
-                    import torch as _t
-                    from encoder import ENTITY_TYPE_IDS_1V1 as _e
-                    _torch = _t
-                    _EIDS = _e
+                if _opponent_algo is None:
+                    if algo_class:
+                        AlgoCls = load_class(algo_class)
+                    else:
+                        from training.algorithms.ppo import PPOAlgorithm
+                        AlgoCls = PPOAlgorithm
+                    _opponent_algo = AlgoCls({
+                        **(algo_config or {}),
+                        'inference': True, 'device': 'cpu',
+                        't_window': t_window,
+                    })
+                _opponent_algo.load_weights(weights)
 
                 if n > 1:
                     # Multi-env: monkey-patch to read cached action
@@ -327,24 +313,8 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                         env._get_opponent_action = types.MethodType(
                             _cached_opponent_action, env)
                 else:
-                    # Single env: inline forward pass (no caching needed)
-                    import types
-
-                    def _single_opponent_action(self_env):
-                        stacked = np.stack(list(self_env._orange_buf), axis=0)
-                        flat_obs = stacked.ravel().astype(np.float32)
-                        with _torch.no_grad():
-                            x = _torch.tensor(
-                                flat_obs[np.newaxis], dtype=_torch.float32)
-                            tokens = x.view(
-                                1, self_env.t_window, -1, TOKEN_FEATURES)
-                            eids = _torch.tensor(_EIDS, dtype=_torch.long)
-                            emb = _opponent_encoder(tokens, eids)
-                            action, _ = _opponent_policy.act_deterministic(emb)
-                        return action[0].cpu().numpy().astype(np.float32)
-
-                    envs[0]._get_opponent_action = types.MethodType(
-                        _single_opponent_action, envs[0])
+                    # Single env: use algorithm.infer() directly
+                    envs[0].set_opponent_algo(_opponent_algo)
             conn.send(('ok',))
 
         elif cmd == 'close':
@@ -378,7 +348,9 @@ class SubprocVecEnv:
                  reward_type: str = 'sparse',
                  dense_reward_weights: Optional[dict] = None,
                  env_class: Optional[str] = None,
-                 envs_per_worker: int = 1):
+                 envs_per_worker: int = 1,
+                 algo_class: Optional[str] = None,
+                 algo_config: Optional[dict] = None):
         self.num_workers = num_envs
         self.envs_per_worker = envs_per_worker
         self.num_envs = num_envs * envs_per_worker  # total logical envs
@@ -390,7 +362,7 @@ class SubprocVecEnv:
             proc = multiprocessing.Process(
                 target=_env_worker,
                 args=(child_conn, t_window, reward_type, dense_reward_weights,
-                      env_class, envs_per_worker),
+                      env_class, envs_per_worker, algo_class, algo_config),
                 daemon=True,
             )
             proc.start()
@@ -950,33 +922,6 @@ class CollectionProfiler:
         plt.close(fig)
 
 
-# ── batched opponent inference ──────────────────────────────────────────────
-
-@torch.no_grad()
-def _opponent_inference(opp_obs: np.ndarray, encoder, policy,
-                        device: str, t_window: int) -> np.ndarray:
-    """Batched GPU forward pass for opponent actions.
-
-    Parameters
-    ----------
-    opp_obs : (num_envs, obs_dim) flat orange observations
-    encoder, policy : opponent's frozen encoder and policy on device
-    device : torch device string
-    t_window : number of stacked frames
-
-    Returns
-    -------
-    (num_envs, 8) numpy array of opponent actions
-    """
-    from encoder import ENTITY_TYPE_IDS_1V1
-    x = torch.tensor(opp_obs, dtype=torch.float32, device=device)
-    tokens = x.view(x.shape[0], t_window, N_TOKENS, TOKEN_FEATURES)
-    eids = torch.tensor(ENTITY_TYPE_IDS_1V1, dtype=torch.long, device=device)
-    emb = encoder(tokens, eids)
-    action, _ = policy.act_deterministic(emb)
-    return action.cpu().numpy()
-
-
 # ── collect and train ───────────────────────────────────────────────────────
 
 def collect_and_train(
@@ -987,15 +932,14 @@ def collect_and_train(
     config: dict,
     scheduler,
     profiler: Optional[CollectionProfiler] = None,
-    opponent_encoder=None,
-    opponent_policy=None,
+    opponent_algo=None,
     opponent_loaded: bool = False,
 ) -> int:
     """Collect rollouts and trigger GPU updates. Algorithm-agnostic.
 
     The scheduler controls which agents use which envs each step.
     When opponent_loaded is True, opponent inference runs centrally
-    on GPU via opponent_encoder/opponent_policy (batched).
+    on GPU via opponent_algo.infer() (batched).
     Returns total environment steps collected.
     """
     from training.abstractions import ActionResult
@@ -1061,9 +1005,7 @@ def collect_and_train(
         _t0 = time.perf_counter()
         if opponent_loaded:
             opp_obs = envs.get_opponent_obs()
-            opp_actions = _opponent_inference(
-                opp_obs, opponent_encoder, opponent_policy,
-                config.get('device', 'cpu'), config.get('t_window', 8))
+            opp_actions = opponent_algo.infer(opp_obs)
             next_obs, rewards, dones, infos = envs.step_with_opponent_actions(
                 actions, opp_actions)
         else:
@@ -1251,6 +1193,14 @@ def train(config: dict):
     # ── create vectorized envs ──────────────────────────────────────────
     dense_weights = config.get('dense_reward_weights', None)
     env_class = config.get('env_class', None)
+    algo_class_str = config.get('algorithm', {}).get('class', '')
+    algo_config_for_workers = {
+        k: v for k, v in config.items()
+        if k not in ('algorithm',)
+    }
+    algo_config_for_workers.setdefault('algorithm', {})
+    algo_config_for_workers['algorithm']['params'] = config.get(
+        'algorithm', {}).get('params', {})
     envs = SubprocVecEnv(
         num_envs=num_envs,
         t_window=t_window,
@@ -1258,6 +1208,8 @@ def train(config: dict):
         dense_reward_weights=dense_weights,
         env_class=env_class,
         envs_per_worker=envs_per_worker,
+        algo_class=algo_class_str,
+        algo_config=algo_config_for_workers,
     )
 
     # ── seed from replay data ───────────────────────────────────────────
@@ -1286,14 +1238,10 @@ def train(config: dict):
     all_update_times: List[tuple] = []  # (agent_id, wall_time) for report
 
     # ── opponent model (centralized GPU inference) ───────────────────────
-    from encoder import SharedTransformerEncoder, D_MODEL
-    from policy_head import StochasticPolicyHead
     from training.opponents.pool import load_opponent_from_snapshot
 
-    opponent_encoder = SharedTransformerEncoder(d_model=D_MODEL).to(device)
-    opponent_policy = StochasticPolicyHead(d_model=D_MODEL).to(device)
-    opponent_encoder.eval()
-    opponent_policy.eval()
+    AlgoCls = config['algorithm']['cls']
+    opponent_algo = AlgoCls({**config, 'inference': True, 'device': device})
     opponent_loaded = False
 
     # ── evaluation hook ────────────────────────────────────────────────
@@ -1369,8 +1317,7 @@ def train(config: dict):
                 if snap_path:
                     _t0 = time.perf_counter()
                     weights = load_opponent_from_snapshot(snap_path, device=device)
-                    opponent_encoder.load_state_dict(weights['encoder'])
-                    opponent_policy.load_state_dict(weights['policy'])
+                    opponent_algo.load_weights(weights)
                     opponent_loaded = True
                     profiler.add_time('opponent_load_time', time.perf_counter() - _t0)
 
@@ -1380,8 +1327,7 @@ def train(config: dict):
                 population, envs, updater, rollout_metrics,
                 {**config, 'device': device},
                 scheduler, profiler=profiler,
-                opponent_encoder=opponent_encoder,
-                opponent_policy=opponent_policy,
+                opponent_algo=opponent_algo,
                 opponent_loaded=opponent_loaded)
             total_collected += steps
             timing_metrics.add_steps(steps)
