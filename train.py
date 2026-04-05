@@ -187,7 +187,8 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                 env_class: Optional[str] = None,
                 envs_per_worker: int = 1,
                 algo_class: Optional[str] = None,
-                algo_config: Optional[dict] = None):
+                algo_config: Optional[dict] = None,
+                env_params: Optional[dict] = None):
     """Child process: owns one or more gym envs, responds to commands.
 
     When envs_per_worker > 1, multiple rlgym-sim arenas run in a single
@@ -207,6 +208,7 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             t_window=t_window,
             reward_type=reward_type,
             dense_reward_weights=dense_reward_weights,
+            **(env_params or {}),
         )
         for _ in range(n)
     ]
@@ -350,7 +352,8 @@ class SubprocVecEnv:
                  env_class: Optional[str] = None,
                  envs_per_worker: int = 1,
                  algo_class: Optional[str] = None,
-                 algo_config: Optional[dict] = None):
+                 algo_config: Optional[dict] = None,
+                 env_params: Optional[dict] = None):
         self.num_workers = num_envs
         self.envs_per_worker = envs_per_worker
         self.num_envs = num_envs * envs_per_worker  # total logical envs
@@ -362,7 +365,8 @@ class SubprocVecEnv:
             proc = multiprocessing.Process(
                 target=_env_worker,
                 args=(child_conn, t_window, reward_type, dense_reward_weights,
-                      env_class, envs_per_worker, algo_class, algo_config),
+                      env_class, envs_per_worker, algo_class, algo_config,
+                      env_params),
                 daemon=True,
             )
             proc.start()
@@ -515,7 +519,8 @@ class AsyncUpdater:
                     self._profiler.record_event(
                         _t0, _t1, 'gpu_update', thread='gpu',
                         agent_id=agent_id)
-                agent.buffer.reset()
+                if hasattr(agent, 'buffer') and hasattr(agent.buffer, 'reset'):
+                    agent.buffer.reset()
                 agent._buffer_ready.set()
                 with self._lock:
                     self._results.append((agent_id, metrics))
@@ -1089,11 +1094,8 @@ def save_training_state(path: Path, population, total_collected: int,
         'agents': [],
     }
     for agent in population.agents:
-        state['agents'].append({
-            'encoder': agent.encoder.state_dict(),
-            'policy': agent.policy.state_dict(),
-            'optimizer': agent.optimizer.state_dict(),
-        })
+        weights = agent.get_weights()
+        state['agents'].append(weights)
     tmp = path / 'training_state.pt.tmp'
     torch.save(state, tmp)
     os.replace(tmp, path / 'training_state.pt')
@@ -1109,9 +1111,7 @@ def load_training_state(path: Path, population, device: str = 'cpu') -> dict:
             f'Checkpoint has {saved_agents} agents but population has '
             f'{population.num_agents}')
     for i, agent_state in enumerate(ckpt['agents']):
-        population.agents[i].encoder.load_state_dict(agent_state['encoder'])
-        population.agents[i].policy.load_state_dict(agent_state['policy'])
-        population.agents[i].optimizer.load_state_dict(agent_state['optimizer'])
+        population.agents[i].load_weights(agent_state)
     population._generation = ckpt['population_generation']
     population._last_snapshot_step = ckpt['population_last_snapshot_step']
     population.scores = ckpt['population_scores']
@@ -1201,6 +1201,7 @@ def train(config: dict):
     algo_config_for_workers.setdefault('algorithm', {})
     algo_config_for_workers['algorithm']['params'] = config.get(
         'algorithm', {}).get('params', {})
+    env_params = config.get('env_params', None)
     envs = SubprocVecEnv(
         num_envs=num_envs,
         t_window=t_window,
@@ -1210,6 +1211,7 @@ def train(config: dict):
         envs_per_worker=envs_per_worker,
         algo_class=algo_class_str,
         algo_config=algo_config_for_workers,
+        env_params=env_params,
     )
 
     # ── seed from replay data ───────────────────────────────────────────

@@ -1,0 +1,46 @@
+algorithm:
+  class: training.algorithms.pong_sac.PongSACAlgorithm
+  params:
+    obs_dim: 4
+    hidden: 256
+    lr: 3e-4
+    alpha_lr: 1e-3
+    gamma: 0.99
+    tau: 0.005
+    batch_size: 256
+    buffer_size: 100000
+    random_steps: 5000
+    update_every: 1
+
+env_class: training.environments.pong_env.PongGymEnv
+env_params:
+  obs_mode: raw
+  opp_skill: 0.0
+  reward_mode: paddle
+
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 1
+    snapshot_interval: 999999999  # disable snapshots (pong uses built-in opponent)
+
+seed: 0
+total_steps: 200000
+num_envs: 1
+envs_per_worker: 1
+eval_interval: 10000
+t_window: 1
+log_interval: 10
+
+evaluation:
+  class: training.evaluation.sim_eval.SimEvaluationHook
+  params:
+    episodes_per_tier: 50
+    episode_timeout_steps: 2000
+    skill_target_tier: Beginner
+    skill_target_win_rate: 0.60
+    tier_opponents:
+      Beginner: null
+
+wandb:
+  enabled: false
