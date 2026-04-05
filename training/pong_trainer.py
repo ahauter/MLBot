@@ -273,15 +273,17 @@ class PongEnv:
             wp_ball.update_with_attention(
                 ball_reward_pos, np.ones(NDIM), [nip_rew])
             wp_ball.normalize()
-            # Update paddles' reward dimension: agent = +reward, opponent = -reward
+            # Update agent paddle's reward dimension: always gets +reward
             wp_pl.update_with_attention(
                 np.array([self.paddle_lx, self.agent_y, reward]),
                 np.ones(NDIM), [1.0])
-            wp_pr.update_with_attention(
-                np.array([self.paddle_rx, self.opp_y, -reward]),
-                np.ones(NDIM), [1.0])
             wp_pl.normalize()
-            wp_pr.normalize()
+            # Opponent only gets -reward on scoring events (goals), not touches
+            if scored:
+                wp_pr.update_with_attention(
+                    np.array([self.paddle_rx, self.opp_y, -reward]),
+                    np.ones(NDIM), [1.0])
+                wp_pr.normalize()
 
         # 7. Frequency learning from prediction residual
         if not scored and self._lr_k_env > 0:
