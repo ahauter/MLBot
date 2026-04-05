@@ -390,7 +390,99 @@ def train(args):
             writer.writerows(rows)
         print(f'Saved {len(rows)} rows to {args.save_csv}')
 
+    # Plot
+    if args.plot:
+        plot_path = args.save_csv.replace('.csv', '_plot.png') if args.save_csv else 'compare_reward_plot.png'
+        plot_results(rows, plot_path, args.random_steps)
+
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_results(rows, save_path, random_steps):
+    """Generate 3-panel comparison figure."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    steps = np.array([r['step'] for r in rows])
+    ego_ip2 = np.array([r['r_dot_ego_ip2'] for r in rows])
+    ball_ip2 = np.array([r['r_dot_ball_ip2'] for r in rows])
+    q_cur = np.array([r['q_current'] for r in rows])
+    rewards = np.array([r['reward'] for r in rows])
+    episodes = np.array([r['episode'] for r in rows])
+
+    # Smoothed versions
+    win = 50
+    ego_smooth = rolling_mean(ego_ip2, win)
+    ball_smooth = rolling_mean(ball_ip2, win)
+    q_smooth = rolling_mean(q_cur, win)
+
+    # Episode boundaries
+    ep_changes = np.where(np.diff(episodes) != 0)[0] + 1
+
+    # Reward events
+    pos_idx = np.where(rewards > 0.5)[0]
+    neg_idx = np.where(rewards < -0.5)[0]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True,
+                             gridspec_kw={'height_ratios': [3, 3, 1]})
+
+    # --- Panel 1: Reward field inner products ---
+    ax1 = axes[0]
+    ax1.scatter(steps, ego_ip2, alpha=0.05, s=1, c='tab:blue', rasterized=True)
+    ax1.scatter(steps, ball_ip2, alpha=0.05, s=1, c='tab:orange', rasterized=True)
+    ax1.plot(steps, ego_smooth, c='tab:blue', lw=1.5, label='r . ego (ip2)')
+    ax1.plot(steps, ball_smooth, c='tab:orange', lw=1.5, label='r . ball (ip2)')
+    for ep in ep_changes:
+        ax1.axvline(steps[ep], color='gray', alpha=0.2, lw=0.5, ls='--')
+    # Mark reward events on inner product traces
+    if len(pos_idx):
+        ax1.scatter(steps[pos_idx], ego_ip2[pos_idx], c='green', s=20,
+                    zorder=5, marker='^', label='+reward')
+    if len(neg_idx):
+        ax1.scatter(steps[neg_idx], ego_ip2[neg_idx], c='red', s=20,
+                    zorder=5, marker='v', label='-reward')
+    ax1.axvline(random_steps, color='black', alpha=0.4, lw=1, ls=':',
+                label=f'random phase end ({random_steps})')
+    ax1.set_ylabel('Inner Product (reward dim)')
+    ax1.set_title('Reward Field Inner Products vs Training Step')
+    ax1.legend(loc='upper right', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # --- Panel 2: SAC Critic Q-values ---
+    ax2 = axes[1]
+    valid_q = np.isfinite(q_cur)
+    ax2.scatter(steps[valid_q], q_cur[valid_q], alpha=0.05, s=1, c='tab:green',
+                rasterized=True)
+    ax2.plot(steps, q_smooth, c='tab:green', lw=1.5, label='Q_current (min Q1,Q2)')
+    for ep in ep_changes:
+        ax2.axvline(steps[ep], color='gray', alpha=0.2, lw=0.5, ls='--')
+    ax2.axvline(random_steps, color='black', alpha=0.4, lw=1, ls=':')
+    ax2.set_ylabel('Q-value')
+    ax2.set_title('SAC Critic Q-value vs Training Step')
+    ax2.legend(loc='upper left', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    # --- Panel 3: Reward signal ---
+    ax3 = axes[2]
+    if len(pos_idx):
+        ax3.bar(steps[pos_idx], rewards[pos_idx], color='green', width=3, alpha=0.8)
+    if len(neg_idx):
+        ax3.bar(steps[neg_idx], rewards[neg_idx], color='red', width=3, alpha=0.8)
+    ax3.set_ylabel('Reward')
+    ax3.set_xlabel('Training Step')
+    ax3.set_title('Per-Step Reward Signal')
+    ax3.set_ylim(-1.3, 1.3)
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'Plot saved to {save_path}')
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +508,9 @@ def main():
     parser.add_argument('--update-every', type=int, default=1)
     parser.add_argument('--eval-interval', type=int, default=500)
     parser.add_argument('--save-csv', type=str, default='compare_reward_data.csv')
+    parser.add_argument('--plot', action='store_true', default=True,
+                        help='Generate matplotlib comparison plot')
+    parser.add_argument('--no-plot', dest='plot', action='store_false')
     args = parser.parse_args()
 
     print(f'Reward field vs critic comparison')
