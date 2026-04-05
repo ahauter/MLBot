@@ -13,14 +13,15 @@ algorithm:
     batch_size: 256
     buffer_size: 100000
     random_steps: 5000
-    update_every: 1
+    update_every: 64
+    updates_per_call: 1
 
 env_class: training.environments.pong_env.PongGymEnv
 
 # Pong-specific env params passed through dense_reward_weights
 dense_reward_weights:
   obs_mode: spectral
-  opp_skill: 0.0
+  opp_skill: 0.5
   reward_mode: paddle
 
 opponent_pool:
