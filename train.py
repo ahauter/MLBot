@@ -541,24 +541,31 @@ class RolloutMetricsProvider:
         self.episode_lengths: deque = deque(maxlen=200)
         self.goals_scored: int = 0
         self.goals_conceded: int = 0
+        self.encoder_residuals: deque = deque(maxlen=200)
 
-    def on_episode_end(self, episode_return: float, episode_length: int, goal: int):
+    def on_episode_end(self, episode_return: float, episode_length: int,
+                       goal: int, encoder_residual: float = None):
         self.episode_returns.append(episode_return)
         self.episode_lengths.append(episode_length)
         if goal > 0:
             self.goals_scored += 1
         elif goal < 0:
             self.goals_conceded += 1
+        if encoder_residual is not None:
+            self.encoder_residuals.append(encoder_residual)
 
     def get_metrics(self) -> dict:
         if not self.episode_returns:
             return {}
-        return {
+        metrics = {
             'mean_return': float(np.mean(self.episode_returns)),
             'mean_length': float(np.mean(self.episode_lengths)),
             'goals_scored': self.goals_scored,
             'goals_conceded': self.goals_conceded,
         }
+        if self.encoder_residuals:
+            metrics['encoder_residual'] = float(np.mean(self.encoder_residuals))
+        return metrics
 
 
 class TimingMetricsProvider:
@@ -1046,8 +1053,10 @@ def collect_and_train(
             episode_lengths[wi] += 1
             if dones[wi]:
                 goal = infos[wi].get('goal', 0)
+                enc_res = infos[wi].get('encoder_residual', None)
                 rollout_metrics.on_episode_end(
-                    episode_returns[wi], int(episode_lengths[wi]), goal)
+                    episode_returns[wi], int(episode_lengths[wi]), goal,
+                    encoder_residual=enc_res)
                 for ai, wids in agent_workers.items():
                     if wi in wids:
                         population.add_score(ai, float(goal))

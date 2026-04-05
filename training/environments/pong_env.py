@@ -154,6 +154,15 @@ class PongGymEnv(gym.Env):
             'touches': self._env.agent_touches,
         }
 
+        # On episode end, include mean encoder residual (spectral mode only)
+        if (done or truncated) and self.obs_mode == 'spectral':
+            count = getattr(self._env, '_episode_residual_count', 0)
+            if count > 0:
+                info['encoder_residual'] = (
+                    self._env._episode_residual_sum / count)
+            else:
+                info['encoder_residual'] = 0.0
+
         return (
             obs,
             float(reward),

@@ -236,10 +236,15 @@ class PongEnv:
         # 3. CORRECT: LMS toward observed positions
         if not scored:
             unity = np.ones(NDIM)
-            wp_ball.update_with_attention(ball_pos, unity,
-                                          [nip_env, nip_padL, nip_padR])
+            ball_residual = wp_ball.update_with_attention(
+                ball_pos, unity, [nip_env, nip_padL, nip_padR])
             wp_pl.update_with_attention(pad_l_pos, unity, [nip_padL])
             wp_pr.update_with_attention(pad_r_pos, unity, [nip_padR])
+            self._last_residual = float(np.linalg.norm(ball_residual))
+            self._episode_residual_sum += self._last_residual
+            self._episode_residual_count += 1
+        else:
+            self._last_residual = 0.0
 
         # 4. Deviation + normalize
         ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0
@@ -336,6 +341,9 @@ class PongEnv:
         self.opp_y = 0.0
         self.agent_touches = 0
         self.touched = False  # at least one touch this episode
+        self._last_residual = 0.0
+        self._episode_residual_sum = 0.0
+        self._episode_residual_count = 0
 
         if self.obs_mode == 'spectral':
             self._create_wavepackets()

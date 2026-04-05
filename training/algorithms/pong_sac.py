@@ -240,11 +240,10 @@ class PongSACAlgorithm(Algorithm):
 
         if not self._inference_only:
             # Collect all trainable parameters
+            # Only critic trains the encoder — actor sees detached embeddings
             actor_params = list(self.actor.parameters())
             critic_params = list(self.critic.parameters())
             if self.encoder is not None:
-                # Encoder gets gradients from both actor and critic
-                actor_params += list(self.encoder.parameters())
                 critic_params += list(self.encoder.parameters())
 
             self.actor_opt = Adam(actor_params, lr=self.lr)
@@ -399,10 +398,10 @@ class PongSACAlgorithm(Algorithm):
         critic_loss.backward()
         self.critic_opt.step()
 
-        # Actor update — encoder gets gradients here too
-        b_emb_actor = self._encode(b_obs)
+        # Actor update — encoder frozen, only actor weights update
+        b_emb_actor = self._encode(b_obs).detach()
         new_action, log_prob = self.actor.sample(b_emb_actor)
-        q1_new, q2_new = self.critic(b_emb_actor.detach(), new_action)
+        q1_new, q2_new = self.critic(b_emb_actor, new_action)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (alpha * log_prob - q_new).mean()
         self.actor_opt.zero_grad()
