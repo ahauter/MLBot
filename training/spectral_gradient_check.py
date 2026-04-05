@@ -1,19 +1,21 @@
 """
-Spectral Rollout Gradient Check — Coupled Dimensions + LMS Learning
-====================================================================
-Tests whether Q = inner_product(ego, reward) after N-step COUPLED Fourier
-rollout produces meaningful gradients when the reward wavepacket is
-LEARNED from reward events via LMS (not initialized with oracle knowledge).
+Spectral Rollout Gradient Check — Conv Critic on Shifted Feature Maps
+=====================================================================
+Architecture:
+  1. Extract decoupled wavepacket coefficients from PongEnv
+  2. Shift ego's y-axis coefficients by action * PADDLE_SPEED * DT * N
+  3. Compute 6-channel outer-product feature maps (differentiable in PyTorch)
+  4. Run learned 2D conv → Q scalar
+  5. Check dQ/d(action) agrees with oracle: sign(ball_y - paddle_y)
 
-Phase 1 (previous): Proved coupled representation produces action-dependent
-gradients when reward wavepacket is initialized at ball position (oracle).
-
-Phase 2 (this): Initialize reward wavepacket randomly, let LMS learn from
-reward events, check if gradients become directionally correct over time.
+The conv learns which spatial patterns in the feature maps predict value.
+The action enters analytically via Fourier phase rotation of the ego
+wavepacket BEFORE the feature maps are computed. Gradients flow:
+  actor → action → ego shift → changed feature maps → conv → Q
 
 Usage:
     python training/spectral_gradient_check.py
-    python training/spectral_gradient_check.py --episodes 200 --seed 42
+    python training/spectral_gradient_check.py --n-rollout 20 --seed 42
 """
 
 import argparse
@@ -22,290 +24,361 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 training_dir = os.path.dirname(os.path.abspath(__file__))
 if training_dir not in sys.path:
     sys.path.insert(0, training_dir)
 
-from pong_trainer import PongEnv, PADDLE_SPEED, DT, COURT_LEFT, COURT_RIGHT
+from pong_trainer import (PongEnv, PADDLE_SPEED, DT,
+                          COURT_LEFT, COURT_RIGHT, COURT_TOP, COURT_BOTTOM)
 
 
 # ---------------------------------------------------------------------------
-# Coupled wavepacket primitives
+# Constants matching spectral_pong_viz.py
+# ---------------------------------------------------------------------------
+FM_NX, FM_NY = 24, 16
+FM_CHANNELS = 6  # ball, env, padL, padR, reward, ball×reward
+K = 8
+NDIM = 3
+BASE_FREQS = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
+
+
+# ---------------------------------------------------------------------------
+# Differentiable feature map computation (PyTorch)
 # ---------------------------------------------------------------------------
 
-def make_frequency_vectors(base_freqs, ndim=3):
-    """Create coupled frequency vectors spanning R^ndim.
+def make_basis_matrices(freqs, x_grid, y_grid, r_grid):
+    """Precompute cos/sin basis matrices for the grids.
 
-    For each base frequency, create vectors along:
-      - each axis (K * ndim pure-axis)
-      - each pair of axes (K * C(ndim,2) diagonal)
-      - all axes (K all-diagonal)
-    Total: K * (ndim + C(ndim,2) + 1) = 8 * 7 = 56 vectors
+    Returns dict of (N, K) tensors for each (grid, trig_fn) combination.
+    These are constants — no grad needed.
     """
-    vecs = []
-    for k in base_freqs:
-        for d in range(ndim):
-            v = np.zeros(ndim); v[d] = k
-            vecs.append(v)
-        for d1 in range(ndim):
-            for d2 in range(d1 + 1, ndim):
-                v = np.zeros(ndim)
-                v[d1] = k / np.sqrt(2); v[d2] = k / np.sqrt(2)
-                vecs.append(v)
-        v = np.ones(ndim) * k / np.sqrt(ndim)
-        vecs.append(v)
-    return torch.tensor(np.array(vecs), dtype=torch.float32)
+    freqs_t = torch.tensor(freqs, dtype=torch.float32)
+    x_t = torch.tensor(x_grid, dtype=torch.float32)
+    y_t = torch.tensor(y_grid, dtype=torch.float32)
+    r_t = torch.tensor(r_grid, dtype=torch.float32)
+
+    return {
+        'cos_x': torch.cos(x_t[:, None] * freqs_t[None, :]),  # (NX, K)
+        'sin_x': torch.sin(x_t[:, None] * freqs_t[None, :]),
+        'cos_y': torch.cos(y_t[:, None] * freqs_t[None, :]),  # (NY, K)
+        'sin_y': torch.sin(y_t[:, None] * freqs_t[None, :]),
+        'cos_r': torch.cos(r_t[:, None] * freqs_t[None, :]),  # (NY, K)  r_grid same size
+        'sin_r': torch.sin(r_t[:, None] * freqs_t[None, :]),
+    }
 
 
-def init_coupled_wavepacket(position, k_vecs, sigma=0.8, amplitude=1.5):
-    """Initialize coupled wavepacket centered at position.
-    Returns c_cos, c_sin as (K,) numpy arrays."""
-    pos = np.asarray(position, dtype=np.float64)
-    kv = k_vecs.numpy()
-    k_mag = np.linalg.norm(kv, axis=1)
-    envelope = amplitude * np.exp(-k_mag**2 * sigma**2 / 2)
-    phases = kv @ pos
-    c_cos = envelope * np.cos(phases)
-    c_sin = envelope * np.sin(phases)
-    energy = 0.5 * np.sum(c_cos**2 + c_sin**2)
-    if energy > 1e-12:
-        scale = 1.0 / np.sqrt(energy)
-        c_cos *= scale; c_sin *= scale
-    return c_cos, c_sin
-
-
-def init_random_wavepacket(K, rng, energy=1.0):
-    """Initialize a random coupled wavepacket (no positional bias).
-    Returns c_cos, c_sin as (K,) numpy arrays normalized to given energy."""
-    c_cos = rng.randn(K).astype(np.float64)
-    c_sin = rng.randn(K).astype(np.float64)
-    e = 0.5 * np.sum(c_cos**2 + c_sin**2)
-    if e > 1e-12:
-        scale = np.sqrt(energy / e)
-        c_cos *= scale; c_sin *= scale
-    return c_cos, c_sin
-
-
-# ---------------------------------------------------------------------------
-# Coupled LMS update (numpy, for env-side learning)
-# ---------------------------------------------------------------------------
-
-def coupled_lms_update(c_cos, c_sin, k_vecs_np, position, target_value,
-                       lr=0.1, clip=10.0):
-    """LMS update for coupled wavepacket.
-
-    At position p, the field predicts F(p) = Σ c_cos[j]*cos(k·p) + c_sin[j]*sin(k·p).
-    Update toward target_value using gradient descent on (target - F(p))².
+def evaluate_field(c_cos, c_sin, cos_basis, sin_basis):
+    """Evaluate 1D Fourier field on a grid. All torch tensors.
 
     Args:
-        c_cos, c_sin: (K,) numpy — mutable, updated in place
-        k_vecs_np: (K, ndim) numpy — frequency vectors
-        position: (ndim,) — where the reward event happened
-        target_value: float — what F(p) should be
-        lr: learning rate
-        clip: coefficient clamp
+        c_cos, c_sin: (K,) — Fourier coefficients for one axis
+        cos_basis, sin_basis: (N, K) — precomputed basis on grid
     Returns:
-        residual: float
+        (N,) field values
     """
-    phases = k_vecs_np @ position  # (K,)
-    cos_basis = np.cos(phases)
-    sin_basis = np.sin(phases)
-    prediction = float(np.sum(c_cos * cos_basis + c_sin * sin_basis))
-    residual = target_value - prediction
-    c_cos += lr * residual * cos_basis
-    c_sin += lr * residual * sin_basis
-    np.clip(c_cos, -clip, clip, out=c_cos)
-    np.clip(c_sin, -clip, clip, out=c_sin)
-    return residual
+    return cos_basis @ c_cos + sin_basis @ c_sin
 
 
-def coupled_normalize(c_cos, c_sin, target_energy=1.0):
-    """Normalize so 0.5 * Σ(c²) = target_energy."""
-    e = 0.5 * np.sum(c_cos**2 + c_sin**2)
-    if e > 1e-12:
-        s = np.sqrt(target_energy / e)
-        c_cos *= s; c_sin *= s
+def compute_feature_maps_torch(wavepackets, basis):
+    """Compute 6-channel (FM_NY, FM_NX) feature maps, differentiable.
+
+    Args:
+        wavepackets: dict with keys 'ball', 'ego', 'opp', 'env', 'reward',
+                     each a dict {'c_cos': (K, NDIM), 'c_sin': (K, NDIM)} tensors
+        basis: precomputed basis matrices from make_basis_matrices()
+    Returns:
+        (6, FM_NY, FM_NX) tensor
+    """
+    maps = []
+
+    for name in ['ball', 'env', 'ego', 'opp', 'reward']:
+        wp = wavepackets[name]
+        # Evaluate on x-grid (axis 0) and y-grid (axis 1)
+        fx = evaluate_field(wp['c_cos'][:, 0], wp['c_sin'][:, 0],
+                            basis['cos_x'], basis['sin_x'])  # (NX,)
+        fy = evaluate_field(wp['c_cos'][:, 1], wp['c_sin'][:, 1],
+                            basis['cos_y'], basis['sin_y'])  # (NY,)
+        maps.append(torch.outer(fy, fx))  # (NY, NX)
+
+    # Channel 6: ball outer product on (x, reward_dim)
+    wp_ball = wavepackets['ball']
+    fx_ball = evaluate_field(wp_ball['c_cos'][:, 0], wp_ball['c_sin'][:, 0],
+                             basis['cos_x'], basis['sin_x'])
+    fr_ball = evaluate_field(wp_ball['c_cos'][:, 2], wp_ball['c_sin'][:, 2],
+                             basis['cos_r'], basis['sin_r'])
+    maps.append(torch.outer(fr_ball, fx_ball))
+
+    return torch.stack(maps)  # (6, NY, NX)
 
 
-# ---------------------------------------------------------------------------
-# Differentiable rollout (torch, for gradient check)
-# ---------------------------------------------------------------------------
-
-def coupled_shift(c_cos, c_sin, delta, k_vecs, axis):
-    """Shift coupled wavepacket by delta on axis. Torch tensors."""
-    angles = k_vecs[:, axis] * delta
+def fourier_shift(c_cos, c_sin, delta, freqs):
+    """Shift Fourier coefficients by delta. Differentiable."""
+    angles = freqs * delta
     ca, sa = torch.cos(angles), torch.sin(angles)
     return c_cos * ca - c_sin * sa, c_cos * sa + c_sin * ca
 
 
-def coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin, action, k_vecs, n_steps):
-    """N-step rollout: shift ego on y-axis, return IP(ego, reward)."""
-    e_cos, e_sin = ego_cos.clone(), ego_sin.clone()
-    delta_y = action * PADDLE_SPEED * DT
-    for _ in range(n_steps):
-        e_cos, e_sin = coupled_shift(e_cos, e_sin, delta_y, k_vecs, axis=1)
-    return torch.sum(e_cos * rew_cos + e_sin * rew_sin)
+# ---------------------------------------------------------------------------
+# Conv Critic
+# ---------------------------------------------------------------------------
+
+class ConvCritic(nn.Module):
+    """Small conv net: (6, 16, 24) → Q scalar.
+
+    Two conv layers with stride 2, then flatten → linear → Q.
+    Matches the StridedConvExtractor architecture but learned.
+    """
+
+    def __init__(self, n_channels=FM_CHANNELS, n_filters=8, ks=3, stride=2):
+        super().__init__()
+        self.conv1 = nn.Conv2d(n_channels, n_filters, ks, stride=stride)
+        self.conv2 = nn.Conv2d(n_filters, n_filters, ks, stride=stride)
+        # Output size: (8, 3, 5) = 120
+        oH1 = (FM_NY - ks) // stride + 1  # 7
+        oW1 = (FM_NX - ks) // stride + 1  # 11
+        oH2 = (oH1 - ks) // stride + 1    # 3
+        oW2 = (oW1 - ks) // stride + 1    # 5
+        flat_dim = n_filters * oH2 * oW2   # 120
+        self.fc = nn.Linear(flat_dim, 1)
+
+    def forward(self, fmaps):
+        """fmaps: (6, NY, NX) or (batch, 6, NY, NX) → Q scalar."""
+        if fmaps.dim() == 3:
+            fmaps = fmaps.unsqueeze(0)
+        x = F.relu(self.conv1(fmaps))
+        x = F.relu(self.conv2(x))
+        x = x.flatten(1)
+        return self.fc(x).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
-# Gradient check at a single state
+# Extract wavepacket state from PongEnv
 # ---------------------------------------------------------------------------
 
-def check_gradient(ego_cos_np, ego_sin_np, rew_cos_np, rew_sin_np,
-                   k_vecs, n_steps, ball_y, paddle_y):
-    """Returns dict with Q, dQ/da, oracle comparison."""
-    ego_cos = torch.tensor(ego_cos_np, dtype=torch.float32)
-    ego_sin = torch.tensor(ego_sin_np, dtype=torch.float32)
-    rew_cos = torch.tensor(rew_cos_np, dtype=torch.float32)
-    rew_sin = torch.tensor(rew_sin_np, dtype=torch.float32)
-
-    action = torch.tensor(0.0, requires_grad=True)
-    Q = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin, action, k_vecs, n_steps)
-    Q.backward()
-    dQ_da = action.grad.item()
-
-    with torch.no_grad():
-        Q_plus = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin,
-                                   torch.tensor(1.0), k_vecs, n_steps).item()
-        Q_minus = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin,
-                                    torch.tensor(-1.0), k_vecs, n_steps).item()
-
-    ball_dy = ball_y - paddle_y
-    oracle = 1.0 if ball_dy > 0 else (-1.0 if ball_dy < 0 else 0.0)
-    grad_sign = 1.0 if dQ_da > 0 else (-1.0 if dQ_da < 0 else 0.0)
-    match = (grad_sign == oracle) if oracle != 0 else True
-
+def extract_wavepackets(env):
+    """Extract decoupled wavepacket coefficients as torch tensors."""
+    def wp_to_torch(wp):
+        return {
+            'c_cos': torch.tensor(wp.c_cos.copy(), dtype=torch.float32),
+            'c_sin': torch.tensor(wp.c_sin.copy(), dtype=torch.float32),
+        }
     return {
-        'Q': Q.item(), 'dQ_da': dQ_da,
-        'Q_plus': Q_plus, 'Q_minus': Q_minus,
-        'ball_dy': ball_dy, 'oracle': oracle, 'match': match,
+        'ball': wp_to_torch(env._wp_ball),
+        'ego': wp_to_torch(env._wp_pl),
+        'opp': wp_to_torch(env._wp_pr),
+        'env': wp_to_torch(env._wp_env),
+        'reward': wp_to_torch(env._wp_reward),
     }
 
 
+def shift_ego_y(wavepackets, delta, freqs_t):
+    """Return new wavepackets dict with ego shifted on y-axis.
+    Avoids in-place ops for autograd compatibility."""
+    wp = {k: {kk: vv.clone() for kk, vv in v.items()}
+          for k, v in wavepackets.items()}
+    ego = wp['ego']
+    old_cos = ego['c_cos']
+    old_sin = ego['c_sin']
+    # Shift only y-axis (column 1), rebuild full tensor
+    new_cos_y, new_sin_y = fourier_shift(
+        old_cos[:, 1], old_sin[:, 1], delta, freqs_t)
+    ego['c_cos'] = torch.stack([old_cos[:, 0], new_cos_y, old_cos[:, 2]], dim=1)
+    ego['c_sin'] = torch.stack([old_sin[:, 0], new_sin_y, old_sin[:, 2]], dim=1)
+    return wp
+
+
 # ---------------------------------------------------------------------------
-# Main: run episodes, LMS-learn reward wavepacket, periodically check grads
+# Gradient check
+# ---------------------------------------------------------------------------
+
+def check_gradient(env, critic, basis, freqs_t, n_steps):
+    """Compute Q and dQ/da at action=0, ±1. Compare to oracle."""
+    wavepackets = extract_wavepackets(env)
+    ball_y = env.ball_y
+    paddle_y = env.agent_y
+
+    results = {}
+    for action_val, label in [(0.0, 'Q'), (1.0, 'Q_plus'), (-1.0, 'Q_minus')]:
+        action = torch.tensor(action_val, dtype=torch.float32,
+                              requires_grad=(action_val == 0.0))
+        total_delta = action * PADDLE_SPEED * DT * n_steps
+        wp_shifted = shift_ego_y(wavepackets, total_delta, freqs_t)
+        fmaps = compute_feature_maps_torch(wp_shifted, basis)
+        q = critic(fmaps)
+
+        if action_val == 0.0:
+            q.backward()
+            results['dQ_da'] = action.grad.item()
+            results['Q'] = q.item()
+        else:
+            results[label] = q.item()
+
+    ball_dy = ball_y - paddle_y
+    oracle = 1.0 if ball_dy > 0 else (-1.0 if ball_dy < 0 else 0.0)
+    grad_sign = 1.0 if results['dQ_da'] > 0 else (-1.0 if results['dQ_da'] < 0 else 0.0)
+    results['ball_dy'] = ball_dy
+    results['oracle'] = oracle
+    results['match'] = (grad_sign == oracle) if oracle != 0 else True
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--episodes', type=int, default=300)
-    parser.add_argument('--check-interval', type=int, default=25,
-                        help='Check gradients every N episodes')
-    parser.add_argument('--n-checks', type=int, default=10,
-                        help='Number of gradient checks per interval')
+    parser.add_argument('--n-states', type=int, default=15)
     parser.add_argument('--n-rollout', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=0.05,
-                        help='LMS learning rate for reward wavepacket')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--opp-skill', type=float, default=0.5)
     args = parser.parse_args()
 
-    rng = np.random.RandomState(args.seed)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
-    base_freqs = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
-    k_vecs = make_frequency_vectors(base_freqs, ndim=3)
-    k_vecs_np = k_vecs.numpy()
-    K = k_vecs.shape[0]
+    # Grids for feature map evaluation
+    x_grid = np.linspace(COURT_LEFT, COURT_RIGHT, FM_NX)
+    y_grid = np.linspace(COURT_BOTTOM, COURT_TOP, FM_NY)
+    r_grid = np.linspace(-1.0, 1.0, FM_NY)
+    basis = make_basis_matrices(BASE_FREQS, x_grid, y_grid, r_grid)
+    freqs_t = torch.tensor(BASE_FREQS, dtype=torch.float32)
 
-    print(f"Coupled representation: {K} frequency vectors in R^3")
-    print(f"LMS lr={args.lr}, rollout N={args.n_rollout}, opp_skill={args.opp_skill}")
+    # Random conv critic (untrained — we're checking gradient FLOW, not quality)
+    critic = ConvCritic()
+    critic.eval()
+
+    print(f"Rollout N={args.n_rollout} ({args.n_rollout * DT:.3f}s)")
+    print(f"Conv critic params: {sum(p.numel() for p in critic.parameters())}")
+    print(f"Feature maps: ({FM_CHANNELS}, {FM_NY}, {FM_NX})")
     print()
 
-    # Initialize reward wavepacket RANDOMLY (no oracle knowledge)
-    rew_cos, rew_sin = init_random_wavepacket(K, rng, energy=1.0)
+    # Collect states from spectral-mode env (so wavepackets exist)
+    env = PongEnv(opp_skill=0.5, reward_mode='paddle', obs_mode='spectral')
+    env.reset()
 
-    env = PongEnv(opp_skill=args.opp_skill, reward_mode='paddle', obs_mode='raw')
+    states_checked = 0
+    matches = 0
+    nonzero = 0
+    dq_list = []
+    qr_list = []
+    step = 0
 
-    total_pos_rewards = 0
-    total_neg_rewards = 0
-    episode = 0
+    header = (f"{'St':>3} | {'ball_dy':>7} | {'Q(0)':>8} | {'dQ/da':>9} | "
+              f"{'oracle':>6} | {'match':>5} | {'Q(+1)':>8} | {'Q(-1)':>8} | "
+              f"{'Q(+1)-Q(-1)':>11}")
+    print(header)
+    print("-" * len(header))
 
-    print(f"{'ep':>5} | {'wins':>4} | {'losses':>6} | {'+rew':>4} | {'-rew':>4} | "
-          f"{'agree':>5} | {'mean_dQ':>8} | {'mean_|Qr|':>10} | {'rew_energy':>10}")
-    print("-" * 85)
+    while states_checked < args.n_states:
+        action = np.random.uniform(-1, 1)
+        _, _, done = env.step(action)
+        step += 1
 
-    MAX_EP_LEN = 600  # 10 seconds at 60fps
+        if step % 40 == 0:
+            ball_dy = env.ball_y - env.agent_y
+            if abs(ball_dy) > 0.15:
+                with torch.no_grad():
+                    pass  # critic is in eval mode, but we need grad for action
+                r = check_gradient(env, critic, basis, freqs_t, args.n_rollout)
 
-    while episode < args.episodes:
-        obs = env.reset()
-        done = False
-        ep_step = 0
+                q_range = r['Q_plus'] - r['Q_minus']
+                qr_list.append(abs(q_range))
+                dq_list.append(abs(r['dQ_da']))
+                if abs(r['dQ_da']) > 1e-10:
+                    nonzero += 1
+                if r['match']:
+                    matches += 1
+                states_checked += 1
 
-        while not done and ep_step < MAX_EP_LEN:
-            # Very noisy — deliberately bad so we get both hits AND misses
-            if rng.rand() < 0.5:
-                action = float(rng.uniform(-1, 1))  # random
-            else:
-                ball_dy = env.ball_y - env.agent_y
-                action = float(np.clip(ball_dy * 1.0 + rng.randn() * 1.5, -1, 1))
-            obs, reward, done = env.step(action)
-            ep_step += 1
+                m = "YES" if r['match'] else "NO"
+                print(f"{states_checked:>3} | {r['ball_dy']:>7.3f} | {r['Q']:>8.4f} | "
+                      f"{r['dQ_da']:>9.5f} | {r['oracle']:>6.1f} | "
+                      f"{m:>5} | {r['Q_plus']:>8.4f} | {r['Q_minus']:>8.4f} | "
+                      f"{q_range:>11.5f}")
 
-            # LMS update on reward events
-            if abs(reward) > 0.5:
-                # Position where reward happened: (ball_x, ball_y, reward_sign)
-                # Use ball position — that's where the scoring event occurred
-                rew_pos = np.array([env.ball_x, env.ball_y, np.sign(reward)])
-                coupled_lms_update(rew_cos, rew_sin, k_vecs_np, rew_pos,
-                                   target_value=reward, lr=args.lr)
-                coupled_normalize(rew_cos, rew_sin, target_energy=1.0)
+        if done:
+            env.reset()
 
-                if reward > 0:
-                    total_pos_rewards += 1
-                else:
-                    total_neg_rewards += 1
+    print(f"\nSummary (N={args.n_rollout}):")
+    print(f"  Non-zero gradients: {nonzero}/{states_checked} ({nonzero/states_checked:.0%})")
+    print(f"  Oracle agreement:   {matches}/{states_checked} ({matches/states_checked:.0%})")
+    print(f"  Mean |dQ/da|:       {np.mean(dq_list):.6f}")
+    print(f"  Mean |Q(+1)-Q(-1)|: {np.mean(qr_list):.6f}")
 
-        episode += 1
+    # Also test across N values
+    print(f"\n{'='*60}")
+    print("Gradient strength vs rollout horizon (5 states, varying N)")
+    print(f"{'='*60}")
 
-        # Periodic gradient check
-        if episode % args.check_interval == 0:
-            matches = 0
-            dq_sum = 0.0
-            qr_sum = 0.0
-            n_tested = 0
+    # Collect 5 fixed states
+    env.reset()
+    fixed_states = []
+    for s in range(5000):
+        _, _, d = env.step(np.random.uniform(-1, 1))
+        if s % 200 == 100:
+            if abs(env.ball_y - env.agent_y) > 0.3:
+                fixed_states.append(lambda e=env: extract_wavepackets(e))
+                # Actually need to snapshot — lambdas won't work
+        if d:
+            env.reset()
 
-            # Collect fresh states and check gradients
-            check_env = PongEnv(opp_skill=args.opp_skill, reward_mode='paddle',
-                                obs_mode='raw')
-            check_env.reset()
-            checks_done = 0
-            check_ep_step = 0
-            for step in range(args.n_checks * 120):
-                a = float(np.clip(rng.randn() * 0.8, -1, 1))
-                _, _, d = check_env.step(a)
-                check_ep_step += 1
-                if d or check_ep_step > MAX_EP_LEN:
-                    check_env.reset()
-                    check_ep_step = 0
+    # Re-collect properly
+    env.reset()
+    snapshots = []
+    for s in range(3000):
+        _, _, d = env.step(np.random.uniform(-1, 1))
+        if s % 200 == 100 and len(snapshots) < 5:
+            if abs(env.ball_y - env.agent_y) > 0.3:
+                snapshots.append({
+                    'wp': extract_wavepackets(env),
+                    'ball_y': env.ball_y,
+                    'paddle_y': env.agent_y,
+                })
+        if d:
+            env.reset()
 
-                if step % 60 == 0 and checks_done < args.n_checks:
-                    by = check_env.ball_y
-                    py = check_env.agent_y
-                    if abs(by - py) > 0.2:
-                        # Build ego wavepacket from current paddle position
-                        ego_pos = [check_env.paddle_lx, py, 0.0]
-                        ego_c, ego_s = init_coupled_wavepacket(ego_pos, k_vecs)
+    if snapshots:
+        print(f"\n{'N':>5} | {'mean |dQ/da|':>12} | {'mean |Qrange|':>13} | {'agree':>5}")
+        print("-" * 50)
+        for N in [1, 5, 10, 20, 50]:
+            m_count = 0
+            dq_sum = 0
+            qr_sum = 0
+            for snap in snapshots:
+                # Rebuild env-like check using saved wavepackets
+                action = torch.tensor(0.0, requires_grad=True)
+                delta = action * PADDLE_SPEED * DT * N
+                wp_s = shift_ego_y(snap['wp'], delta, freqs_t)
+                fmaps = compute_feature_maps_torch(wp_s, basis)
+                q = critic(fmaps)
+                q.backward()
+                dq = action.grad.item()
 
-                        r = check_gradient(ego_c, ego_s, rew_cos, rew_sin,
-                                           k_vecs, args.n_rollout, by, py)
-                        if r['match']:
-                            matches += 1
-                        dq_sum += abs(r['dQ_da'])
-                        qr_sum += abs(r['Q_plus'] - r['Q_minus'])
-                        n_tested += 1
-                        checks_done += 1
+                with torch.no_grad():
+                    d_plus = torch.tensor(PADDLE_SPEED * DT * N)
+                    d_minus = torch.tensor(-PADDLE_SPEED * DT * N)
+                    qp = critic(compute_feature_maps_torch(
+                        shift_ego_y(snap['wp'], d_plus, freqs_t), basis)).item()
+                    qm = critic(compute_feature_maps_torch(
+                        shift_ego_y(snap['wp'], d_minus, freqs_t), basis)).item()
 
-            if n_tested > 0:
-                rew_energy = 0.5 * np.sum(rew_cos**2 + rew_sin**2)
-                print(f"{episode:>5} | {total_pos_rewards:>4} | {total_neg_rewards:>6} | "
-                      f"{total_pos_rewards:>4} | {total_neg_rewards:>4} | "
-                      f"{matches}/{n_tested:<3} | "
-                      f"{dq_sum/n_tested:>8.4f} | {qr_sum/n_tested:>10.4f} | "
-                      f"{rew_energy:>10.4f}")
+                ball_dy = snap['ball_y'] - snap['paddle_y']
+                oracle = 1.0 if ball_dy > 0 else -1.0
+                grad_sign = 1.0 if dq > 0 else -1.0
+                if grad_sign == oracle:
+                    m_count += 1
+                dq_sum += abs(dq)
+                qr_sum += abs(qp - qm)
 
-    print("\nDone.")
+            ns = len(snapshots)
+            print(f"{N:>5} | {dq_sum/ns:>12.6f} | {qr_sum/ns:>13.6f} | {m_count}/{ns}")
+
+    print("\nNote: conv weights are RANDOM (untrained). Oracle agreement reflects")
+    print("gradient FLOW, not gradient QUALITY. A trained critic would learn to")
+    print("make these gradients directionally correct.")
 
 
 if __name__ == '__main__':
