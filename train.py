@@ -220,111 +220,117 @@ def _env_worker(conn: multiprocessing.connection.Connection,
         except (EOFError, BrokenPipeError):
             break
 
-        if cmd == 'reset':
-            obs_list = []
-            for env in envs:
-                obs, _info = env.reset()
-                obs_list.append(obs)
-            conn.send(('obs', np.stack(obs_list, axis=0)))
+        try:
+            if cmd == 'reset':
+                obs_list = []
+                for env in envs:
+                    obs, _info = env.reset()
+                    obs_list.append(obs)
+                conn.send(('obs', np.stack(obs_list, axis=0)))
 
-        elif cmd == 'step':
-            # data is (n, 8) actions
-            actions = data
+            elif cmd == 'step':
+                # data is (n, 8) actions
+                actions = data
 
-            # Pre-compute all opponent actions in one batched forward pass
-            if _opponent_algo is not None and n > 1:
-                flat_list = []
-                for e in envs:
-                    stacked = np.stack(list(e._orange_buf), axis=0)
-                    flat_list.append(stacked.ravel().astype(np.float32))
-                batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
-                opp_np = _opponent_algo.infer(batch).astype(np.float32)
-                for i, e in enumerate(envs):
-                    e._cached_opp_action = opp_np[i]
+                # Pre-compute all opponent actions in one batched forward pass
+                if _opponent_algo is not None and n > 1:
+                    flat_list = []
+                    for e in envs:
+                        stacked = np.stack(list(e._orange_buf), axis=0)
+                        flat_list.append(stacked.ravel().astype(np.float32))
+                    batch = np.stack(flat_list, axis=0)  # (n, T*N*F)
+                    opp_np = _opponent_algo.infer(batch).astype(np.float32)
+                    for i, e in enumerate(envs):
+                        e._cached_opp_action = opp_np[i]
 
-            obs_list, rewards, dones, infos = [], [], [], []
-            for i, env in enumerate(envs):
-                obs, reward, done, truncated, info = env.step(actions[i])
-                obs_list.append(obs)
-                rewards.append(reward)
-                dones.append(done)
-                infos.append(info)
-            conn.send((
-                'step',
-                np.stack(obs_list, axis=0),
-                np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.float32),
-                infos,
-            ))
+                obs_list, rewards, dones, infos = [], [], [], []
+                for i, env in enumerate(envs):
+                    obs, reward, done, truncated, info = env.step(actions[i])
+                    obs_list.append(obs)
+                    rewards.append(reward)
+                    dones.append(done)
+                    infos.append(info)
+                conn.send((
+                    'step',
+                    np.stack(obs_list, axis=0),
+                    np.array(rewards, dtype=np.float32),
+                    np.array(dones, dtype=np.float32),
+                    infos,
+                ))
 
-        elif cmd == 'get_opponent_obs':
-            obs_list = []
-            for env in envs:
-                obs_list.append(env.get_opponent_obs())
-            conn.send(('opponent_obs', np.stack(obs_list, axis=0)))
+            elif cmd == 'get_opponent_obs':
+                obs_list = []
+                for env in envs:
+                    obs_list.append(env.get_opponent_obs())
+                conn.send(('opponent_obs', np.stack(obs_list, axis=0)))
 
-        elif cmd == 'step_with_opp':
-            blue_actions, opp_actions = data  # (n, 8) each
-            obs_list, rewards, dones, infos = [], [], [], []
-            for i, env in enumerate(envs):
-                obs, reward, done, truncated, info = env.step_with_opponent_action(
-                    blue_actions[i], opp_actions[i])
-                obs_list.append(obs)
-                rewards.append(reward)
-                dones.append(done)
-                infos.append(info)
-            conn.send((
-                'step',
-                np.stack(obs_list, axis=0),
-                np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.float32),
-                infos,
-            ))
+            elif cmd == 'step_with_opp':
+                blue_actions, opp_actions = data  # (n, 8) each
+                obs_list, rewards, dones, infos = [], [], [], []
+                for i, env in enumerate(envs):
+                    obs, reward, done, truncated, info = env.step_with_opponent_action(
+                        blue_actions[i], opp_actions[i])
+                    obs_list.append(obs)
+                    rewards.append(reward)
+                    dones.append(done)
+                    infos.append(info)
+                conn.send((
+                    'step',
+                    np.stack(obs_list, axis=0),
+                    np.array(rewards, dtype=np.float32),
+                    np.array(dones, dtype=np.float32),
+                    infos,
+                ))
 
-        elif cmd == 'set_opponent_snapshot':
-            snap_path = data
-            if snap_path is not None:
-                from training.opponents.pool import load_opponent_from_snapshot
-                weights = load_opponent_from_snapshot(snap_path, device='cpu')
+            elif cmd == 'set_opponent_snapshot':
+                snap_path = data
+                if snap_path is not None:
+                    from training.opponents.pool import load_opponent_from_snapshot
+                    weights = load_opponent_from_snapshot(snap_path, device='cpu')
 
-                if _opponent_algo is None:
-                    if algo_class:
-                        AlgoCls = load_class(algo_class)
+                    if _opponent_algo is None:
+                        if algo_class:
+                            AlgoCls = load_class(algo_class)
+                        else:
+                            from training.algorithms.ppo import PPOAlgorithm
+                            AlgoCls = PPOAlgorithm
+                        _opponent_algo = AlgoCls({
+                            **(algo_config or {}),
+                            'inference': True, 'device': 'cpu',
+                            't_window': t_window,
+                        })
+                    _opponent_algo.load_weights(weights)
+
+                    if n > 1:
+                        # Multi-env: monkey-patch to read cached action
+                        # (computed in the step handler above)
+                        import types
+
+                        def _cached_opponent_action(self_env):
+                            return self_env._cached_opp_action
+
+                        for env in envs:
+                            env._cached_opp_action = np.zeros(8, dtype=np.float32)
+                            env._get_opponent_action = types.MethodType(
+                                _cached_opponent_action, env)
                     else:
-                        from training.algorithms.ppo import PPOAlgorithm
-                        AlgoCls = PPOAlgorithm
-                    _opponent_algo = AlgoCls({
-                        **(algo_config or {}),
-                        'inference': True, 'device': 'cpu',
-                        't_window': t_window,
-                    })
-                _opponent_algo.load_weights(weights)
+                        # Single env: use algorithm.infer() directly
+                        envs[0].set_opponent_algo(_opponent_algo)
+                conn.send(('ok',))
 
-                if n > 1:
-                    # Multi-env: monkey-patch to read cached action
-                    # (computed in the step handler above)
-                    import types
+            elif cmd == 'close':
+                for env in envs:
+                    env.close()
+                conn.send(('closed',))
+                break
 
-                    def _cached_opponent_action(self_env):
-                        return self_env._cached_opp_action
+            else:
+                conn.send(('error', f'Unknown command: {cmd}'))
 
-                    for env in envs:
-                        env._cached_opp_action = np.zeros(8, dtype=np.float32)
-                        env._get_opponent_action = types.MethodType(
-                            _cached_opponent_action, env)
-                else:
-                    # Single env: use algorithm.infer() directly
-                    envs[0].set_opponent_algo(_opponent_algo)
-            conn.send(('ok',))
-
-        elif cmd == 'close':
-            for env in envs:
-                env.close()
-            conn.send(('closed',))
-            break
-
-        else:
-            conn.send(('error', f'Unknown command: {cmd}'))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 class SubprocVecEnv:
@@ -535,12 +541,14 @@ class RolloutMetricsProvider:
     def __init__(self):
         self.episode_returns: deque = deque(maxlen=200)
         self.episode_lengths: deque = deque(maxlen=200)
+        self.episode_touches: deque = deque(maxlen=200)
         self.goals_scored: int = 0
         self.goals_conceded: int = 0
 
-    def on_episode_end(self, episode_return: float, episode_length: int, goal: int):
+    def on_episode_end(self, episode_return: float, episode_length: int, goal: int, touches: int = 0):
         self.episode_returns.append(episode_return)
         self.episode_lengths.append(episode_length)
+        self.episode_touches.append(touches)
         if goal > 0:
             self.goals_scored += 1
         elif goal < 0:
@@ -552,6 +560,7 @@ class RolloutMetricsProvider:
         return {
             'mean_return': float(np.mean(self.episode_returns)),
             'mean_length': float(np.mean(self.episode_lengths)),
+            'mean_touches': float(np.mean(self.episode_touches)),
             'goals_scored': self.goals_scored,
             'goals_conceded': self.goals_conceded,
         }
@@ -1042,8 +1051,9 @@ def collect_and_train(
             episode_lengths[wi] += 1
             if dones[wi]:
                 goal = infos[wi].get('goal', 0)
+                touches = infos[wi].get('touches', 0)
                 rollout_metrics.on_episode_end(
-                    episode_returns[wi], int(episode_lengths[wi]), goal)
+                    episode_returns[wi], int(episode_lengths[wi]), goal, touches)
                 for ai, wids in agent_workers.items():
                     if wi in wids:
                         population.add_score(ai, float(goal))
