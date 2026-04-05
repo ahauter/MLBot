@@ -146,6 +146,8 @@ def train(args):
 
     # Per-step metric storage
     rows = []  # for CSV: list of dicts
+    prev_ego_ip2 = None
+    prev_ball_ip2 = None
 
     t0 = time.time()
 
@@ -167,6 +169,16 @@ def train(args):
         # Wavepacket metrics (computed after env.step updates wavepackets)
         wp = compute_wp_metrics(env)
 
+        # Finite-difference gradients
+        if prev_ego_ip2 is not None:
+            dr_ego_dt = wp['r_dot_ego_ip2'] - prev_ego_ip2
+            dr_ball_dt = wp['r_dot_ball_ip2'] - prev_ball_ip2
+        else:
+            dr_ego_dt = 0.0
+            dr_ball_dt = 0.0
+        prev_ego_ip2 = wp['r_dot_ego_ip2']
+        prev_ball_ip2 = wp['r_dot_ball_ip2']
+
         # Q-value for current (obs, action) — only meaningful after random phase
         q_current = float('nan')
         if step > args.random_steps:
@@ -185,6 +197,8 @@ def train(args):
             'r_dot_ball_ip2': wp['r_dot_ball_ip2'],
             'r_dot_ego_nip': wp['r_dot_ego_nip'],
             'r_dot_ball_nip': wp['r_dot_ball_nip'],
+            'dr_ego_dt': dr_ego_dt,
+            'dr_ball_dt': dr_ball_dt,
             'q_current': q_current,
             'q_batch_mean': float('nan'),
         })
@@ -197,6 +211,8 @@ def train(args):
             obs = env.reset()
             ep_reward = 0.0
             ep_len = 0
+            prev_ego_ip2 = None
+            prev_ball_ip2 = None
         else:
             obs = next_obs
 
@@ -376,6 +392,90 @@ def train(args):
                       f'r·ball mean={np.mean([r["r_dot_ball_ip2"] for r in neg_events]):.4f}  '
                       f'Q mean={np.nanmean([r["q_current"] for r in neg_events]):.4f}')
 
+        # ---- Gradient analysis ----
+        dr_ego = np.array([r['dr_ego_dt'] for r in post_random])
+        dr_ball = np.array([r['dr_ball_dt'] for r in post_random])
+        steps_arr = np.array([r['step'] for r in post_random])
+
+        print(f'\n{"=" * 70}')
+        print('GRADIENT ANALYSIS (dr/dt)')
+        print('=' * 70)
+
+        print(f'\n{"Metric":<20s} {"Mean":>10s} {"Std":>10s} {"Min":>10s} {"Max":>10s}')
+        print('-' * 62)
+        for name, arr in [('dr·ego/dt', dr_ego), ('dr·ball/dt', dr_ball)]:
+            print(f'{name:<20s} {arr.mean():>10.6f} {arr.std():>10.6f} '
+                  f'{arr.min():>10.6f} {arr.max():>10.6f}')
+
+        # Pre-event gradient analysis
+        neg_indices = [i for i, r in enumerate(post_random) if r['reward'] < -0.5]
+        if neg_indices:
+            print(f'\nPre-event gradient analysis ({len(neg_indices)} negative events):')
+            print('-' * 60)
+            for lookback in [5, 10, 20, 50]:
+                ego_pre = []
+                ball_pre = []
+                for idx in neg_indices:
+                    start = max(0, idx - lookback)
+                    # Only include if window doesn't cross episode boundary
+                    eps_in_window = set(post_random[j]['episode']
+                                        for j in range(start, idx + 1))
+                    if len(eps_in_window) == 1:
+                        ego_pre.append(np.mean(dr_ego[start:idx]))
+                        ball_pre.append(np.mean(dr_ball[start:idx]))
+                if ego_pre:
+                    print(f'  {lookback:>2d}-step lookback: '
+                          f'dr·ego={np.mean(ego_pre):+.6f} '
+                          f'dr·ball={np.mean(ball_pre):+.6f} '
+                          f'(n={len(ego_pre)} events)')
+
+            # Lead-time estimation
+            ego_mean = ego_ip2.mean()
+            ego_std = ego_ip2.std()
+            threshold = ego_mean - 1.0 * ego_std
+            lead_times = []
+            for idx in neg_indices:
+                ep = post_random[idx]['episode']
+                # Walk backwards from event to find first drop below threshold
+                lead = 0
+                for j in range(idx - 1, -1, -1):
+                    if post_random[j]['episode'] != ep:
+                        break
+                    if post_random[j]['r_dot_ego_ip2'] < threshold:
+                        lead = idx - j
+                    else:
+                        break  # signal recovered, stop
+                if lead > 0:
+                    lead_times.append(lead)
+
+            if lead_times:
+                lt = np.array(lead_times)
+                print(f'\n  Lead-time (steps before event where r·ego < mean-1σ):')
+                print(f'    mean={lt.mean():.1f}  median={np.median(lt):.1f}  '
+                      f'range=[{lt.min()}, {lt.max()}]  (n={len(lt)}/{len(neg_indices)} events)')
+            else:
+                print(f'\n  No measurable lead-time detected (r·ego stays above threshold)')
+
+            # Lagged cross-correlation: dr·ego/dt vs reward
+            print(f'\n  Lagged cross-correlation (dr·ego/dt vs reward):')
+            print(f'  {"Lag (steps)":<15s} {"Correlation":>12s}')
+            print(f'  {"-"*28}')
+            best_lag = 0
+            best_corr = 0.0
+            for lag in [0, 1, 2, 5, 10, 20, 30, 50]:
+                if lag >= len(dr_ego):
+                    continue
+                # dr_ego leads reward by `lag` steps
+                if lag == 0:
+                    r = pearson_r(dr_ego, rewards)
+                else:
+                    r = pearson_r(dr_ego[:-lag], rewards[lag:])
+                print(f'  {lag:<15d} {r:>+12.4f}')
+                if abs(r) > abs(best_corr):
+                    best_corr = r
+                    best_lag = lag
+            print(f'  Best lag: {best_lag} steps (r={best_corr:+.4f})')
+
     print(f'\n{"=" * 70}')
 
     # Save CSV
@@ -383,6 +483,7 @@ def train(args):
         fieldnames = ['step', 'episode', 'reward',
                       'r_dot_ego_ip2', 'r_dot_ball_ip2',
                       'r_dot_ego_nip', 'r_dot_ball_nip',
+                      'dr_ego_dt', 'dr_ball_dt',
                       'q_current', 'q_batch_mean']
         with open(args.save_csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -390,10 +491,12 @@ def train(args):
             writer.writerows(rows)
         print(f'Saved {len(rows)} rows to {args.save_csv}')
 
-    # Plot
+    # Plots
     if args.plot:
         plot_path = args.save_csv.replace('.csv', '_plot.png') if args.save_csv else 'compare_reward_plot.png'
         plot_results(rows, plot_path, args.random_steps)
+        episodes_path = args.save_csv.replace('.csv', '_episodes.png') if args.save_csv else 'compare_reward_episodes.png'
+        plot_episode_zooms(rows, episodes_path)
 
     return rows
 
@@ -403,7 +506,7 @@ def train(args):
 # ---------------------------------------------------------------------------
 
 def plot_results(rows, save_path, random_steps):
-    """Generate 3-panel comparison figure."""
+    """Generate 4-panel comparison figure with gradient analysis."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -411,14 +514,19 @@ def plot_results(rows, save_path, random_steps):
     steps = np.array([r['step'] for r in rows])
     ego_ip2 = np.array([r['r_dot_ego_ip2'] for r in rows])
     ball_ip2 = np.array([r['r_dot_ball_ip2'] for r in rows])
+    dr_ego = np.array([r['dr_ego_dt'] for r in rows])
+    dr_ball = np.array([r['dr_ball_dt'] for r in rows])
     q_cur = np.array([r['q_current'] for r in rows])
     rewards = np.array([r['reward'] for r in rows])
     episodes = np.array([r['episode'] for r in rows])
 
     # Smoothed versions
     win = 50
+    grad_win = 20
     ego_smooth = rolling_mean(ego_ip2, win)
     ball_smooth = rolling_mean(ball_ip2, win)
+    dr_ego_smooth = rolling_mean(dr_ego, grad_win)
+    dr_ball_smooth = rolling_mean(dr_ball, grad_win)
     q_smooth = rolling_mean(q_cur, win)
 
     # Episode boundaries
@@ -428,8 +536,8 @@ def plot_results(rows, save_path, random_steps):
     pos_idx = np.where(rewards > 0.5)[0]
     neg_idx = np.where(rewards < -0.5)[0]
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True,
-                             gridspec_kw={'height_ratios': [3, 3, 1]})
+    fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True,
+                             gridspec_kw={'height_ratios': [3, 2, 3, 1]})
 
     # --- Panel 1: Reward field inner products ---
     ax1 = axes[0]
@@ -439,7 +547,6 @@ def plot_results(rows, save_path, random_steps):
     ax1.plot(steps, ball_smooth, c='tab:orange', lw=1.5, label='r . ball (ip2)')
     for ep in ep_changes:
         ax1.axvline(steps[ep], color='gray', alpha=0.2, lw=0.5, ls='--')
-    # Mark reward events on inner product traces
     if len(pos_idx):
         ax1.scatter(steps[pos_idx], ego_ip2[pos_idx], c='green', s=20,
                     zorder=5, marker='^', label='+reward')
@@ -453,36 +560,128 @@ def plot_results(rows, save_path, random_steps):
     ax1.legend(loc='upper right', fontsize=8)
     ax1.grid(True, alpha=0.3)
 
-    # --- Panel 2: SAC Critic Q-values ---
+    # --- Panel 2: Gradients dr/dt ---
     ax2 = axes[1]
-    valid_q = np.isfinite(q_cur)
-    ax2.scatter(steps[valid_q], q_cur[valid_q], alpha=0.05, s=1, c='tab:green',
-                rasterized=True)
-    ax2.plot(steps, q_smooth, c='tab:green', lw=1.5, label='Q_current (min Q1,Q2)')
+    ax2.scatter(steps, dr_ego, alpha=0.03, s=1, c='tab:blue', rasterized=True)
+    ax2.scatter(steps, dr_ball, alpha=0.03, s=1, c='tab:orange', rasterized=True)
+    ax2.plot(steps, dr_ego_smooth, c='tab:blue', lw=1.5, label='dr·ego/dt')
+    ax2.plot(steps, dr_ball_smooth, c='tab:orange', lw=1.5, label='dr·ball/dt')
+    ax2.axhline(0, color='black', alpha=0.3, lw=0.5)
+    # Shade pre-event windows (50 steps before each negative event)
+    for idx in neg_idx:
+        ax2.axvspan(steps[max(0, idx - 50)], steps[idx],
+                    color='red', alpha=0.08)
     for ep in ep_changes:
         ax2.axvline(steps[ep], color='gray', alpha=0.2, lw=0.5, ls='--')
     ax2.axvline(random_steps, color='black', alpha=0.4, lw=1, ls=':')
-    ax2.set_ylabel('Q-value')
-    ax2.set_title('SAC Critic Q-value vs Training Step')
-    ax2.legend(loc='upper left', fontsize=8)
+    ax2.set_ylabel('d/dt (finite diff)')
+    ax2.set_title('Reward Field Gradients (predictive signal?)')
+    ax2.legend(loc='upper right', fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    # --- Panel 3: Reward signal ---
+    # --- Panel 3: SAC Critic Q-values ---
     ax3 = axes[2]
-    if len(pos_idx):
-        ax3.bar(steps[pos_idx], rewards[pos_idx], color='green', width=3, alpha=0.8)
-    if len(neg_idx):
-        ax3.bar(steps[neg_idx], rewards[neg_idx], color='red', width=3, alpha=0.8)
-    ax3.set_ylabel('Reward')
-    ax3.set_xlabel('Training Step')
-    ax3.set_title('Per-Step Reward Signal')
-    ax3.set_ylim(-1.3, 1.3)
+    valid_q = np.isfinite(q_cur)
+    ax3.scatter(steps[valid_q], q_cur[valid_q], alpha=0.05, s=1, c='tab:green',
+                rasterized=True)
+    ax3.plot(steps, q_smooth, c='tab:green', lw=1.5, label='Q_current (min Q1,Q2)')
+    for ep in ep_changes:
+        ax3.axvline(steps[ep], color='gray', alpha=0.2, lw=0.5, ls='--')
+    ax3.axvline(random_steps, color='black', alpha=0.4, lw=1, ls=':')
+    ax3.set_ylabel('Q-value')
+    ax3.set_title('SAC Critic Q-value vs Training Step')
+    ax3.legend(loc='upper left', fontsize=8)
     ax3.grid(True, alpha=0.3)
+
+    # --- Panel 4: Reward signal ---
+    ax4 = axes[3]
+    if len(pos_idx):
+        ax4.bar(steps[pos_idx], rewards[pos_idx], color='green', width=3, alpha=0.8)
+    if len(neg_idx):
+        ax4.bar(steps[neg_idx], rewards[neg_idx], color='red', width=3, alpha=0.8)
+    ax4.set_ylabel('Reward')
+    ax4.set_xlabel('Training Step')
+    ax4.set_title('Per-Step Reward Signal')
+    ax4.set_ylim(-1.3, 1.3)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'Plot saved to {save_path}')
+
+
+def plot_episode_zooms(rows, save_path, max_episodes=6):
+    """Zoomed per-episode plots for episodes ending in negative reward."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # Find episodes that end in negative reward
+    episodes_data = {}
+    for r in rows:
+        ep = r['episode']
+        if ep not in episodes_data:
+            episodes_data[ep] = []
+        episodes_data[ep].append(r)
+
+    neg_episodes = []
+    for ep, ep_rows in sorted(episodes_data.items()):
+        if ep_rows[-1]['reward'] < -0.5:
+            neg_episodes.append((ep, ep_rows))
+        if len(neg_episodes) >= max_episodes:
+            break
+
+    if not neg_episodes:
+        print('No negative-terminal episodes found for zoom plots.')
+        return
+
+    n = len(neg_episodes)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3.5 * n))
+    if n == 1:
+        axes = [axes]
+
+    for i, (ep_num, ep_rows) in enumerate(neg_episodes):
+        ax = axes[i]
+        t = np.arange(len(ep_rows))
+        ego = np.array([r['r_dot_ego_ip2'] for r in ep_rows])
+        ball = np.array([r['r_dot_ball_ip2'] for r in ep_rows])
+        dr_ego = np.array([r['dr_ego_dt'] for r in ep_rows])
+        dr_ball = np.array([r['dr_ball_dt'] for r in ep_rows])
+
+        # Inner products on primary y-axis
+        ax.plot(t, ego, c='tab:blue', lw=1.5, label='r·ego')
+        ax.plot(t, ball, c='tab:orange', lw=1.5, label='r·ball')
+        ax.axvline(len(t) - 1, color='red', lw=2, ls='--', label='miss (-1)')
+        ax.set_ylabel('Inner Product')
+        ax.set_title(f'Episode {ep_num} ({len(ep_rows)} steps, ends in miss)')
+        ax.grid(True, alpha=0.3)
+
+        # Gradients on secondary y-axis
+        ax2 = ax.twinx()
+        # Smooth gradients for readability
+        gwin = min(10, len(t) // 3) if len(t) > 6 else 1
+        dr_ego_s = rolling_mean(dr_ego, gwin) if gwin > 1 else dr_ego
+        dr_ball_s = rolling_mean(dr_ball, gwin) if gwin > 1 else dr_ball
+        ax2.plot(t, dr_ego_s, c='tab:blue', lw=1, ls=':', alpha=0.7,
+                 label='dr·ego/dt')
+        ax2.plot(t, dr_ball_s, c='tab:orange', lw=1, ls=':', alpha=0.7,
+                 label='dr·ball/dt')
+        ax2.axhline(0, color='gray', alpha=0.3, lw=0.5)
+        ax2.set_ylabel('Gradient', fontsize=8)
+
+        # Combined legend
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2,
+                  loc='upper right', fontsize=7)
+
+        ax.set_xlabel('Step within episode')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'Episode zoom plot saved to {save_path}')
 
 
 # ---------------------------------------------------------------------------

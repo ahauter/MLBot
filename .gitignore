@@ -11,6 +11,7 @@ replay_data/
 wandb/
 compare_reward_data.csv
 compare_reward_data_plot.png
+compare_reward_data_episodes.png
 *.db
 .claude/
 .env
