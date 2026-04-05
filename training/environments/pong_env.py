@@ -513,7 +513,13 @@ class PongGymEnv(gym.Env):
             truncated = True
 
         if done:
-            goal = -1 if reward < 0 else 1
+            # Derive goal from game state, not reward (which varies by mode)
+            if self._env.ball_x < COURT_LEFT:
+                goal = -1   # agent missed
+            elif self._env.ball_x > COURT_RIGHT:
+                goal = 1    # opponent missed (agent scored)
+            else:
+                goal = 0    # timeout or other
         else:
             goal = 0
 
