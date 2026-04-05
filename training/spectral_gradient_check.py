@@ -1,21 +1,19 @@
 """
-Spectral Rollout Gradient Check — Coupled Dimensions
-=====================================================
+Spectral Rollout Gradient Check — Coupled Dimensions + LMS Learning
+====================================================================
 Tests whether Q = inner_product(ego, reward) after N-step COUPLED Fourier
-rollout produces meaningful, directionally-correct gradients dQ/d(action).
+rollout produces meaningful gradients when the reward wavepacket is
+LEARNED from reward events via LMS (not initialized with oracle knowledge).
 
-COUPLED means: each frequency is a VECTOR k_vec[j] in R^3 (x, y, reward).
-Phase = k_vec · position. Shifting on y rotates the ENTIRE coefficient
-because the phase depends on ALL dimensions jointly. This means spatial
-movement affects reward-dimension alignment — which is the key property
-the decoupled representation lacked.
+Phase 1 (previous): Proved coupled representation produces action-dependent
+gradients when reward wavepacket is initialized at ball position (oracle).
 
-Compares spectral-derived gradient direction against the oracle:
-  oracle_direction = sign(ball_y - paddle_y)
+Phase 2 (this): Initialize reward wavepacket randomly, let LMS learn from
+reward events, check if gradients become directionally correct over time.
 
 Usage:
     python training/spectral_gradient_check.py
-    python training/spectral_gradient_check.py --n-states 20 --seed 42
+    python training/spectral_gradient_check.py --episodes 200 --seed 42
 """
 
 import argparse
@@ -29,305 +27,285 @@ training_dir = os.path.dirname(os.path.abspath(__file__))
 if training_dir not in sys.path:
     sys.path.insert(0, training_dir)
 
-from pong_trainer import PongEnv, PADDLE_SPEED, DT
+from pong_trainer import PongEnv, PADDLE_SPEED, DT, COURT_LEFT, COURT_RIGHT
 
 
 # ---------------------------------------------------------------------------
-# Coupled wavepacket representation
-# ---------------------------------------------------------------------------
-# Each wavepacket has K frequency vectors k_vec[j] in R^ndim and scalar
-# coefficients c_cos[j], c_sin[j].
-#
-# Field at position p: F(p) = Σ_j c_cos[j]*cos(k_vec[j]·p) + c_sin[j]*sin(k_vec[j]·p)
-#
-# Shifting by delta on axis d:
-#   angle[j] = k_vec[j, d] * delta
-#   new_cos[j] = c_cos[j]*cos(angle[j]) - c_sin[j]*sin(angle[j])
-#   new_sin[j] = c_cos[j]*sin(angle[j]) + c_sin[j]*cos(angle[j])
-#
-# Key property: shifting on y rotates ALL coefficients because k_vec[j]
-# has components on all axes. This couples spatial movement to reward alignment.
+# Coupled wavepacket primitives
 # ---------------------------------------------------------------------------
 
 def make_frequency_vectors(base_freqs, ndim=3):
-    """Create coupled frequency vectors from base frequencies.
+    """Create coupled frequency vectors spanning R^ndim.
 
-    For each base frequency, create vectors pointing in several directions
-    in R^ndim so the representation spans all axis combinations.
-
-    Strategy: for K base freqs, create vectors along:
-      - each axis direction (K * ndim pure-axis vectors)
-      - each pair of axes (K * C(ndim,2) diagonal vectors)
-      - all axes (K all-diagonal vectors)
-    Total: K * (ndim + C(ndim,2) + 1) = 8 * (3 + 3 + 1) = 56 vectors
-
-    Returns: (K_total, ndim) tensor of frequency vectors
+    For each base frequency, create vectors along:
+      - each axis (K * ndim pure-axis)
+      - each pair of axes (K * C(ndim,2) diagonal)
+      - all axes (K all-diagonal)
+    Total: K * (ndim + C(ndim,2) + 1) = 8 * 7 = 56 vectors
     """
     vecs = []
     for k in base_freqs:
-        # Pure axis directions
         for d in range(ndim):
-            v = np.zeros(ndim)
-            v[d] = k
+            v = np.zeros(ndim); v[d] = k
             vecs.append(v)
-        # Pair diagonals (these create the cross-axis coupling!)
         for d1 in range(ndim):
             for d2 in range(d1 + 1, ndim):
                 v = np.zeros(ndim)
-                v[d1] = k / np.sqrt(2)
-                v[d2] = k / np.sqrt(2)
+                v[d1] = k / np.sqrt(2); v[d2] = k / np.sqrt(2)
                 vecs.append(v)
-        # All-axis diagonal
         v = np.ones(ndim) * k / np.sqrt(ndim)
         vecs.append(v)
     return torch.tensor(np.array(vecs), dtype=torch.float32)
 
 
 def init_coupled_wavepacket(position, k_vecs, sigma=0.8, amplitude=1.5):
-    """Initialize a coupled wavepacket centered at position.
-
-    Coefficients are set so the field is a Gaussian-enveloped peak at position:
-      c_cos[j] = amp[j] * cos(k_vec[j] · position)
-      c_sin[j] = amp[j] * sin(k_vec[j] · position)
-
-    where amp[j] = amplitude * exp(-|k_vec[j]|^2 * sigma^2 / 2)
-
-    Args:
-        position: (ndim,) — center position in (x, y, reward) space
-        k_vecs: (K, ndim) — frequency vectors
-        sigma, amplitude: envelope parameters
-    Returns:
-        c_cos, c_sin: (K,) tensors
-    """
-    pos = torch.tensor(position, dtype=torch.float32)
-    k_mag = torch.norm(k_vecs, dim=1)  # (K,)
-    envelope = amplitude * torch.exp(-k_mag**2 * sigma**2 / 2)  # (K,)
-    phases = k_vecs @ pos  # (K,) = k_vec · position
-    c_cos = envelope * torch.cos(phases)
-    c_sin = envelope * torch.sin(phases)
-    # Normalize so ∫F²≈1 (Parseval: energy ≈ 0.5 * Σ(c_cos² + c_sin²))
-    energy = 0.5 * torch.sum(c_cos**2 + c_sin**2)
+    """Initialize coupled wavepacket centered at position.
+    Returns c_cos, c_sin as (K,) numpy arrays."""
+    pos = np.asarray(position, dtype=np.float64)
+    kv = k_vecs.numpy()
+    k_mag = np.linalg.norm(kv, axis=1)
+    envelope = amplitude * np.exp(-k_mag**2 * sigma**2 / 2)
+    phases = kv @ pos
+    c_cos = envelope * np.cos(phases)
+    c_sin = envelope * np.sin(phases)
+    energy = 0.5 * np.sum(c_cos**2 + c_sin**2)
     if energy > 1e-12:
-        scale = 1.0 / torch.sqrt(energy)
-        c_cos = c_cos * scale
-        c_sin = c_sin * scale
+        scale = 1.0 / np.sqrt(energy)
+        c_cos *= scale; c_sin *= scale
     return c_cos, c_sin
 
 
-def coupled_shift(c_cos, c_sin, delta, k_vecs, axis):
-    """Shift a coupled wavepacket by delta on one axis.
+def init_random_wavepacket(K, rng, energy=1.0):
+    """Initialize a random coupled wavepacket (no positional bias).
+    Returns c_cos, c_sin as (K,) numpy arrays normalized to given energy."""
+    c_cos = rng.randn(K).astype(np.float64)
+    c_sin = rng.randn(K).astype(np.float64)
+    e = 0.5 * np.sum(c_cos**2 + c_sin**2)
+    if e > 1e-12:
+        scale = np.sqrt(energy / e)
+        c_cos *= scale; c_sin *= scale
+    return c_cos, c_sin
+
+
+# ---------------------------------------------------------------------------
+# Coupled LMS update (numpy, for env-side learning)
+# ---------------------------------------------------------------------------
+
+def coupled_lms_update(c_cos, c_sin, k_vecs_np, position, target_value,
+                       lr=0.1, clip=10.0):
+    """LMS update for coupled wavepacket.
+
+    At position p, the field predicts F(p) = Σ c_cos[j]*cos(k·p) + c_sin[j]*sin(k·p).
+    Update toward target_value using gradient descent on (target - F(p))².
 
     Args:
-        c_cos, c_sin: (K,) — scalar coefficients per frequency
-        delta: scalar tensor (can require grad)
-        k_vecs: (K, ndim) — frequency vectors
-        axis: int — which axis to shift on
+        c_cos, c_sin: (K,) numpy — mutable, updated in place
+        k_vecs_np: (K, ndim) numpy — frequency vectors
+        position: (ndim,) — where the reward event happened
+        target_value: float — what F(p) should be
+        lr: learning rate
+        clip: coefficient clamp
     Returns:
-        new_cos, new_sin: (K,) shifted coefficients
+        residual: float
     """
-    angles = k_vecs[:, axis] * delta  # (K,) — only the axis-d component matters
+    phases = k_vecs_np @ position  # (K,)
+    cos_basis = np.cos(phases)
+    sin_basis = np.sin(phases)
+    prediction = float(np.sum(c_cos * cos_basis + c_sin * sin_basis))
+    residual = target_value - prediction
+    c_cos += lr * residual * cos_basis
+    c_sin += lr * residual * sin_basis
+    np.clip(c_cos, -clip, clip, out=c_cos)
+    np.clip(c_sin, -clip, clip, out=c_sin)
+    return residual
+
+
+def coupled_normalize(c_cos, c_sin, target_energy=1.0):
+    """Normalize so 0.5 * Σ(c²) = target_energy."""
+    e = 0.5 * np.sum(c_cos**2 + c_sin**2)
+    if e > 1e-12:
+        s = np.sqrt(target_energy / e)
+        c_cos *= s; c_sin *= s
+
+
+# ---------------------------------------------------------------------------
+# Differentiable rollout (torch, for gradient check)
+# ---------------------------------------------------------------------------
+
+def coupled_shift(c_cos, c_sin, delta, k_vecs, axis):
+    """Shift coupled wavepacket by delta on axis. Torch tensors."""
+    angles = k_vecs[:, axis] * delta
     ca, sa = torch.cos(angles), torch.sin(angles)
-    new_cos = c_cos * ca - c_sin * sa
-    new_sin = c_cos * sa + c_sin * ca
-    return new_cos, new_sin
+    return c_cos * ca - c_sin * sa, c_cos * sa + c_sin * ca
 
 
-def coupled_inner_product(a_cos, a_sin, b_cos, b_sin):
-    """Inner product between two coupled wavepackets. Returns scalar."""
-    return torch.sum(a_cos * b_cos + a_sin * b_sin)
-
-
-def coupled_rollout(ego_cos, ego_sin, rew_cos, rew_sin,
-                    action, k_vecs, n_steps):
-    """Differentiable N-step coupled spectral rollout.
-
-    Shifts ego by action * PADDLE_SPEED * DT on y-axis (axis=1) each step.
-    Reward wavepacket is static.
-    Returns Q = inner_product(ego_rolled, reward).
-
-    Because k_vecs have components on all axes, shifting ego on y
-    rotates coefficients that also encode reward-dimension alignment.
-    This is the key coupling that makes Q action-dependent.
-    """
+def coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin, action, k_vecs, n_steps):
+    """N-step rollout: shift ego on y-axis, return IP(ego, reward)."""
     e_cos, e_sin = ego_cos.clone(), ego_sin.clone()
-    ego_delta_y = action * PADDLE_SPEED * DT
-
+    delta_y = action * PADDLE_SPEED * DT
     for _ in range(n_steps):
-        e_cos, e_sin = coupled_shift(e_cos, e_sin, ego_delta_y, k_vecs, axis=1)
-
-    return coupled_inner_product(e_cos, e_sin, rew_cos, rew_sin)
-
-
-# ---------------------------------------------------------------------------
-# Extract game state and build coupled wavepackets
-# ---------------------------------------------------------------------------
-
-def extract_state(env, k_vecs):
-    """Extract game state and create coupled wavepackets from positions."""
-    # Ego paddle position in (x, y, reward) space
-    # reward dim = ego's accumulated reward association (use 0 as neutral)
-    ego_pos = [env.paddle_lx, env.agent_y, 0.0]
-    ego_cos, ego_sin = init_coupled_wavepacket(ego_pos, k_vecs)
-
-    # Reward wavepacket: centered where positive reward happens
-    # In paddle mode, +1 reward at paddle hit = agent's x position, ball's y
-    # After many hits, this should be near (paddle_lx, ~0, +1)
-    # For now, use a fixed "reward lives in reward-dim" position
-    # but WITH spatial structure from the coupled frequencies
-    rew_pos = [env.paddle_lx, env.ball_y, 1.0]
-    rew_cos, rew_sin = init_coupled_wavepacket(rew_pos, k_vecs)
-
-    return {
-        'ego_cos': ego_cos, 'ego_sin': ego_sin,
-        'rew_cos': rew_cos, 'rew_sin': rew_sin,
-        'ball_y': env.ball_y,
-        'paddle_y': env.agent_y,
-        'ball_vx': env.ball_vx,
-        'ball_vy': env.ball_vy,
-    }
+        e_cos, e_sin = coupled_shift(e_cos, e_sin, delta_y, k_vecs, axis=1)
+    return torch.sum(e_cos * rew_cos + e_sin * rew_sin)
 
 
 # ---------------------------------------------------------------------------
-# Gradient check
+# Gradient check at a single state
 # ---------------------------------------------------------------------------
 
-def check_gradients(state, k_vecs, n_steps, action_val=0.0):
-    """Compute Q and dQ/da at a given action, plus Q at +1 and -1."""
-    action = torch.tensor(action_val, dtype=torch.float32, requires_grad=True)
+def check_gradient(ego_cos_np, ego_sin_np, rew_cos_np, rew_sin_np,
+                   k_vecs, n_steps, ball_y, paddle_y):
+    """Returns dict with Q, dQ/da, oracle comparison."""
+    ego_cos = torch.tensor(ego_cos_np, dtype=torch.float32)
+    ego_sin = torch.tensor(ego_sin_np, dtype=torch.float32)
+    rew_cos = torch.tensor(rew_cos_np, dtype=torch.float32)
+    rew_sin = torch.tensor(rew_sin_np, dtype=torch.float32)
 
-    Q = coupled_rollout(
-        state['ego_cos'], state['ego_sin'],
-        state['rew_cos'], state['rew_sin'],
-        action, k_vecs, n_steps)
+    action = torch.tensor(0.0, requires_grad=True)
+    Q = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin, action, k_vecs, n_steps)
     Q.backward()
     dQ_da = action.grad.item()
 
     with torch.no_grad():
-        Q_plus = coupled_rollout(
-            state['ego_cos'], state['ego_sin'],
-            state['rew_cos'], state['rew_sin'],
-            torch.tensor(1.0), k_vecs, n_steps).item()
-        Q_minus = coupled_rollout(
-            state['ego_cos'], state['ego_sin'],
-            state['rew_cos'], state['rew_sin'],
-            torch.tensor(-1.0), k_vecs, n_steps).item()
+        Q_plus = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin,
+                                   torch.tensor(1.0), k_vecs, n_steps).item()
+        Q_minus = coupled_rollout_q(ego_cos, ego_sin, rew_cos, rew_sin,
+                                    torch.tensor(-1.0), k_vecs, n_steps).item()
 
-    ball_dy = state['ball_y'] - state['paddle_y']
-    oracle_sign = 1.0 if ball_dy > 0 else (-1.0 if ball_dy < 0 else 0.0)
+    ball_dy = ball_y - paddle_y
+    oracle = 1.0 if ball_dy > 0 else (-1.0 if ball_dy < 0 else 0.0)
     grad_sign = 1.0 if dQ_da > 0 else (-1.0 if dQ_da < 0 else 0.0)
-    match = (grad_sign == oracle_sign) if oracle_sign != 0.0 else True
+    match = (grad_sign == oracle) if oracle != 0 else True
 
     return {
         'Q': Q.item(), 'dQ_da': dQ_da,
         'Q_plus': Q_plus, 'Q_minus': Q_minus,
-        'ball_dy': ball_dy, 'oracle_sign': oracle_sign, 'match': match,
+        'ball_dy': ball_dy, 'oracle': oracle, 'match': match,
     }
 
 
 # ---------------------------------------------------------------------------
-# Collect game states
-# ---------------------------------------------------------------------------
-
-def collect_states(n_states, k_vecs, seed=0):
-    """Run PongEnv, collect coupled wavepacket states at varied moments."""
-    np.random.seed(seed)
-    env = PongEnv(opp_skill=0.5, reward_mode='paddle', obs_mode='raw')
-
-    states = []
-    env.reset()
-    step = 0
-
-    while len(states) < n_states and step < n_states * 300:
-        action = np.random.uniform(-1.0, 1.0)
-        _, reward, done = env.step(action)
-        step += 1
-
-        if step % 60 == 0:
-            ball_dy = env.ball_y - env.agent_y
-            if abs(ball_dy) > 0.1:
-                states.append(extract_state(env, k_vecs))
-
-        if done:
-            env.reset()
-
-    return states
-
-
-# ---------------------------------------------------------------------------
-# Main
+# Main: run episodes, LMS-learn reward wavepacket, periodically check grads
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Coupled spectral rollout gradient check')
-    parser.add_argument('--n-states', type=int, default=10)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--episodes', type=int, default=300)
+    parser.add_argument('--check-interval', type=int, default=25,
+                        help='Check gradients every N episodes')
+    parser.add_argument('--n-checks', type=int, default=10,
+                        help='Number of gradient checks per interval')
+    parser.add_argument('--n-rollout', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=0.05,
+                        help='LMS learning rate for reward wavepacket')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--opp-skill', type=float, default=0.5)
     args = parser.parse_args()
+
+    rng = np.random.RandomState(args.seed)
+    np.random.seed(args.seed)
 
     base_freqs = np.array([0.3, 0.6, 1.0, 1.4, 1.9, 2.4, 3.0, 3.7])
     k_vecs = make_frequency_vectors(base_freqs, ndim=3)
+    k_vecs_np = k_vecs.numpy()
     K = k_vecs.shape[0]
+
     print(f"Coupled representation: {K} frequency vectors in R^3")
-    print(f"  (from {len(base_freqs)} base frequencies x 7 directions)\n")
-
-    print("Collecting game states...")
-    states = collect_states(args.n_states, k_vecs, seed=args.seed)
-    print(f"Collected {len(states)} states\n")
-
-    # Diagnostic: check coupling structure
-    s0 = states[0]
-    print("=== Coupled Wavepacket Diagnostics (State 0) ===")
-    print(f"  ball_y={s0['ball_y']:.3f}  paddle_y={s0['paddle_y']:.3f}  "
-          f"ball_dy={s0['ball_y']-s0['paddle_y']:.3f}")
-    ego_e = 0.5 * torch.sum(s0['ego_cos']**2 + s0['ego_sin']**2).item()
-    rew_e = 0.5 * torch.sum(s0['rew_cos']**2 + s0['rew_sin']**2).item()
-    ip0 = coupled_inner_product(s0['ego_cos'], s0['ego_sin'],
-                                s0['rew_cos'], s0['rew_sin']).item()
-    print(f"  ego energy={ego_e:.4f}  reward energy={rew_e:.4f}  IP(ego,rew)={ip0:.4f}")
-    # Count how many k_vecs have nonzero components on multiple axes
-    multi_axis = (k_vecs.abs() > 1e-6).sum(dim=1) > 1
-    print(f"  Cross-axis frequency vectors: {multi_axis.sum().item()}/{K} "
-          f"(these create the coupling)")
+    print(f"LMS lr={args.lr}, rollout N={args.n_rollout}, opp_skill={args.opp_skill}")
     print()
 
-    n_values = [1, 5, 10, 20, 50]
+    # Initialize reward wavepacket RANDOMLY (no oracle knowledge)
+    rew_cos, rew_sin = init_random_wavepacket(K, rng, energy=1.0)
 
-    for N in n_values:
-        print(f"{'='*85}")
-        print(f"  N = {N} rollout steps ({N * DT:.3f}s lookahead)")
-        print(f"{'='*85}")
-        header = (f"{'St':>3} | {'ball_dy':>7} | {'Q(0)':>8} | {'dQ/da':>9} | "
-                  f"{'oracle':>6} | {'match':>5} | {'Q(+1)':>8} | {'Q(-1)':>8} | "
-                  f"{'Q(+1)-Q(-1)':>11}")
-        print(header)
-        print("-" * len(header))
+    env = PongEnv(opp_skill=args.opp_skill, reward_mode='paddle', obs_mode='raw')
 
-        matches = 0
-        nonzero = 0
-        q_ranges = []
+    total_pos_rewards = 0
+    total_neg_rewards = 0
+    episode = 0
 
-        for i, state in enumerate(states):
-            r = check_gradients(state, k_vecs, N, action_val=0.0)
-            q_range = r['Q_plus'] - r['Q_minus']
-            q_ranges.append(abs(q_range))
+    print(f"{'ep':>5} | {'wins':>4} | {'losses':>6} | {'+rew':>4} | {'-rew':>4} | "
+          f"{'agree':>5} | {'mean_dQ':>8} | {'mean_|Qr|':>10} | {'rew_energy':>10}")
+    print("-" * 85)
 
-            if abs(r['dQ_da']) > 1e-10:
-                nonzero += 1
-            if r['match']:
-                matches += 1
+    MAX_EP_LEN = 600  # 10 seconds at 60fps
 
-            match_str = "YES" if r['match'] else "NO"
-            print(f"{i:>3} | {r['ball_dy']:>7.3f} | {r['Q']:>8.4f} | "
-                  f"{r['dQ_da']:>9.5f} | {r['oracle_sign']:>6.1f} | "
-                  f"{match_str:>5} | {r['Q_plus']:>8.4f} | {r['Q_minus']:>8.4f} | "
-                  f"{q_range:>11.5f}")
+    while episode < args.episodes:
+        obs = env.reset()
+        done = False
+        ep_step = 0
 
-        n_total = len(states)
-        print(f"\nSummary (N={N}):")
-        print(f"  Non-zero gradients: {nonzero}/{n_total} ({nonzero/n_total:.0%})")
-        print(f"  Oracle agreement:   {matches}/{n_total} ({matches/n_total:.0%})")
-        print(f"  Mean |Q(+1)-Q(-1)|: {np.mean(q_ranges):.6f}")
-        print(f"  Max  |Q(+1)-Q(-1)|: {np.max(q_ranges):.6f}")
-        print()
+        while not done and ep_step < MAX_EP_LEN:
+            # Very noisy — deliberately bad so we get both hits AND misses
+            if rng.rand() < 0.5:
+                action = float(rng.uniform(-1, 1))  # random
+            else:
+                ball_dy = env.ball_y - env.agent_y
+                action = float(np.clip(ball_dy * 1.0 + rng.randn() * 1.5, -1, 1))
+            obs, reward, done = env.step(action)
+            ep_step += 1
+
+            # LMS update on reward events
+            if abs(reward) > 0.5:
+                # Position where reward happened: (ball_x, ball_y, reward_sign)
+                # Use ball position — that's where the scoring event occurred
+                rew_pos = np.array([env.ball_x, env.ball_y, np.sign(reward)])
+                coupled_lms_update(rew_cos, rew_sin, k_vecs_np, rew_pos,
+                                   target_value=reward, lr=args.lr)
+                coupled_normalize(rew_cos, rew_sin, target_energy=1.0)
+
+                if reward > 0:
+                    total_pos_rewards += 1
+                else:
+                    total_neg_rewards += 1
+
+        episode += 1
+
+        # Periodic gradient check
+        if episode % args.check_interval == 0:
+            matches = 0
+            dq_sum = 0.0
+            qr_sum = 0.0
+            n_tested = 0
+
+            # Collect fresh states and check gradients
+            check_env = PongEnv(opp_skill=args.opp_skill, reward_mode='paddle',
+                                obs_mode='raw')
+            check_env.reset()
+            checks_done = 0
+            check_ep_step = 0
+            for step in range(args.n_checks * 120):
+                a = float(np.clip(rng.randn() * 0.8, -1, 1))
+                _, _, d = check_env.step(a)
+                check_ep_step += 1
+                if d or check_ep_step > MAX_EP_LEN:
+                    check_env.reset()
+                    check_ep_step = 0
+
+                if step % 60 == 0 and checks_done < args.n_checks:
+                    by = check_env.ball_y
+                    py = check_env.agent_y
+                    if abs(by - py) > 0.2:
+                        # Build ego wavepacket from current paddle position
+                        ego_pos = [check_env.paddle_lx, py, 0.0]
+                        ego_c, ego_s = init_coupled_wavepacket(ego_pos, k_vecs)
+
+                        r = check_gradient(ego_c, ego_s, rew_cos, rew_sin,
+                                           k_vecs, args.n_rollout, by, py)
+                        if r['match']:
+                            matches += 1
+                        dq_sum += abs(r['dQ_da'])
+                        qr_sum += abs(r['Q_plus'] - r['Q_minus'])
+                        n_tested += 1
+                        checks_done += 1
+
+            if n_tested > 0:
+                rew_energy = 0.5 * np.sum(rew_cos**2 + rew_sin**2)
+                print(f"{episode:>5} | {total_pos_rewards:>4} | {total_neg_rewards:>6} | "
+                      f"{total_pos_rewards:>4} | {total_neg_rewards:>4} | "
+                      f"{matches}/{n_tested:<3} | "
+                      f"{dq_sum/n_tested:>8.4f} | {qr_sum/n_tested:>10.4f} | "
+                      f"{rew_energy:>10.4f}")
+
+    print("\nDone.")
 
 
 if __name__ == '__main__':
