@@ -529,8 +529,8 @@ class PongSACAlgorithm(Algorithm):
         self.actor.load_state_dict(copy.deepcopy(other.actor.state_dict()))
         self.critic.load_state_dict(copy.deepcopy(other.critic.state_dict()))
         self.target_critic.load_state_dict(copy.deepcopy(other.target_critic.state_dict()))
-        if self.spectral_encoder is not None and other.encoder is not None:
-            self.spectral_encoder.load_state_dict(copy.deepcopy(other.encoder.state_dict()))
+        if self.spectral_encoder is not None and other.spectral_encoder is not None:
+            self.spectral_encoder.load_state_dict(copy.deepcopy(other.spectral_encoder.state_dict()))
         if noise_scale > 0:
             with torch.no_grad():
                 all_params = list(self.actor.parameters()) + list(self.critic.parameters())

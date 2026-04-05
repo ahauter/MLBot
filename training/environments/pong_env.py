@@ -107,7 +107,8 @@ class PongEnv:
     """
 
     def __init__(self, opp_skill: float = 0.0, reward_mode: str = 'goal',
-                 obs_mode: str = 'raw', lr_k_env: float = 0.0):
+                 obs_mode: str = 'raw', lr_k_env: float = 0.0,
+                 lr_k: float = 0.001, lr_c_pred: float = 0.05):
         self.paddle_lx = COURT_LEFT + PADDLE_X_OFFSET
         self.paddle_rx = COURT_RIGHT - PADDLE_X_OFFSET
         self.half_h = PADDLE_HEIGHT / 2.0
@@ -115,6 +116,8 @@ class PongEnv:
         self.reward_mode = reward_mode
         self.obs_mode = obs_mode
         self._lr_k_env = lr_k_env
+        self._lr_k = lr_k
+        self._lr_c_pred = lr_c_pred
 
         if obs_mode == 'spectral':
             self._init_spectral()
@@ -192,7 +195,11 @@ class PongEnv:
             nip_padL = abs(wp_ball.normalized_inner_product(wp_pl))
             nip_padR = abs(wp_ball.normalized_inner_product(wp_pr))
             ball_vel = np.array([self.ball_vx, self.ball_vy, 0.0])
-            predicted_pos = wp_ball.predict_position(ball_vel, DT, np.zeros(NDIM))
+            force_env  = wp_ball.predict_force(wp_env,  nip_env,  force_scale=0.3)
+            force_padL = wp_ball.predict_force(wp_pl,   nip_padL, force_scale=0.5)
+            force_padR = wp_ball.predict_force(wp_pr,   nip_padR, force_scale=0.5)
+            total_force = force_env + force_padL + force_padR
+            predicted_pos = wp_ball.predict_position(ball_vel, DT, total_force)
         else:
             nip_env = nip_padL = nip_padR = 0.0
             predicted_pos = ball_pos.copy()
@@ -219,6 +226,18 @@ class PongEnv:
             self._episode_residual_count += 1
         else:
             self._last_residual = 0.0
+
+        # 3b. Amplitude update from prediction residual
+        # Teach the field to encode the prediction error at each location so
+        # that predict_force produces corrective forces in future steps.
+        if not scored and self._lr_c_pred > 0:
+            pred_residual = ball_pos - predicted_pos
+            pred_mag = np.linalg.norm(pred_residual[:2])
+            if pred_mag > 1e-8:
+                wp_ball.update_lms(ball_pos,
+                                   pred_residual / (pred_mag + 1e-8),
+                                   anomaly_scale=pred_mag,
+                                   lr=self._lr_c_pred)
 
         # 4. Deviation + normalize
         ball_dev = np.array([wp_ball.integrate_squared(d) - 1.0 for d in range(NDIM)])
@@ -253,8 +272,8 @@ class PongEnv:
             wp_pr.normalize()
 
         # 7. Frequency learning from prediction residual
-        if not scored and self._lr_k_env > 0:
-            wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=self._lr_k_env)
+        if not scored and self._lr_k > 0:
+            wp_ball.learn_from_residual(predicted_pos, ball_pos, lr_k=self._lr_k)
 
         # 8. Store positions
         wp_ball.pos[:] = ball_pos
@@ -447,6 +466,8 @@ class PongGymEnv(gym.Env):
             opp_skill=opp_skill,
             reward_mode=self._reward_mode,
             obs_mode=obs_mode if obs_mode == 'raw' else 'spectral',
+            lr_k=params.get('lr_k', 0.001),
+            lr_c_pred=params.get('lr_c_pred', 0.05),
         )
 
         if obs_mode == 'spectral':
@@ -492,7 +513,7 @@ class PongGymEnv(gym.Env):
             truncated = True
 
         if done:
-            goal = 1 if reward > 0 else -1
+            goal = -1 if reward < 0 else 1
         else:
             goal = 0
 
@@ -502,6 +523,10 @@ class PongGymEnv(gym.Env):
         }
 
         return obs, float(reward), bool(done), truncated, info
+
+    def step_with_opponent_action(self, action, opp_action):
+        """Ignore external opponent action; PongEnv controls its own opponent."""
+        return self.step(action)
 
     def close(self):
         pass

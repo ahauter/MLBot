@@ -231,8 +231,10 @@ class WavepacketObject2D:
         np.clip(self.c_sin, -COEFF_CLIP, COEFF_CLIP, out=self.c_sin)
 
     def update_lms(self, domain_pos: np.ndarray, target: np.ndarray,
-                   anomaly_scale: float = 1.0) -> np.ndarray:
-        if self.lr <= 0:
+                   anomaly_scale: float = 1.0,
+                   lr: float | None = None) -> np.ndarray:
+        effective_lr = (lr if lr is not None else self.lr) * anomaly_scale
+        if effective_lr <= 0:
             return np.zeros(self.ndim)
         residual = np.zeros(self.ndim)
         for d in range(self.ndim):
@@ -241,7 +243,7 @@ class WavepacketObject2D:
             pred = float(c @ basis)
             res = target[d] - pred
             residual[d] = res
-            c_new = c + (self.lr * anomaly_scale) * basis * res
+            c_new = c + effective_lr * basis * res
             np.clip(c_new, -COEFF_CLIP, COEFF_CLIP, out=c_new)
             self._set_c_flat(d, c_new)
         return residual
