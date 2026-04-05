@@ -9,6 +9,7 @@ checkpoints/
 models/
 replay_data/
 wandb/
+compare_reward_data.csv
 *.db
 .claude/
 .env
