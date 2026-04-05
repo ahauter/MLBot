@@ -519,8 +519,7 @@ class AsyncUpdater:
                     self._profiler.record_event(
                         _t0, _t1, 'gpu_update', thread='gpu',
                         agent_id=agent_id)
-                if hasattr(agent, 'buffer') and hasattr(agent.buffer, 'reset'):
-                    agent.buffer.reset()
+                agent.buffer.reset()
                 agent._buffer_ready.set()
                 with self._lock:
                     self._results.append((agent_id, metrics))

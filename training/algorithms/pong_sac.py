@@ -58,6 +58,10 @@ class ReplayBuffer:
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
+    def reset(self):
+        """No-op. Circular replay buffer persists across updates."""
+        pass
+
     def sample(self, batch_size: int, device: torch.device):
         idx = np.random.randint(0, self.size, size=batch_size)
         return (
