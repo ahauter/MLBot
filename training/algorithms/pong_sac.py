@@ -417,6 +417,11 @@ class PongSACAlgorithm(Algorithm):
         critic_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
         self.critic_opt.zero_grad()
         critic_loss.backward()
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), float('inf'))
+        if self.spectral_encoder is not None:
+            encoder_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.spectral_encoder.parameters(), float('inf'))
         self.critic_opt.step()
 
         # Actor update — encoder frozen, only actor weights update
@@ -427,6 +432,8 @@ class PongSACAlgorithm(Algorithm):
         actor_loss = (alpha * log_prob - q_new).mean()
         self.actor_opt.zero_grad()
         actor_loss.backward()
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), float('inf'))
         self.actor_opt.step()
 
         # Entropy coefficient update
@@ -454,7 +461,11 @@ class PongSACAlgorithm(Algorithm):
             'q_mean': q1_pred.mean().item(),
             'entropy': -log_prob.mean().item(),
             'buffer_size': self.buffer.size,
+            'actor_grad_norm': actor_grad_norm.item(),
+            'critic_grad_norm': critic_grad_norm.item(),
         }
+        if self.spectral_encoder is not None:
+            metrics['encoder_grad_norm'] = encoder_grad_norm.item()
         if self._recent_residuals:
             metrics['encoder_residual'] = float(
                 np.mean(self._recent_residuals))
