@@ -113,6 +113,7 @@ class TokenObsBuilder(ObsBuilder):
         previous_action: np.ndarray,
     ) -> np.ndarray:
         own_team = player.team_num   # 0 = blue, 1 = orange
+        s = -1.0 if own_team == 1 else 1.0  # 180° rotation sign for orange
 
         # Identify opponent (first player on the other team)
         opponent: Optional[PlayerData] = None
@@ -125,15 +126,15 @@ class TokenObsBuilder(ObsBuilder):
 
         # ── token 0: ball ─────────────────────────────────────────────────────
         ball_tok = np.array([
-            ball.position[0]         / FIELD_X,
-            ball.position[1]         / FIELD_Y,
-            ball.position[2]         / CEILING_Z,
-            ball.linear_velocity[0]  / MAX_VEL,
-            ball.linear_velocity[1]  / MAX_VEL,
-            ball.linear_velocity[2]  / MAX_VEL,
-            ball.angular_velocity[0] / MAX_ANG_VEL,
-            ball.angular_velocity[1] / MAX_ANG_VEL,
-            ball.angular_velocity[2] / MAX_ANG_VEL,
+            s * ball.position[0]         / FIELD_X,
+            s * ball.position[1]         / FIELD_Y,
+            ball.position[2]             / CEILING_Z,
+            s * ball.linear_velocity[0]  / MAX_VEL,
+            s * ball.linear_velocity[1]  / MAX_VEL,
+            ball.linear_velocity[2]      / MAX_VEL,
+            s * ball.angular_velocity[0] / MAX_ANG_VEL,
+            s * ball.angular_velocity[1] / MAX_ANG_VEL,
+            ball.angular_velocity[2]     / MAX_ANG_VEL,
             0.0,
         ], dtype=np.float32)
 
@@ -142,31 +143,31 @@ class TokenObsBuilder(ObsBuilder):
         own_boost = player.boost_amount  # 0..1 — multiply by 100 for 0-100 scale
 
         own_tok = np.array([
-            own.position[0]        / FIELD_X,
-            own.position[1]        / FIELD_Y,
-            own.position[2]        / CEILING_Z,
-            own.linear_velocity[0] / MAX_VEL,
-            own.linear_velocity[1] / MAX_VEL,
-            own.linear_velocity[2] / MAX_VEL,
-            own.yaw()              / math.pi,
-            own.pitch()            / math.pi,
-            own.roll()             / math.pi,
-            (own_boost * 100.0)    / MAX_BOOST,
+            s * own.position[0]        / FIELD_X,
+            s * own.position[1]        / FIELD_Y,
+            own.position[2]            / CEILING_Z,
+            s * own.linear_velocity[0] / MAX_VEL,
+            s * own.linear_velocity[1] / MAX_VEL,
+            own.linear_velocity[2]     / MAX_VEL,
+            s * own.yaw()              / math.pi,
+            own.pitch()                / math.pi,
+            own.roll()                 / math.pi,
+            (own_boost * 100.0)        / MAX_BOOST,
         ], dtype=np.float32)
 
         # ── token 2: opponent — boost hidden ──────────────────────────────────
         if opponent is not None:
             opp     = opponent.car_data
             opp_tok = np.array([
-                opp.position[0]        / FIELD_X,
-                opp.position[1]        / FIELD_Y,
-                opp.position[2]        / CEILING_Z,
-                opp.linear_velocity[0] / MAX_VEL,
-                opp.linear_velocity[1] / MAX_VEL,
-                opp.linear_velocity[2] / MAX_VEL,
-                opp.yaw()              / math.pi,
-                opp.pitch()            / math.pi,
-                opp.roll()             / math.pi,
+                s * opp.position[0]        / FIELD_X,
+                s * opp.position[1]        / FIELD_Y,
+                opp.position[2]            / CEILING_Z,
+                s * opp.linear_velocity[0] / MAX_VEL,
+                s * opp.linear_velocity[1] / MAX_VEL,
+                opp.linear_velocity[2]     / MAX_VEL,
+                s * opp.yaw()              / math.pi,
+                opp.pitch()                / math.pi,
+                opp.roll()                 / math.pi,
                 0.0,   # <-- opponent boost intentionally hidden
             ], dtype=np.float32)
         else:
@@ -178,9 +179,9 @@ class TokenObsBuilder(ObsBuilder):
             active = float(state.boost_pads[idx]) if idx < len(state.boost_pads) else 0.0
             pos    = _BIG_PAD_POSITIONS[i]
             pad_toks.append(np.array([
-                pos[0] / FIELD_X,
-                pos[1] / FIELD_Y,
-                pos[2] / CEILING_Z,
+                s * pos[0] / FIELD_X,
+                s * pos[1] / FIELD_Y,
+                pos[2]     / CEILING_Z,
                 active,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             ], dtype=np.float32))
