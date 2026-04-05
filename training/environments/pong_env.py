@@ -522,6 +522,16 @@ class PongGymEnv(gym.Env):
             'touches': self._env.agent_touches,
         }
 
+        # Auto-reset on episode end (gymnasium vectorized-env convention).
+        # The returned obs is the first observation of the NEW episode;
+        # the terminal observation is stashed in info for algorithms that
+        # need it.
+        if done or truncated:
+            info['terminal_observation'] = obs
+            self._env.reset()
+            self._step_count = 0
+            obs = self._get_obs()
+
         return obs, float(reward), bool(done), truncated, info
 
     def step_with_opponent_action(self, action, opp_action):
