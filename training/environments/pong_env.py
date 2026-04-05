@@ -425,14 +425,17 @@ class PongGymEnv(gym.Env):
         t_window: int = 1,
         reward_type: str = 'sparse',
         dense_reward_weights: Optional[dict] = None,
-        obs_mode: str = 'raw',
-        opp_skill: float = 0.0,
-        reward_mode: Optional[str] = None,
-        max_steps: int = 2000,
     ):
         super().__init__()
         self.t_window = t_window
-        self.max_steps = max_steps
+
+        # Pong-specific params come through dense_reward_weights dict
+        # (the only custom dict the framework passes to env constructors)
+        params = dense_reward_weights or {}
+        obs_mode = params.get('obs_mode', 'raw')
+        opp_skill = params.get('opp_skill', 0.0)
+        reward_mode = params.get('reward_mode', None)
+        self.max_steps = params.get('max_steps', 2000)
         self.obs_mode = obs_mode
 
         if reward_mode is not None:
@@ -447,7 +450,8 @@ class PongGymEnv(gym.Env):
         )
 
         if obs_mode == 'spectral':
-            obs_dim = FM_CHANNELS * FM_NY * FM_NX  # 6 * 16 * 24 = 2304
+            # 2304 feature map + 1 encoder residual appended
+            obs_dim = FM_CHANNELS * FM_NY * FM_NX + 1
         else:
             obs_dim = self._env.obs_dim
 
@@ -462,7 +466,10 @@ class PongGymEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         if self.obs_mode == 'spectral':
             fmaps = self._env.get_feature_maps()
-            return fmaps.ravel().astype(np.float32)
+            flat = fmaps.ravel().astype(np.float32)
+            # Append LMS residual as last element
+            residual = getattr(self._env, '_last_residual', 0.0)
+            return np.append(flat, np.float32(residual))
         else:
             return self._env._raw_obs().astype(np.float32)
 
@@ -493,15 +500,6 @@ class PongGymEnv(gym.Env):
             'goal': goal,
             'touches': self._env.agent_touches,
         }
-
-        # On episode end, include mean encoder residual (spectral mode only)
-        if (done or truncated) and self.obs_mode == 'spectral':
-            count = getattr(self._env, '_episode_residual_count', 0)
-            if count > 0:
-                info['encoder_residual'] = (
-                    self._env._episode_residual_sum / count)
-            else:
-                info['encoder_residual'] = 0.0
 
         return obs, float(reward), bool(done), truncated, info
 

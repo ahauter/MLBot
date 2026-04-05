@@ -204,7 +204,10 @@ class PongSACAlgorithm(Algorithm):
 
         # Observation mode
         self.obs_mode = params.get('obs_mode', 'raw')
-        self.obs_dim = params.get('obs_dim', 4 if self.obs_mode == 'raw' else 2304)
+        self.obs_dim = params.get('obs_dim', 4 if self.obs_mode == 'raw' else 2305)
+        # Feature map dimension (obs minus appended residual for spectral)
+        self._fmap_dim = (FM_CHANNELS * FM_NY * FM_NX
+                          if self.obs_mode == 'spectral' else self.obs_dim)
 
         # Hyperparameters
         self.hidden = params.get('hidden', 256)
@@ -223,11 +226,11 @@ class PongSACAlgorithm(Algorithm):
         self.device = torch.device(_device)
 
         # Spectral encoder (trainable conv on GPU)
-        self.encoder = None
+        self.spectral_encoder = None
         if self.obs_mode == 'spectral':
             n_filters = params.get('n_filters', 16)
             embedding_dim = params.get('embedding_dim', 64)
-            self.encoder = SpectralEncoder(n_filters, embedding_dim).to(self.device)
+            self.spectral_encoder = SpectralEncoder(n_filters, embedding_dim).to(self.device)
             actor_input_dim = embedding_dim
         else:
             actor_input_dim = self.obs_dim
@@ -243,8 +246,8 @@ class PongSACAlgorithm(Algorithm):
             # Only critic trains the encoder — actor sees detached embeddings
             actor_params = list(self.actor.parameters())
             critic_params = list(self.critic.parameters())
-            if self.encoder is not None:
-                critic_params += list(self.encoder.parameters())
+            if self.spectral_encoder is not None:
+                critic_params += list(self.spectral_encoder.parameters())
 
             self.actor_opt = Adam(actor_params, lr=self.lr)
             self.critic_opt = Adam(critic_params, lr=self.lr)
@@ -263,21 +266,34 @@ class PongSACAlgorithm(Algorithm):
         self._total_steps = 0
         self._steps_since_update = 0
 
+        # Encoder residual tracking (spectral mode only)
+        from collections import deque
+        self._recent_residuals = deque(maxlen=200)
+
         # Required by AsyncUpdater in train.py
         self._buffer_ready = threading.Event()
         self._buffer_ready.set()
+
+        # Framework expects .encoder, .policy, .optimizer for checkpointing
+        # Map SAC components to match PPO's interface
+        self.encoder = self.actor
+        self.policy = self.critic
+        self.optimizer = self.actor_opt if not self._inference_only else None
 
         # Eval mode by default
         self.actor.eval()
         self.critic.eval()
         self.target_critic.eval()
-        if self.encoder is not None:
-            self.encoder.eval()
+        if self.spectral_encoder is not None:
+            self.spectral_encoder.eval()
 
     def _encode(self, obs_t: torch.Tensor) -> torch.Tensor:
-        """Pass through encoder if spectral, otherwise identity."""
-        if self.encoder is not None:
-            return self.encoder(obs_t)
+        """Pass through spectral conv encoder if present, otherwise identity.
+
+        For spectral mode, strips the appended residual float before encoding.
+        """
+        if self.spectral_encoder is not None:
+            return self.spectral_encoder(obs_t[:, :self._fmap_dim])
         return obs_t
 
     @classmethod
@@ -359,6 +375,11 @@ class PongSACAlgorithm(Algorithm):
                 done_arr[i],
             )
             self._steps_since_update += 1
+            # Extract appended residual from spectral obs (last element)
+            if self.spectral_encoder is not None and obs_2d.shape[1] > self._fmap_dim:
+                res = float(obs_2d[i, self._fmap_dim])
+                if res > 0:
+                    self._recent_residuals.append(res)
 
     def should_update(self) -> bool:
         """True when we have enough data and enough steps since last update."""
@@ -371,8 +392,8 @@ class PongSACAlgorithm(Algorithm):
 
         self.actor.train()
         self.critic.train()
-        if self.encoder is not None:
-            self.encoder.train()
+        if self.spectral_encoder is not None:
+            self.spectral_encoder.train()
 
         b_obs, b_act, b_rew, b_next, b_done = self.buffer.sample(
             self.batch_size, self.device)
@@ -423,10 +444,10 @@ class PongSACAlgorithm(Algorithm):
 
         self.actor.eval()
         self.critic.eval()
-        if self.encoder is not None:
-            self.encoder.eval()
+        if self.spectral_encoder is not None:
+            self.spectral_encoder.eval()
 
-        return {
+        metrics = {
             'critic_loss': critic_loss.item(),
             'actor_loss': actor_loss.item(),
             'alpha': self.alpha,
@@ -434,6 +455,10 @@ class PongSACAlgorithm(Algorithm):
             'entropy': -log_prob.mean().item(),
             'buffer_size': self.buffer.size,
         }
+        if self._recent_residuals:
+            metrics['encoder_residual'] = float(
+                np.mean(self._recent_residuals))
+        return metrics
 
     def save_checkpoint(self, path: Path) -> None:
         path = Path(path)
@@ -448,8 +473,8 @@ class PongSACAlgorithm(Algorithm):
             'alpha_opt': self.alpha_opt.state_dict(),
             'total_steps': self._total_steps,
         }
-        if self.encoder is not None:
-            state['encoder'] = self.encoder.state_dict()
+        if self.spectral_encoder is not None:
+            state['encoder'] = self.spectral_encoder.state_dict()
         torch.save(state, path / 'checkpoint.pt')
 
     def load_checkpoint(self, path: Path) -> None:
@@ -464,8 +489,8 @@ class PongSACAlgorithm(Algorithm):
         self.log_alpha = ckpt['log_alpha'].to(self.device).requires_grad_(True)
         self.alpha_opt.load_state_dict(ckpt['alpha_opt'])
         self._total_steps = ckpt.get('total_steps', 0)
-        if self.encoder is not None and 'encoder' in ckpt:
-            self.encoder.load_state_dict(ckpt['encoder'])
+        if self.spectral_encoder is not None and 'encoder' in ckpt:
+            self.spectral_encoder.load_state_dict(ckpt['encoder'])
 
     def get_weights(self) -> dict:
         """Return weights for snapshot saving."""
@@ -473,21 +498,21 @@ class PongSACAlgorithm(Algorithm):
             'encoder': {k: v.clone() for k, v in self.actor.state_dict().items()},
             'policy': {k: v.clone() for k, v in self.critic.state_dict().items()},
         }
-        if self.encoder is not None:
+        if self.spectral_encoder is not None:
             weights['spectral_encoder'] = {
-                k: v.clone() for k, v in self.encoder.state_dict().items()}
+                k: v.clone() for k, v in self.spectral_encoder.state_dict().items()}
         return weights
 
     def load_weights(self, weights: dict) -> None:
         """Load weights from snapshot."""
         self.actor.load_state_dict(weights['encoder'])
         self.critic.load_state_dict(weights['policy'])
-        if self.encoder is not None and 'spectral_encoder' in weights:
-            self.encoder.load_state_dict(weights['spectral_encoder'])
+        if self.spectral_encoder is not None and 'spectral_encoder' in weights:
+            self.spectral_encoder.load_state_dict(weights['spectral_encoder'])
         self.actor.eval()
         self.critic.eval()
-        if self.encoder is not None:
-            self.encoder.eval()
+        if self.spectral_encoder is not None:
+            self.spectral_encoder.eval()
 
     @torch.no_grad()
     def infer(self, obs: np.ndarray) -> np.ndarray:
@@ -504,13 +529,13 @@ class PongSACAlgorithm(Algorithm):
         self.actor.load_state_dict(copy.deepcopy(other.actor.state_dict()))
         self.critic.load_state_dict(copy.deepcopy(other.critic.state_dict()))
         self.target_critic.load_state_dict(copy.deepcopy(other.target_critic.state_dict()))
-        if self.encoder is not None and other.encoder is not None:
-            self.encoder.load_state_dict(copy.deepcopy(other.encoder.state_dict()))
+        if self.spectral_encoder is not None and other.encoder is not None:
+            self.spectral_encoder.load_state_dict(copy.deepcopy(other.encoder.state_dict()))
         if noise_scale > 0:
             with torch.no_grad():
                 all_params = list(self.actor.parameters()) + list(self.critic.parameters())
-                if self.encoder is not None:
-                    all_params += list(self.encoder.parameters())
+                if self.spectral_encoder is not None:
+                    all_params += list(self.spectral_encoder.parameters())
                 for p in all_params:
                     p.add_(torch.randn_like(p) * noise_scale)
         self.actor_opt = Adam(self.actor.parameters(), lr=self.lr)

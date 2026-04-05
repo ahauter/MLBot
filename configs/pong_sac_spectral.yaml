@@ -2,9 +2,9 @@ algorithm:
   class: training.algorithms.pong_sac.PongSACAlgorithm
   params:
     obs_mode: spectral
-    obs_dim: 2304          # 6 channels × 16 height × 24 width (raw feature maps)
-    n_filters: 16          # conv filters per layer
-    embedding_dim: 64      # conv output → MLP input
+    obs_dim: 2305          # 6*16*24 feature maps + 1 LMS residual
+    n_filters: 16
+    embedding_dim: 64
     hidden: 256
     lr: 3e-4
     alpha_lr: 1e-3
@@ -16,7 +16,9 @@ algorithm:
     update_every: 1
 
 env_class: training.environments.pong_env.PongGymEnv
-env_params:
+
+# Pong-specific env params passed through dense_reward_weights
+dense_reward_weights:
   obs_mode: spectral
   opp_skill: 0.0
   reward_mode: paddle

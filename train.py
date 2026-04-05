@@ -187,8 +187,7 @@ def _env_worker(conn: multiprocessing.connection.Connection,
                 env_class: Optional[str] = None,
                 envs_per_worker: int = 1,
                 algo_class: Optional[str] = None,
-                algo_config: Optional[dict] = None,
-                env_params: Optional[dict] = None):
+                algo_config: Optional[dict] = None):
     """Child process: owns one or more gym envs, responds to commands.
 
     When envs_per_worker > 1, multiple rlgym-sim arenas run in a single
@@ -208,7 +207,6 @@ def _env_worker(conn: multiprocessing.connection.Connection,
             t_window=t_window,
             reward_type=reward_type,
             dense_reward_weights=dense_reward_weights,
-            **(env_params or {}),
         )
         for _ in range(n)
     ]
@@ -352,8 +350,7 @@ class SubprocVecEnv:
                  env_class: Optional[str] = None,
                  envs_per_worker: int = 1,
                  algo_class: Optional[str] = None,
-                 algo_config: Optional[dict] = None,
-                 env_params: Optional[dict] = None):
+                 algo_config: Optional[dict] = None):
         self.num_workers = num_envs
         self.envs_per_worker = envs_per_worker
         self.num_envs = num_envs * envs_per_worker  # total logical envs
@@ -365,8 +362,7 @@ class SubprocVecEnv:
             proc = multiprocessing.Process(
                 target=_env_worker,
                 args=(child_conn, t_window, reward_type, dense_reward_weights,
-                      env_class, envs_per_worker, algo_class, algo_config,
-                      env_params),
+                      env_class, envs_per_worker, algo_class, algo_config),
                 daemon=True,
             )
             proc.start()
@@ -541,31 +537,24 @@ class RolloutMetricsProvider:
         self.episode_lengths: deque = deque(maxlen=200)
         self.goals_scored: int = 0
         self.goals_conceded: int = 0
-        self.encoder_residuals: deque = deque(maxlen=200)
 
-    def on_episode_end(self, episode_return: float, episode_length: int,
-                       goal: int, encoder_residual: float = None):
+    def on_episode_end(self, episode_return: float, episode_length: int, goal: int):
         self.episode_returns.append(episode_return)
         self.episode_lengths.append(episode_length)
         if goal > 0:
             self.goals_scored += 1
         elif goal < 0:
             self.goals_conceded += 1
-        if encoder_residual is not None:
-            self.encoder_residuals.append(encoder_residual)
 
     def get_metrics(self) -> dict:
         if not self.episode_returns:
             return {}
-        metrics = {
+        return {
             'mean_return': float(np.mean(self.episode_returns)),
             'mean_length': float(np.mean(self.episode_lengths)),
             'goals_scored': self.goals_scored,
             'goals_conceded': self.goals_conceded,
         }
-        if self.encoder_residuals:
-            metrics['encoder_residual'] = float(np.mean(self.encoder_residuals))
-        return metrics
 
 
 class TimingMetricsProvider:
@@ -1053,10 +1042,8 @@ def collect_and_train(
             episode_lengths[wi] += 1
             if dones[wi]:
                 goal = infos[wi].get('goal', 0)
-                enc_res = infos[wi].get('encoder_residual', None)
                 rollout_metrics.on_episode_end(
-                    episode_returns[wi], int(episode_lengths[wi]), goal,
-                    encoder_residual=enc_res)
+                    episode_returns[wi], int(episode_lengths[wi]), goal)
                 for ai, wids in agent_workers.items():
                     if wi in wids:
                         population.add_score(ai, float(goal))
@@ -1102,8 +1089,11 @@ def save_training_state(path: Path, population, total_collected: int,
         'agents': [],
     }
     for agent in population.agents:
-        weights = agent.get_weights()
-        state['agents'].append(weights)
+        state['agents'].append({
+            'encoder': agent.encoder.state_dict(),
+            'policy': agent.policy.state_dict(),
+            'optimizer': agent.optimizer.state_dict(),
+        })
     tmp = path / 'training_state.pt.tmp'
     torch.save(state, tmp)
     os.replace(tmp, path / 'training_state.pt')
@@ -1119,7 +1109,9 @@ def load_training_state(path: Path, population, device: str = 'cpu') -> dict:
             f'Checkpoint has {saved_agents} agents but population has '
             f'{population.num_agents}')
     for i, agent_state in enumerate(ckpt['agents']):
-        population.agents[i].load_weights(agent_state)
+        population.agents[i].encoder.load_state_dict(agent_state['encoder'])
+        population.agents[i].policy.load_state_dict(agent_state['policy'])
+        population.agents[i].optimizer.load_state_dict(agent_state['optimizer'])
     population._generation = ckpt['population_generation']
     population._last_snapshot_step = ckpt['population_last_snapshot_step']
     population.scores = ckpt['population_scores']
@@ -1209,7 +1201,6 @@ def train(config: dict):
     algo_config_for_workers.setdefault('algorithm', {})
     algo_config_for_workers['algorithm']['params'] = config.get(
         'algorithm', {}).get('params', {})
-    env_params = config.get('env_params', None)
     envs = SubprocVecEnv(
         num_envs=num_envs,
         t_window=t_window,
@@ -1219,7 +1210,6 @@ def train(config: dict):
         envs_per_worker=envs_per_worker,
         algo_class=algo_class_str,
         algo_config=algo_config_for_workers,
-        env_params=env_params,
     )
 
     # ── seed from replay data ───────────────────────────────────────────

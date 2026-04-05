@@ -1,6 +1,7 @@
 algorithm:
   class: training.algorithms.pong_sac.PongSACAlgorithm
   params:
+    obs_mode: raw
     obs_dim: 4
     hidden: 256
     lr: 3e-4
@@ -13,7 +14,9 @@ algorithm:
     update_every: 1
 
 env_class: training.environments.pong_env.PongGymEnv
-env_params:
+
+# Pong-specific env params passed through dense_reward_weights
+dense_reward_weights:
   obs_mode: raw
   opp_skill: 0.0
   reward_mode: paddle
@@ -22,7 +25,7 @@ opponent_pool:
   class: training.opponents.population.Population
   params:
     agents: 1
-    snapshot_interval: 999999999  # disable snapshots (pong uses built-in opponent)
+    snapshot_interval: 999999999
 
 seed: 0
 total_steps: 200000
