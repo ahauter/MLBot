@@ -1,8 +1,10 @@
 algorithm:
   class: training.algorithms.pong_sac.PongSACAlgorithm
   params:
-    obs_mode: raw6
-    obs_dim: 6
+    obs_mode: spectral
+    obs_dim: 2305          # 6*16*24 feature maps + 1 LMS residual
+    n_filters: 16
+    embedding_dim: 64
     hidden: 256
     lr: 3e-4
     alpha_lr: 1e-3
@@ -18,9 +20,9 @@ env_class: training.environments.pong_env.PongGymEnv
 
 # Pong-specific env params passed through dense_reward_weights
 dense_reward_weights:
-  obs_mode: raw6
+  obs_mode: spectral
   opp_skill: 0.5
-  reward_mode: paddle
+  reward_mode: goal
 
 opponent_pool:
   class: training.opponents.population.Population
@@ -47,5 +49,5 @@ evaluation:
       Beginner: null
 
 wandb:
-  project: pong-sac-raw-paddle
+  project: pong-sac-spectral-goal
   enabled: true

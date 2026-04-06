@@ -29,12 +29,12 @@ opponent_pool:
     snapshot_interval: 999999999
 
 seed: 0
-total_steps: 200000
+total_steps: 2e6
 num_envs: 1
 envs_per_worker: 1
-eval_interval: 10000
+eval_interval: 1e4
 t_window: 1
-log_interval: 10
+log_interval: 1e2
 
 evaluation:
   class: training.evaluation.sim_eval.SimEvaluationHook
@@ -47,4 +47,5 @@ evaluation:
       Beginner: null
 
 wandb:
-  enabled: false
+  project: pong-sac-raw-goal
+  enabled: true
