@@ -126,6 +126,8 @@ class PongEnv:
     def obs_dim(self) -> int:
         if self.obs_mode == 'spectral':
             return self._spectral_dim
+        if self.obs_mode == 'raw6':
+            return 6
         return 4
 
     def _init_spectral(self):
@@ -301,9 +303,22 @@ class PongEnv:
             (self.ball_x - COURT_LEFT) / (COURT_RIGHT - COURT_LEFT) * 2 - 1,
         ])
 
+    def _raw6_obs(self) -> np.ndarray:
+        """Raw 6D: (ball_x, ball_y, agent_x, agent_y, opp_x, opp_y) normalized."""
+        return np.array([
+            self.ball_x / (COURT_RIGHT - COURT_LEFT) * 2,
+            self.ball_y / (COURT_TOP - COURT_BOTTOM) * 2,
+            self.paddle_lx / (COURT_RIGHT - COURT_LEFT) * 2,
+            self.agent_y / (COURT_TOP - COURT_BOTTOM) * 2,
+            self.paddle_rx / (COURT_RIGHT - COURT_LEFT) * 2,
+            self.opp_y / (COURT_TOP - COURT_BOTTOM) * 2,
+        ], dtype=np.float32)
+
     def _obs(self) -> np.ndarray:
         if self.obs_mode == 'spectral':
             return self._spectral_obs()
+        if self.obs_mode == 'raw6':
+            return self._raw6_obs()
         return self._raw_obs()
 
     def reset(self) -> np.ndarray:
@@ -465,7 +480,7 @@ class PongGymEnv(gym.Env):
         self._env = PongEnv(
             opp_skill=opp_skill,
             reward_mode=self._reward_mode,
-            obs_mode=obs_mode if obs_mode == 'raw' else 'spectral',
+            obs_mode=obs_mode if obs_mode in ('raw', 'raw6') else 'spectral',
             lr_k=params.get('lr_k', 0.001),
             lr_c_pred=params.get('lr_c_pred', 0.05),
         )
@@ -491,6 +506,8 @@ class PongGymEnv(gym.Env):
             # Append LMS residual as last element
             residual = getattr(self._env, '_last_residual', 0.0)
             return np.append(flat, np.float32(residual))
+        elif self.obs_mode == 'raw6':
+            return self._env._raw6_obs()
         else:
             return self._env._raw_obs().astype(np.float32)
 
