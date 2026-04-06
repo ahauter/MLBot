@@ -1,0 +1,48 @@
+algorithm:
+  class: training.algorithms.pong_sac.PongSACAlgorithm
+  params:
+    obs_mode: raw6
+    obs_dim: 6
+    random_steps: 1000
+
+env_class: training.environments.pong_env.PongGymEnv
+
+dense_reward_weights:
+  obs_mode: raw6
+  opp_skill: 0.5
+  reward_mode: paddle
+
+opponent_pool:
+  class: training.opponents.population.Population
+  params:
+    agents: 1
+    snapshot_interval: 999999999
+
+search_space:
+  algorithm.params.encoder_lr:
+    type: float
+    low: 1e-5
+    high: 1e-3
+    log: true
+  algorithm.params.gamma:
+    type: float
+    low: 0.9
+    high: 0.999
+
+num_envs: 1
+envs_per_worker: 1
+t_window: 1
+
+evaluation:
+  class: training.evaluation.sim_eval.SimEvaluationHook
+  params:
+    episodes_per_tier: 50
+    episode_timeout_steps: 2000
+    skill_target_tier: Beginner
+    skill_target_win_rate: 0.60
+    tier_opponents:
+      Beginner: null
+
+wandb:
+  project: rlbot-baseline-tuning
+  enabled: true
