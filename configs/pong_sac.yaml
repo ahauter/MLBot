@@ -19,7 +19,7 @@ env_class: training.environments.pong_env.PongGymEnv
 # Pong-specific env params passed through dense_reward_weights
 dense_reward_weights:
   obs_mode: raw
-  opp_skill: 0.2
+  opp_skill: 0.5
   reward_mode: paddle
 
 opponent_pool:
@@ -29,7 +29,7 @@ opponent_pool:
     snapshot_interval: 999999999
 
 seed: 0
-total_steps: 200000
+total_steps: 2e6
 num_envs: 1
 envs_per_worker: 1
 eval_interval: 10000
